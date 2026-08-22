@@ -22,11 +22,18 @@ model Tenant {
   users User[]
 }
 
+enum Role {
+  ADMIN     // manages the tenant: invites people, changes settings
+  ORGANIZER // creates and publishes events
+  ATTENDEE  // buys tickets, joins the community
+}
+
 model User {
   id           String   @id @default(cuid())
   tenantId     String
   email        String
   passwordHash String
+  role         Role     @default(ATTENDEE)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   refreshTokens RefreshToken[]
@@ -35,6 +42,31 @@ model User {
 
   @@unique([tenantId, email])
   @@index([tenantId])
+}
+
+/// An invitation to join a tenant.
+///
+/// This is what replaces the trusted X-Tenant-ID header on /register. The
+/// registering user never states which tenant they are joining — the invite
+/// says so, and the invite was created by someone already inside it. There is
+/// nothing left for the caller to lie about.
+///
+/// Same shape as RefreshToken on purpose: 32 random bytes handed out, only a
+/// SHA-256 hash stored, single-use, with an expiry.
+model Invite {
+  id         String    @id @default(cuid())
+  tenantId   String
+  email      String
+  role       Role      @default(ATTENDEE)
+  tokenHash  String    @unique
+  invitedBy  String
+  expiresAt  DateTime
+  acceptedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, email])
 }
 
 model RefreshToken {

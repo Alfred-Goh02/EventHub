@@ -33,9 +33,11 @@ const TENANTS = [
 
 // The same email in both tenants, on purpose: it demonstrates that
 // @@unique([tenantId, email]) scopes identity per tenant rather than globally.
-const USERS = [
-  { tenantId: 'tenant_acme', email: 'alice@acme.com', password: 'hunter2222' },
-  { tenantId: 'tenant_globex', email: 'alice@acme.com', password: 'hunter2222' },
+// Seeded as ADMIN: a brand-new tenant has nobody to invite its first member,
+// so the bootstrap user has to arrive some other way.
+const USERS: Array<{ tenantId: string; email: string; password: string; role: 'ADMIN' }> = [
+  { tenantId: 'tenant_acme', email: 'alice@acme.com', password: 'hunter2222', role: 'ADMIN' },
+  { tenantId: 'tenant_globex', email: 'alice@acme.com', password: 'hunter2222', role: 'ADMIN' },
 ];
 
 async function main() {
@@ -59,8 +61,8 @@ async function main() {
 
       await tx.user.upsert({
         where: { tenantId_email: { tenantId: u.tenantId, email: u.email } },
-        update: {},
-        create: { tenantId: u.tenantId, email: u.email, passwordHash },
+        update: { role: u.role },
+        create: { tenantId: u.tenantId, email: u.email, passwordHash, role: u.role },
       });
     });
 
