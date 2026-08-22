@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: eventhub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eventhub
+      POSTGRES_PASSWORD: eventhub
+      # The admin database only. Service databases are created by the bootstrap
+      # script below, each owned by its own non-superuser role.
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs ONLY on an empty data directory. To re-run it after changing the
+      # bootstrap: docker compose down -v && docker compose up -d
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventhub -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:

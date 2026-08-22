@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Turborepo cache
+.turbo/
+
+# Generated Prisma clients (regenerate with `prisma generate`)
+**/src/generated/
+
+# Environment files — these hold database credentials
+.env
+.env.*
+!.env.example
+
+# JWT signing keys — NEVER commit these
+**/keys/
+*.pem
+
+# Logs and OS noise
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
