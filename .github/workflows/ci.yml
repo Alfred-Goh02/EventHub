@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to the same PR cancels the first run rather than queueing behind
+# it. On a free plan the minutes are finite, and a superseded run tells you
+# nothing you still care about.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build and verify
+    runs-on: ubuntu-latest
+
+    # A real Postgres, not a mock. The point of this job is to prove the repo can
+    # rebuild its own database from nothing — the claim that would otherwise only
+    # be true on Alfred's laptop.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: eventhub
+          POSTGRES_PASSWORD: eventhub
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eventhub -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@localhost:5432/eventhub_auth
+      APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@localhost:5432/eventhub_auth
+      JWT_ISSUER: https://auth.eventhub.local
+      JWT_AUDIENCE: eventhub-api
+      NODE_ENV: test
+      PORT: 3001
+      LOG_LEVEL: info
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pinned version from packageManager in package.json, so CI and
+      # local can never drift.
+      - uses: pnpm/action-setup@v4
+
+      # Read from .nvmrc rather than hardcoded here, so the version lives in ONE
+      # place. CI testing a different Node than you develop on means CI cannot
+      # catch a version-specific problem, and you cannot reproduce a CI failure.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # --frozen-lockfile fails rather than silently updating the lockfile. If
+      # this step fails, someone changed a dependency without committing the
+      # lockfile — which is exactly what you want CI to catch.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # The same bootstrap docker-compose mounts locally. If this drifts from
+      # what the repo needs, CI goes red here rather than in six months.
+      - name: Bootstrap databases and roles
+        run: psql "postgresql://eventhub:eventhub@localhost:5432/postgres" -v ON_ERROR_STOP=1 -f db/init/01-bootstrap.sql
+
+      - name: Apply migrations
+        working-directory: services/auth
+        run: pnpm exec prisma migrate deploy
+
+      - name: Seed
+        working-directory: services/auth
+        run: pnpm exec prisma db seed
+
+      # Keys are gitignored, so CI generates its own throwaway pair. Never reuse
+      # a real signing key in CI — anything in a build environment is readable by
+      # anything else running there.
+      - name: Generate JWT keypair
+        working-directory: services/auth
+        run: node scripts/generate-keys.mjs
+
+      # The check that actually matters: does the COMPILED output boot and serve?
+      # Type-checking proves the code is consistent, not that it runs.
+      - name: Smoke test the compiled service
+        working-directory: services/auth
+        run: |
+          node dist/index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:3001/health > /dev/null; then break; fi
+            sleep 1
+          done
+
+          echo "--- health ---"
+          curl -sf http://localhost:3001/health
+
+          echo ""
+          echo "--- login as the seeded admin ---"
+          TOKEN=$(curl -sf -X POST http://localhost:3001/login \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tenant-ID: tenant_acme' \
+            -d '{"email":"alice@acme.com","password":"hunter2222"}' \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).accessToken))")
+          test -n "$TOKEN" || { echo "no access token returned"; kill $SERVER_PID; exit 1; }
+
+          echo ""
+          echo "--- authenticated /me ---"
+          curl -sf http://localhost:3001/me -H "Authorization: Bearer $TOKEN"
+
+          echo ""
+          echo "--- registering without an invite must FAIL ---"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/register \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tenant-ID: tenant_globex' \
+            -d '{"email":"attacker@evil.com","password":"hunter2222"}')
+          test "$CODE" = "400" || { echo "expected 400, got $CODE — the tenant hole is open"; kill $SERVER_PID; exit 1; }
+          echo "correctly rejected ($CODE)"
+
+          kill $SERVER_PID
+
+      # Tenant isolation is the load-bearing security property of this codebase,
+      # so it is asserted on every pull request rather than trusted.
+      - name: Assert RLS blocks the runtime role
+        run: |
+          COUNT=$(psql "$APP_DATABASE_URL" -tAc 'SELECT count(*) FROM "User";')
+          test "$COUNT" = "0" || { echo "RLS FAILED: runtime role saw $COUNT users with no tenant context"; exit 1; }
+          echo "runtime role sees 0 users without tenant context"
+
+          # set_config must run in the SAME transaction as the query, because it
+          # is LOCAL — so this is a multi-statement batch. psql echoes command
+          # tags like BEGIN and COMMIT even under -tA, and set_config returns the
+          # value it set, so the output has several lines and only one of them is
+          # the count. Match the numeric line rather than assuming its position:
+          # `tail -1` picked up COMMIT, which is what failed the first CI run.
+          WITH_CTX=$(psql "$APP_DATABASE_URL" -tAc "BEGIN; SELECT set_config('app.tenant_id','tenant_acme',true); SELECT count(*) FROM \"User\"; COMMIT;" | grep -E '^[0-9]+$')
+          test "$WITH_CTX" -ge "1" || { echo "expected users for tenant_acme, got '$WITH_CTX'"; exit 1; }
+          echo "with tenant context it sees $WITH_CTX"
+
+      # Every table must have RLS unless it is on the documented exemption list.
+      # This is what stops a future migration silently shipping a table that is
+      # readable across tenants.
+      - name: Assert no table is missing RLS
+        run: |
+          MISSING=$(psql "$DATABASE_URL" -tAc "
+            SELECT string_agg(relname, ', ')
+            FROM pg_class
+            WHERE relkind = 'r'
+              AND relnamespace = 'public'::regnamespace
+              AND NOT (relrowsecurity AND relforcerowsecurity)
+              AND relname NOT IN ('_prisma_migrations', 'Tenant', 'RefreshToken', 'Invite');
+          ")
+          test -z "$MISSING" || { echo "tables missing RLS: $MISSING"; exit 1; }
+          echo "every non-exempt table has RLS enabled and forced"
