@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Two invariants hold across every model in this file, and both exist because
+/// row-level security has blind spots:
+///
+///   1. Every parent carries @@unique([tenantId, id]) and every child references
+///      it by that PAIR, never by id alone. Postgres runs foreign-key checks as
+///      the table owner and they BYPASS row security entirely, so a plain
+///      eventId FK would let a caller scoped to tenant A attach a child to
+///      tenant B's row - silently, with no error and no way for RLS to see it.
+///      A composite FK makes that reference structurally impossible instead of
+///      merely forbidden.
+///
+///   2. No unique index omits tenantId. Unique enforcement is also not subject
+///      to row security, so a globally-unique column would reject a value with
+///      a 23505 that reveals another tenant already used it.
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+  COMPLETED
+}
+
+model Venue {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  address   String?
+  capacity  Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events Event[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId])
+}
+
+model Event {
+  id       String @id @default(cuid())
+  tenantId String
+
+  /// A User id from the AUTH service's database. There is deliberately no
+  /// foreign key: that table lives in another database this service cannot even
+  /// open a connection to. Referential validity is enforced upstream by the
+  /// signed token, never here - which is the honest price of database-per-service.
+  /// Always set from req.auth.userId, never from the request body.
+  organiserId String
+
+  title       String
+  slug        String
+  description String?
+  status      EventStatus @default(DRAFT)
+  capacity    Int
+  startsAt    DateTime
+  endsAt      DateTime
+
+  /// Optimistic concurrency. Prisma has no @version, so nothing increments this
+  /// automatically - every update must pass `version: { increment: 1 }` or the
+  /// mechanism silently does nothing while appearing to work.
+  version Int @default(1)
+
+  /// Soft delete. RLS does NOT filter these out, so `deletedAt: null` belongs in
+  /// every read query.
+  deletedAt DateTime?
+
+  venueId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  venue    Venue?    @relation(fields: [tenantId, venueId], references: [tenantId, id], onDelete: Restrict)
+  sessions Session[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, startsAt])
+  /// NOTE: there is deliberately NO @@unique([tenantId, slug]) here. Slug must be
+  /// unique only among LIVE rows so a deleted slug can be reused, which needs a
+  /// partial index Prisma cannot express. It is created as raw SQL in the
+  /// migration. Declaring @@unique as well would make Prisma adopt that index and
+  /// then generate a findUnique that can match several soft-deleted rows.
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tenantId  String
+  eventId   String
+  title     String
+  speaker   String?
+  startsAt  DateTime
+  endsAt    DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Restrict, not Cascade. A cascading delete runs as the table owner and would
+  /// bypass RLS the same way FK checks do, so deleting one tenant's Event could
+  /// destroy another tenant's rows.
+  event Event @relation(fields: [tenantId, eventId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, eventId])
+}
+
+/// Transactional outbox. Written in the SAME transaction as the state change it
+/// describes, so the database and Kafka can never disagree - you cannot atomically
+/// write to Postgres and publish to a broker, and this is the standard answer.
+/// The relay that drains it is Chapter 4; the table exists now so the pattern is
+/// in place before money depends on it.
+model OutboxMessage {
+  id       String @id @default(cuid())
+  tenantId String
+
+  /// Explicit ordering, rather than trusting the id format. Draining must use
+  /// `WHERE publishedAt IS NULL ORDER BY seq` and NOT a `seq > cursor` cursor:
+  /// sequence values are allocated before commit, so seq=5 can commit after
+  /// seq=6 and a cursor would skip it permanently - a silently lost message,
+  /// which is the exact failure an outbox exists to prevent.
+  seq BigInt @default(autoincrement())
+
+  eventType     String
+  schemaVersion Int    @default(1)
+
+  /// The Kafka partition key. Keyed by the entity whose ordering matters, never
+  /// by tenantId - keying by tenant puts all of one tenant's traffic on a single
+  /// partition and adding brokers does nothing for the busiest customer.
+  aggregateId String
+
+  payload     Json
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([publishedAt, seq])
+  @@index([tenantId])
+}

@@ -36,8 +36,14 @@ jobs:
           --health-retries 10
 
     env:
+      # Auth's databases. DATABASE_URL is the owner (migrations only);
+      # APP_DATABASE_URL owns nothing so RLS applies to it.
       DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@localhost:5432/eventhub_auth
       APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@localhost:5432/eventhub_auth
+      # Event's own database. Separate credentials entirely — this role cannot
+      # even open a connection to eventhub_auth.
+      EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@localhost:5432/eventhub_event
+      EVENT_APP_DATABASE_URL: postgresql://eventhub_event_app:eventhub_event_app@localhost:5432/eventhub_event
       JWT_ISSUER: https://auth.eventhub.local
       JWT_AUDIENCE: eventhub-api
       NODE_ENV: test
@@ -73,8 +79,14 @@ jobs:
       - name: Bootstrap databases and roles
         run: psql "postgresql://eventhub:eventhub@localhost:5432/postgres" -v ON_ERROR_STOP=1 -f db/init/01-bootstrap.sql
 
-      - name: Apply migrations
+      - name: Apply migrations (auth)
         working-directory: services/auth
+        run: pnpm exec prisma migrate deploy
+
+      - name: Apply migrations (event)
+        working-directory: services/event
+        env:
+          DATABASE_URL: ${{ env.EVENT_DATABASE_URL }}
         run: pnpm exec prisma migrate deploy
 
       - name: Seed
@@ -127,6 +139,42 @@ jobs:
 
           kill $SERVER_PID
 
+      # The cross-service proof: Event verifies a token AUTH signed, holding only
+      # the public key, with no call to Auth and no shared session store. If this
+      # ever needs a network hop to Auth, the asymmetric-JWT design has been lost.
+      - name: Smoke test cross-service token verification
+        run: |
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/auth && node dist/index.js &)
+          (cd services/event && PORT=3002 DATABASE_URL="$EVENT_DATABASE_URL" APP_DATABASE_URL="$EVENT_APP_DATABASE_URL" node dist/index.js &)
+
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:3001/health >/dev/null && curl -sf http://localhost:3002/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          curl -sf http://localhost:3002/health
+          echo ""
+
+          TOKEN=$(curl -sf -X POST http://localhost:3001/login \
+            -H 'Content-Type: application/json' -H 'X-Tenant-ID: tenant_acme' \
+            -d '{"email":"alice@acme.com","password":"hunter2222"}' \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).accessToken))")
+          test -n "$TOKEN" || { echo "auth did not issue a token"; exit 1; }
+
+          echo "--- event verifies a token auth signed ---"
+          curl -sf http://localhost:3002/whoami -H "Authorization: Bearer $TOKEN"
+          echo ""
+
+          echo "--- a garbage token must be rejected ---"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3002/whoami -H "Authorization: Bearer not.a.token")
+          test "$CODE" = "401" || { echo "expected 401, got $CODE"; exit 1; }
+          echo "rejected ($CODE)"
+
+          pkill -f "node dist/index.js" || true
+
       # Tenant isolation is the load-bearing security property of this codebase,
       # so it is asserted on every pull request rather than trusted.
       - name: Assert RLS blocks the runtime role
@@ -147,16 +195,46 @@ jobs:
 
       # Every table must have RLS unless it is on the documented exemption list.
       # This is what stops a future migration silently shipping a table that is
-      # readable across tenants.
+      # readable across tenants — Prisma never emits RLS, so a forgotten policy
+      # block is invisible in code review.
+      #
+      # Runs against BOTH databases. Each service has its own exemption list, and
+      # exempting a table is therefore a decision someone writes down here rather
+      # than an omission nobody notices.
       - name: Assert no table is missing RLS
         run: |
-          MISSING=$(psql "$DATABASE_URL" -tAc "
-            SELECT string_agg(relname, ', ')
-            FROM pg_class
-            WHERE relkind = 'r'
-              AND relnamespace = 'public'::regnamespace
-              AND NOT (relrowsecurity AND relforcerowsecurity)
-              AND relname NOT IN ('_prisma_migrations', 'Tenant', 'RefreshToken', 'Invite');
-          ")
-          test -z "$MISSING" || { echo "tables missing RLS: $MISSING"; exit 1; }
-          echo "every non-exempt table has RLS enabled and forced"
+          check() {
+            local url="$1" label="$2" exempt="$3"
+            MISSING=$(psql "$url" -tAc "
+              SELECT string_agg(relname, ', ')
+              FROM pg_class
+              WHERE relkind = 'r'
+                AND relnamespace = 'public'::regnamespace
+                AND NOT (relrowsecurity AND relforcerowsecurity)
+                AND relname NOT IN ($exempt);
+            ")
+            test -z "$MISSING" || { echo "[$label] tables missing RLS: $MISSING"; exit 1; }
+            echo "[$label] every non-exempt table has RLS enabled and forced"
+          }
+
+          # Auth exemptions, each justified in its migration:
+          #   Tenant       - read before tenant context exists, to resolve a slug
+          #   RefreshToken - found by token hash; tenant is a result, not an input
+          #   Invite       - same as RefreshToken
+          check "$DATABASE_URL" auth "'_prisma_migrations','Tenant','RefreshToken','Invite'"
+
+          # Event has no exemptions. Every table is tenant-scoped, including
+          # OutboxMessage, which carries a second role-targeted policy for the
+          # relay rather than being exempt.
+          check "$EVENT_DATABASE_URL" event "'_prisma_migrations'"
+
+      # Database-per-service must hold at the CONNECTION boundary, not merely at
+      # the table grants. If this ever starts succeeding, the isolation has been
+      # quietly weakened.
+      - name: Assert Event cannot connect to Auth's database
+        run: |
+          if psql "postgresql://eventhub_event_app:eventhub_event_app@localhost:5432/eventhub_auth" -tAc 'SELECT 1' 2>/dev/null; then
+            echo "ISOLATION FAILED: the event role opened a session against eventhub_auth"
+            exit 1
+          fi
+          echo "event role is refused CONNECT to eventhub_auth, as intended"
