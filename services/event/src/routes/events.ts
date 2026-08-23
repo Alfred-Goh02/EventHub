@@ -208,3 +208,224 @@ events.get('/:id', requireAuth, ah(async (req, res) => {
 
   return res.json(event);
 }));
+
+// ---------------------------------------------------------------------------
+// Optimistic concurrency
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses an If-Match header.
+ *
+ * RFC 9110 entity-tags are QUOTED, so the header value is literally `"3"`, not
+ * `3`. `Number(req.header('If-Match'))` yields NaN, which becomes
+ * `where: { version: NaN }` and a spurious 409 on a request that should have
+ * succeeded. `*` is also legal and means "any current representation" — an
+ * existence check with no version predicate.
+ */
+type IfMatch =
+  | { kind: 'missing' }
+  | { kind: 'any' }
+  | { kind: 'version'; version: number }
+  | { kind: 'invalid' };
+
+function parseIfMatch(raw: string | undefined): IfMatch {
+  if (raw === undefined) return { kind: 'missing' };
+
+  const value = raw.trim();
+  if (value === '*') return { kind: 'any' };
+
+  // W/ marks a weak validator; the quotes are part of the syntax, not decoration.
+  const unquoted = value.replace(/^W\//, '').replace(/^"|"$/g, '');
+  const version = Number(unquoted);
+
+  if (!Number.isInteger(version) || version < 1) return { kind: 'invalid' };
+  return { kind: 'version', version };
+}
+
+const patchEvent = z
+  .object({
+    title: z.string().min(1).max(200).optional(),
+    description: z.string().max(5000).nullable().optional(),
+    capacity: z.number().int().positive().optional(),
+    startsAt: z.coerce.date().optional(),
+    endsAt: z.coerce.date().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: 'no fields to update' });
+
+events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, res) => {
+  const ifMatch = parseIfMatch(req.header('If-Match'));
+
+  if (ifMatch.kind === 'missing') {
+    return res.status(428).json({ error: 'If-Match header is required' });
+  }
+  // 400, not 409: a malformed header is a bad request, not a version conflict.
+  if (ifMatch.kind === 'invalid') {
+    return res.status(400).json({ error: 'malformed If-Match header' });
+  }
+
+  const parsed = patchEvent.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+
+  const { tenantId } = req.auth!;
+  const id = req.params.id;
+
+  const outcome = await withTenant(tenantId, async (tx) => {
+    const { count } = await tx.event.updateMany({
+      where: {
+        id,
+        deletedAt: null,
+        ...(ifMatch.kind === 'version' ? { version: ifMatch.version } : {}),
+      },
+      data: {
+        ...parsed.data,
+        // Prisma has no @version, so nothing increments this automatically.
+        // Omit it and count is still 1, the write succeeds, and every later
+        // If-Match on the same stale value also succeeds — optimistic
+        // concurrency silently does nothing while appearing to work, which is
+        // worse than not having it at all.
+        version: { increment: 1 },
+      },
+    });
+
+    if (count === 1) {
+      const updated = await tx.event.findFirst({
+        where: { id, deletedAt: null },
+        select: {
+          id: true, title: true, slug: true, description: true, status: true,
+          capacity: true, startsAt: true, endsAt: true, version: true,
+        },
+      });
+      return { kind: 'updated' as const, event: updated! };
+    }
+
+    // count === 0 has four possible causes: no such id, stale version, another
+    // tenant's row, or soft-deleted. Mapping all four to 409 makes a genuinely
+    // missing id report a version conflict.
+    //
+    // The disambiguation runs INSIDE this transaction, on `tx`. Re-reading with
+    // the bare `prisma` client would escape the tenant context and build a
+    // cross-tenant existence oracle — one line, and it looks entirely correct.
+    const exists = await tx.event.findFirst({
+      where: { id, deletedAt: null },
+      select: { version: true },
+    });
+
+    return exists
+      ? { kind: 'conflict' as const, currentVersion: exists.version }
+      : { kind: 'missing' as const };
+  });
+
+  if (outcome.kind === 'missing') {
+    return res.status(404).json({ error: 'event not found' });
+  }
+
+  if (outcome.kind === 'conflict') {
+    // Returning the current version is safe precisely because that lookup was
+    // tenant-scoped: it can only ever describe a row the caller may already see.
+    res.setHeader('ETag', `"${outcome.currentVersion}"`);
+    return res.status(409).json({
+      error: 'version conflict - the event changed since you read it',
+      currentVersion: outcome.currentVersion,
+    });
+  }
+
+  res.setHeader('ETag', `"${outcome.event.version}"`);
+  return res.json(outcome.event);
+}));
+
+// ---------------------------------------------------------------------------
+// Publish - the first write that must also reach Kafka
+// ---------------------------------------------------------------------------
+events.post('/:id/publish', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, res) => {
+  const { tenantId } = req.auth!;
+  const id = req.params.id;
+
+  const outcome = await withTenant(tenantId, async (tx) => {
+    // Only a DRAFT may be published, and that condition lives in the WHERE
+    // clause rather than a read-then-check. It is therefore atomic: two
+    // concurrent publishes cannot both match, so only one can emit an outbox row.
+    const { count } = await tx.event.updateMany({
+      where: { id, deletedAt: null, status: 'DRAFT' },
+      data: { status: 'PUBLISHED', version: { increment: 1 } },
+    });
+
+    if (count === 0) {
+      const exists = await tx.event.findFirst({
+        where: { id, deletedAt: null },
+        select: { status: true },
+      });
+      return exists
+        ? { kind: 'wrong-state' as const, status: exists.status }
+        : { kind: 'missing' as const };
+    }
+
+    const event = await tx.event.findFirst({
+      where: { id },
+      select: {
+        id: true, title: true, slug: true, status: true, capacity: true,
+        startsAt: true, endsAt: true, organiserId: true, version: true,
+      },
+    });
+
+    // THE POINT OF THE OUTBOX: this insert is in the SAME transaction as the
+    // status change above. You cannot atomically write to Postgres and publish
+    // to Kafka - a crash between the two either loses the message or announces
+    // something that never happened. Committing both together makes the
+    // database the single source of truth, and a separate relay drains this
+    // table afterwards. That relay is Chapter 4; the row is written now so the
+    // pattern is in place before money depends on it.
+    await tx.outboxMessage.create({
+      data: {
+        tenantId,
+        eventType: 'event.published',
+        schemaVersion: 1,
+        // The Kafka partition key. Keyed by the event so all messages about one
+        // event stay ordered - never by tenantId, which would put a whole
+        // tenant's traffic on a single partition.
+        aggregateId: event!.id,
+        payload: {
+          eventId: event!.id,
+          tenantId,
+          title: event!.title,
+          slug: event!.slug,
+          capacity: event!.capacity,
+          startsAt: event!.startsAt.toISOString(),
+          endsAt: event!.endsAt.toISOString(),
+          organiserId: event!.organiserId,
+        },
+      },
+    });
+
+    return { kind: 'published' as const, event: event! };
+  });
+
+  if (outcome.kind === 'missing') {
+    return res.status(404).json({ error: 'event not found' });
+  }
+  if (outcome.kind === 'wrong-state') {
+    return res.status(409).json({ error: `cannot publish an event in state ${outcome.status}` });
+  }
+
+  return res.json(outcome.event);
+}));
+
+// ---------------------------------------------------------------------------
+// Soft delete
+// ---------------------------------------------------------------------------
+events.delete('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, res) => {
+  const { count } = await withTenant(req.auth!.tenantId, (tx) =>
+    tx.event.updateMany({
+      where: { id: req.params.id, deletedAt: null },
+      data: { deletedAt: new Date(), version: { increment: 1 } },
+    }),
+  );
+
+  // Soft delete rather than DELETE, so the row survives for audit and Sessions
+  // pointing at it do not become dangling. It also frees the slug, because the
+  // unique index covers only rows where deletedAt IS NULL.
+  if (count === 0) return res.status(404).json({ error: 'event not found' });
+
+  return res.status(204).send();
+}));
