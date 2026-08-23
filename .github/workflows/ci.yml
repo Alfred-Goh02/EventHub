@@ -51,9 +51,12 @@ jobs:
       # local can never drift.
       - uses: pnpm/action-setup@v4
 
+      # Read from .nvmrc rather than hardcoded here, so the version lives in ONE
+      # place. CI testing a different Node than you develop on means CI cannot
+      # catch a version-specific problem, and you cannot reproduce a CI failure.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: pnpm
 
       # --frozen-lockfile fails rather than silently updating the lockfile. If

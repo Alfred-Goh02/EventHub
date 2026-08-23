@@ -8,8 +8,12 @@
     "dev": "turbo run dev"
   },
   "devDependencies": {
-    "@types/node": "22",
+    "@types/node": "^26.2.0",
     "turbo": "^2.10.7",
     "typescript": "5.7.3"
+  },
+  "engines": {
+    "node": ">=26",
+    "pnpm": ">=9.15.0 <10"
   }
 }
