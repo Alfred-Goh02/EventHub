@@ -132,8 +132,14 @@ jobs:
           test "$COUNT" = "0" || { echo "RLS FAILED: runtime role saw $COUNT users with no tenant context"; exit 1; }
           echo "runtime role sees 0 users without tenant context"
 
-          WITH_CTX=$(psql "$APP_DATABASE_URL" -tAc "BEGIN; SELECT set_config('app.tenant_id','tenant_acme',true); SELECT count(*) FROM \"User\"; COMMIT;" | tail -1)
-          test "$WITH_CTX" -ge "1" || { echo "expected users for tenant_acme, got $WITH_CTX"; exit 1; }
+          # set_config must run in the SAME transaction as the query, because it
+          # is LOCAL — so this is a multi-statement batch. psql echoes command
+          # tags like BEGIN and COMMIT even under -tA, and set_config returns the
+          # value it set, so the output has several lines and only one of them is
+          # the count. Match the numeric line rather than assuming its position:
+          # `tail -1` picked up COMMIT, which is what failed the first CI run.
+          WITH_CTX=$(psql "$APP_DATABASE_URL" -tAc "BEGIN; SELECT set_config('app.tenant_id','tenant_acme',true); SELECT count(*) FROM \"User\"; COMMIT;" | grep -E '^[0-9]+$')
+          test "$WITH_CTX" -ge "1" || { echo "expected users for tenant_acme, got '$WITH_CTX'"; exit 1; }
           echo "with tenant context it sees $WITH_CTX"
 
       # Every table must have RLS unless it is on the documented exemption list.
