@@ -10,6 +10,7 @@
     "generate": "prisma generate"
   },
   "dependencies": {
+    "@eventhub/auth-middleware": "workspace:*",
     "@eventhub/config": "workspace:*",
     "@eventhub/logger": "workspace:*",
     "@eventhub/types": "workspace:*",

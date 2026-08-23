@@ -17,6 +17,13 @@ if (!ISSUER || !AUDIENCE) {
   throw new Error('JWT_ISSUER and JWT_AUDIENCE are required');
 }
 
+// Exported AFTER the guard, so control-flow narrowing gives these a plain
+// `string` type. Declaring them earlier would need a `!` assertion on values
+// that have not been checked yet — which would still work at runtime, but the
+// assertion would be a claim the code had not yet earned.
+export const jwtIssuer: string = ISSUER;
+export const jwtAudience: string = AUDIENCE;
+
 // Resolved relative to THIS FILE, not the working directory. `keys/private.pem`
 // only worked because dev happens to run from services/auth; it would throw
 // ENOENT from the repo root, or in a container with a different WORKDIR.
@@ -24,7 +31,7 @@ if (!ISSUER || !AUDIENCE) {
 const keyPath = (name: string) => new URL(`../keys/${name}`, import.meta.url);
 
 const privateKey = await importPKCS8(readFileSync(keyPath('private.pem'), 'utf8'), ALG);
-const publicKey = await importSPKI(readFileSync(keyPath('public.pem'), 'utf8'), ALG);
+export const publicKey = await importSPKI(readFileSync(keyPath('public.pem'), 'utf8'), ALG);
 
 export async function signAccessToken(
   userId: string,
