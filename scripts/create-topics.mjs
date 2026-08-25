@@ -31,7 +31,29 @@ const TOPICS = [
     topic: 'events.activity',
     numPartitions: 3,
     replicationFactor: 1,
-    note: 'Event lifecycle. Keyed by event id, so all messages about one event stay ordered.',
+    // COMPACTED, not deleted.
+    //
+    // Kafka retains the latest message per KEY forever, so a consumer can
+    // rebuild its entire projection by replaying from the beginning — no HTTP
+    // bootstrap path and no cold-start hole. Under the default cleanup.policy
+    // of `delete`, a service deployed a week later would simply never learn
+    // about events published before its retention window, with no error
+    // anywhere to say so.
+    //
+    // This is exactly why the payload is a full SNAPSHOT rather than a delta:
+    // replaying deltas requires every delta, and compaction keeps only the last
+    // message per key.
+    //
+    // The cost is losing change history on this topic — which is why the ticket
+    // topics below stay on `delete`. For those, the SEQUENCE is the information.
+    configEntries: [
+      { name: 'cleanup.policy', value: 'compact' },
+      // Compact aggressively in dev so the behaviour is observable rather than
+      // theoretical. Production would leave these at their defaults.
+      { name: 'min.cleanable.dirty.ratio', value: '0.1' },
+      { name: 'segment.ms', value: '60000' },
+    ],
+    note: 'Event snapshots, COMPACTED. Keyed by event id.',
   },
   {
     topic: 'tickets.reserved',
@@ -57,6 +79,16 @@ const TOPICS = [
     replicationFactor: 1,
     note: 'Community posts and reactions.',
   },
+  {
+    topic: 'smoke.roundtrip',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // The broker smoke test produces plain JSON. It must not touch a real topic:
+    // events.activity carries Avro in the Confluent wire format (a magic byte
+    // plus a 4-byte schema id), so a JSON message on it is undecodable — and an
+    // undecodable message blocks its partition until someone intervenes.
+    note: 'Throwaway target for scripts/kafka-smoke.mjs. Plain JSON, never Avro.',
+  },
 ];
 
 const kafka = new Kafka({ clientId: 'eventhub-admin', brokers: [BROKER] });
@@ -73,10 +105,11 @@ async function main() {
     console.log('all topics already exist');
   } else {
     await admin.createTopics({
-      topics: missing.map(({ topic, numPartitions, replicationFactor }) => ({
+      topics: missing.map(({ topic, numPartitions, replicationFactor, configEntries }) => ({
         topic,
         numPartitions,
         replicationFactor,
+        ...(configEntries ? { configEntries } : {}),
       })),
       waitForLeaders: true,
     });

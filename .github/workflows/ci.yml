@@ -17,53 +17,25 @@ jobs:
     name: build and verify
     runs-on: ubuntu-latest
 
-    # A real Postgres, not a mock. The point of this job is to prove the repo can
-    # rebuild its own database from nothing — the claim that would otherwise only
-    # be true on Alfred's laptop.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: eventhub
-          POSTGRES_PASSWORD: eventhub
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U eventhub -d postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      # Kafka in KRaft mode, mirroring docker-compose.yml. Note the advertised
-      # addresses differ from local: in a service container everything shares the
-      # runner's network namespace, so both listeners advertise localhost rather
-      # than a compose service name.
-      kafka:
-        image: confluentinc/cp-kafka:7.8.0
-        env:
-          KAFKA_NODE_ID: 1
-          KAFKA_PROCESS_ROLES: broker,controller
-          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
-          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
-          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:29092,PLAINTEXT_HOST://localhost:9092
-          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-          CLUSTER_ID: EventHubLocalCluster1
-        ports:
-          - 9092:9092
-        options: >-
-          --health-cmd "kafka-broker-api-versions --bootstrap-server localhost:9092"
-          --health-interval 10s
-          --health-timeout 10s
-          --health-retries 15
-          --health-start-period 20s
+    # NOTE: there is deliberately no `services:` block. The whole stack comes up
+    # from docker-compose.yml as a job step instead.
+    #
+    # Two reasons, both learned rather than assumed:
+    #
+    #   1. Actions service containers have no `depends_on` between each other.
+    #      cp-schema-registry's entrypoint runs `cub kafka-ready` against the
+    #      broker, so as a service container it depends on winning a race that
+    #      Actions does not arrange. `docker compose up --wait` honours the
+    #      healthchecks and depends_on the compose file already declares.
+    #
+    #   2. Service containers forced a config that DIFFERS from local — they
+    #      share the runner's network namespace, so Kafka had to advertise
+    #      localhost on both listeners rather than a compose service name. Two
+    #      configurations for one broker is exactly the drift CI exists to catch.
+    #
+    # Using compose also means the Postgres bootstrap runs through the image's
+    # own /docker-entrypoint-initdb.d hook, the same path as a fresh laptop —
+    # so CI no longer needs a separate step to apply it.
 
     env:
       # Auth's databases. DATABASE_URL is the owner (migrations only);
@@ -104,10 +76,18 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # The same bootstrap docker-compose mounts locally. If this drifts from
-      # what the repo needs, CI goes red here rather than in six months.
-      - name: Bootstrap databases and roles
-        run: psql "postgresql://eventhub:eventhub@localhost:5432/postgres" -v ON_ERROR_STOP=1 -f db/init/01-bootstrap.sql
+      # The EXACT stack a developer runs, from the same file, with the same
+      # config. --wait blocks until every healthcheck passes, so nothing below
+      # races a half-started broker.
+      #
+      # The Postgres bootstrap runs itself here, through the image's
+      # /docker-entrypoint-initdb.d hook — the same path as a fresh laptop.
+      # Its volume is empty on a runner, so it always fires.
+      - name: Start infrastructure
+        run: docker compose up -d --wait
+
+      - name: Show what came up
+        run: docker compose ps
 
       - name: Apply migrations (auth)
         working-directory: services/auth
@@ -137,6 +117,31 @@ jobs:
       # holds per key while different keys spread out for parallelism.
       - name: Kafka round-trip and partition-key check
         run: node scripts/kafka-smoke.mjs
+
+      # The Avro path was the only unproven link: schema registration and
+      # serialisation happened on one laptop and nowhere else, while every other
+      # invariant in this repo is asserted on each PR.
+      - name: Register Avro schemas
+        run: node scripts/register-schemas.mjs
+
+      # Asserts that the payload the Event service actually writes can be encoded
+      # against the registered schema. Its failure mode is a poison message: a
+      # row that can never be serialised, re-selected on every drain, blocking
+      # everything behind it — with a growing backlog as the only symptom.
+      - name: Verify the schema contract
+        run: node scripts/verify-schema-contract.mjs
+
+      # Generated types are committed, so editing a .avsc without regenerating
+      # would ship types that quietly disagree with the wire format. Regenerating
+      # here and diffing turns that into a red build.
+      #
+      # Generated from the COMMITTED .avsc, never from the live registry — a
+      # build that needs port 8081 is not a reproducible build.
+      - name: Avro types are up to date
+        run: |
+          node scripts/generate-avro-types.mjs
+          git diff --exit-code -- contracts/generated \
+            || { echo "contracts/generated is stale — run: node scripts/generate-avro-types.mjs"; exit 1; }
 
       - name: Generate JWT keypair
         working-directory: services/auth
