@@ -23,6 +23,32 @@ CREATE ROLE eventhub_auth_app    LOGIN          PASSWORD 'eventhub_auth_app';
 CREATE ROLE eventhub_event_owner LOGIN CREATEDB PASSWORD 'eventhub_event_owner';
 CREATE ROLE eventhub_event_app   LOGIN          PASSWORD 'eventhub_event_app';
 
+CREATE ROLE eventhub_ticketing_owner LOGIN CREATEDB PASSWORD 'eventhub_ticketing_owner';
+CREATE ROLE eventhub_ticketing_app   LOGIN          PASSWORD 'eventhub_ticketing_app';
+
+-- Drains Ticketing's own outbox. Same shape and same reasoning as the Event
+-- relay: it reads by delivery state across every tenant, so it is a separate
+-- role with its own policy rather than a reason to reach for the superuser.
+CREATE ROLE eventhub_ticketing_relay LOGIN PASSWORD 'eventhub_ticketing_relay';
+ALTER ROLE eventhub_ticketing_relay SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_ticketing_relay SET statement_timeout = '15s';
+
+-- Releases expired seat holds.
+--
+-- It gets its own role because it does something no request-scoped role should
+-- be able to do: operate ACROSS tenants. A TTL sweep has no tenant context —
+-- it selects by expiry, not by customer — so it cannot use the tenant-scoped
+-- policy the app role uses.
+--
+-- A partial index cannot express "expired" either. now() is STABLE, not
+-- IMMUTABLE, so `WHERE expiresAt > now()` is rejected outright:
+--   ERROR: functions in index predicate must be marked IMMUTABLE
+-- (verified). Expiry is therefore a swept state transition, not a view — which
+-- is why this role exists at all.
+CREATE ROLE eventhub_ticketing_sweeper LOGIN PASSWORD 'eventhub_ticketing_sweeper';
+ALTER ROLE eventhub_ticketing_sweeper SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_ticketing_sweeper SET statement_timeout = '15s';
+
 -- Drains the transactional outbox. Reads by delivery state rather than by
 -- tenant, so it gets its own role and its own policy instead of the superuser.
 CREATE ROLE eventhub_event_relay LOGIN          PASSWORD 'eventhub_event_relay';
@@ -48,6 +74,7 @@ ALTER ROLE eventhub_event_relay SET statement_timeout = '15s';
 -- ---------------------------------------------------------------------------
 CREATE DATABASE eventhub_auth  OWNER eventhub_auth_owner;
 CREATE DATABASE eventhub_event OWNER eventhub_event_owner;
+CREATE DATABASE eventhub_ticketing OWNER eventhub_ticketing_owner;
 
 -- ---------------------------------------------------------------------------
 -- Connection isolation. By default PUBLIC may CONNECT to any database, so the
@@ -60,6 +87,10 @@ GRANT  CONNECT ON DATABASE eventhub_auth  TO eventhub_auth_owner, eventhub_auth_
 
 REVOKE CONNECT ON DATABASE eventhub_event FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_event TO eventhub_event_owner, eventhub_event_app, eventhub_event_relay;
+
+REVOKE CONNECT ON DATABASE eventhub_ticketing FROM PUBLIC;
+GRANT  CONNECT ON DATABASE eventhub_ticketing TO eventhub_ticketing_owner, eventhub_ticketing_app,
+                                               eventhub_ticketing_relay, eventhub_ticketing_sweeper;
 
 -- ---------------------------------------------------------------------------
 -- Schema-level access, granted inside each database.
@@ -77,3 +108,6 @@ GRANT USAGE ON SCHEMA public TO eventhub_auth_app;
 
 \connect eventhub_event
 GRANT USAGE ON SCHEMA public TO eventhub_event_app, eventhub_event_relay;
+
+\connect eventhub_ticketing
+GRANT USAGE ON SCHEMA public TO eventhub_ticketing_app, eventhub_ticketing_relay, eventhub_ticketing_sweeper;

@@ -1,0 +1,265 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Same two invariants as the Event service, for the same reasons:
+///
+///   1. Every parent carries @@unique([tenantId, id]) and children reference the
+///      PAIR, because foreign-key checks run as the table owner and BYPASS row
+///      security — a plain id FK would let a caller scoped to tenant A attach a
+///      child to tenant B's row, silently.
+///   2. No unique index omits tenantId, because unique enforcement also bypasses
+///      row security and a collision would reveal another tenant's data.
+
+/// Ticketing's local copy of what it needs to know about an Event.
+///
+/// It CANNOT join to eventhub_event — CONNECT is revoked and this service has no
+/// credential for that database. So it consumes events.activity and keeps this
+/// projection instead. That is the honest price of database-per-service: a join
+/// becomes a subscription.
+model EventProjection {
+  id       String @id
+  tenantId String
+
+  title       String
+  slug        String
+  status      String
+  capacity    Int
+  startsAt    DateTime
+  endsAt      DateTime
+  organiserId String
+  deleted     Boolean @default(false)
+
+  /// The Event.version this projection was built from.
+  ///
+  /// The monotonic guard: apply a message only when its version is HIGHER than
+  /// what is stored. That single check makes the projection safe under BOTH
+  /// at-least-once redelivery AND out-of-order arrival — neither can move it
+  /// backwards. Without it, a redelivered older snapshot silently reverts state.
+  sourceVersion Int
+
+  updatedAt DateTime @updatedAt
+
+  ticketTypes TicketType[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+}
+
+/// Inventory for one class of ticket.
+///
+/// The four counters are the heart of the chapter. total is fixed; the other
+/// three move between each other and must always sum to it:
+///
+///   remaining + held + sold = total
+///
+/// That is a CHECK constraint, not a convention. If a bug ever breaks it the
+/// transaction fails loudly rather than overselling quietly — and overselling
+/// is the failure that costs money and reputation.
+model TicketType {
+  id       String @id @default(cuid())
+  tenantId String
+  eventId  String
+
+  name       String
+  priceCents Int
+
+  total     Int
+  /// Available to sell right now.
+  remaining Int
+  /// Reserved but not paid for. Returns to `remaining` when a hold expires.
+  held      Int @default(0)
+  /// Paid for. Never returns.
+  sold      Int @default(0)
+
+  version Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event EventProjection  @relation(fields: [tenantId, eventId], references: [tenantId, id], onDelete: Restrict)
+  items ReservationItem[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, eventId])
+}
+
+enum ReservationStatus {
+  /// Seats are held, the clock is running.
+  HELD
+  /// Payment is in flight. The clock is STOPPED — the sweeper must not reclaim
+  /// seats from someone whose card is being charged, or they pay for nothing.
+  PENDING_PAYMENT
+  CONFIRMED
+  /// The hold ran out and the seats went back to `remaining`.
+  EXPIRED
+  CANCELLED
+}
+
+model Reservation {
+  id       String @id @default(cuid())
+  tenantId String
+  eventId  String
+
+  /// A User id from Auth's database. No foreign key: that table is in another
+  /// database this service cannot connect to. Always taken from the verified
+  /// token, never from the request body.
+  userId String
+
+  status ReservationStatus @default(HELD)
+
+  /// When the hold lapses. Enforced by a sweeper, NOT by an index predicate:
+  /// now() is STABLE rather than IMMUTABLE, so `WHERE expiresAt > now()` is
+  /// rejected with "functions in index predicate must be marked IMMUTABLE".
+  /// Expiry is therefore a state transition someone performs, not a view.
+  expiresAt DateTime
+
+  /// Set when the payment provider call starts. While this is set the sweeper
+  /// leaves the row alone.
+  paymentStartedAt DateTime?
+  confirmedAt      DateTime?
+
+  version Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items ReservationItem[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, userId])
+  @@index([tenantId, eventId])
+  /// NOTE: the sweeper's index is created as raw SQL in the migration, predicated
+  /// on status rather than on time — see expiresAt above.
+}
+
+model ReservationItem {
+  id       String @id @default(cuid())
+  tenantId String
+
+  reservationId String
+  ticketTypeId  String
+  quantity      Int
+
+  reservation Reservation @relation(fields: [tenantId, reservationId], references: [tenantId, id], onDelete: Restrict)
+  ticketType  TicketType  @relation(fields: [tenantId, ticketTypeId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, reservationId, ticketTypeId])
+  @@index([tenantId, ticketTypeId])
+}
+
+/// Makes a retried POST safe to replay.
+///
+/// Two-phase: the row is claimed BEFORE the work starts and completed after, so
+/// a crash mid-flight is distinguishable from a duplicate. Writing it only after
+/// the work commits would let a retry duplicate the work; writing it in the same
+/// transaction cannot store a response status that is not known until the
+/// handler returns.
+model IdempotencyKey {
+  id       String @id @default(cuid())
+  tenantId String
+  userId   String
+
+  key      String
+  endpoint String
+
+  /// sha256(method + path + canonical body). Without it, someone who observes a
+  /// victim's Idempotency-Key can send it with a DIFFERENT body and receive the
+  /// victim's stored response.
+  requestHash String
+
+  /// 'in_progress' | 'completed'
+  state String @default("in_progress")
+
+  responseStatus Int?
+  responseBody   Json?
+
+  /// What stops a killed process wedging a key forever. Without a lease, a crash
+  /// between claim and completion makes that key permanently unusable.
+  leaseExpiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Scoped by tenant AND user. Keyed on `key` alone, tenant B replaying tenant
+  /// A's key would receive A's cached response body verbatim.
+  @@unique([tenantId, userId, endpoint, key])
+  @@index([tenantId, leaseExpiresAt])
+}
+
+/// Consumer-side deduplication.
+///
+/// Delivery is at-least-once — the relay can crash after producing and before
+/// committing, and will republish on restart. Every consumer must therefore
+/// recognise a message it has already applied. messageId is the outbox row id,
+/// stable across relay retries; (topic, partition, offset) is not, because a
+/// redelivery gets a new offset.
+model ProcessedMessage {
+  id            String   @id @default(cuid())
+  tenantId      String
+  consumerGroup String
+  messageId     String
+  processedAt   DateTime @default(now())
+
+  @@unique([tenantId, consumerGroup, messageId])
+  @@index([processedAt])
+}
+
+/// How far behind the projection is.
+///
+/// Written in the SAME transaction as the projection update, so it cannot claim
+/// to be caught up on data it did not apply. It exists to disambiguate a missing
+/// projection row: lag near zero means the event genuinely does not exist (404),
+/// while high lag means this service is behind (503 with Retry-After). Without
+/// it, both look identical and a customer is told an event does not exist when
+/// it does.
+model ConsumerCheckpoint {
+  id            String @id @default(cuid())
+  consumerGroup String
+  topic         String
+  partition     Int
+
+  lastOffset          BigInt
+  lastMessageOccurred DateTime?
+  updatedAt           DateTime  @updatedAt
+
+  @@unique([consumerGroup, topic, partition])
+}
+
+/// Ticketing's own outbox, same shape as the Event service's.
+///
+/// Identical on purpose: the relay reads `topic` off the row and is otherwise
+/// routing-free, so draining this table needs a different connection string and
+/// nothing else.
+model OutboxMessage {
+  id       String @id @default(cuid())
+  tenantId String
+
+  seq BigInt @default(autoincrement())
+
+  topic         String
+  eventType     String
+  schemaVersion Int    @default(1)
+  aggregateId   String
+
+  payload     Json
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  attempts       Int       @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deadLetteredAt DateTime?
+
+  /// NOTE: no @@index([publishedAt, seq]) — Postgres cannot use a leading
+  /// IS NULL column to supply ORDER BY, so that index restricts rows and then
+  /// SORTS, degrading exactly as the backlog grows. The partial index is raw
+  /// SQL in the migration.
+  @@index([tenantId])
+}
