@@ -4,6 +4,7 @@ import { withTenant } from '../db.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { requireAuth, requireRole } from '../auth.js';
 import { ah } from '../async.js';
+import { SNAPSHOT_SELECT, emitEventSnapshot } from '../outbox.js';
 
 // The explicit `: Router` annotation is required, not stylistic. With
 // declaration emit on, TypeScript must name this type in the generated .d.ts —
@@ -80,8 +81,8 @@ events.post('/', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, 
   const body = parsed.data;
 
   try {
-    const event = await withTenant(tenantId, (tx) =>
-      tx.event.create({
+    const event = await withTenant(tenantId, async (tx) => {
+      const created = await tx.event.create({
         data: {
           tenantId,
           // Taken from the verified token, NEVER from the request body. There is
@@ -98,12 +99,16 @@ events.post('/', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, 
           endsAt: body.endsAt,
           venueId: body.venueId ?? null,
         },
-        select: {
-          id: true, title: true, slug: true, status: true, capacity: true,
-          startsAt: true, endsAt: true, version: true, organiserId: true,
-        },
-      }),
-    );
+        select: SNAPSHOT_SELECT,
+      });
+
+      // Emitted on creation too, not only on publish. events.activity is a
+      // snapshot topic describing the current state of an event, so a consumer
+      // that has never heard of a DRAFT event cannot reason about it later
+      // becoming PUBLISHED. Ticketing simply ignores anything not PUBLISHED.
+      await emitEventSnapshot(tx, created, 'CREATED');
+      return created;
+    });
 
     return res.status(201).json(event);
   } catch (err) {
@@ -277,6 +282,17 @@ events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (r
         id,
         deletedAt: null,
         ...(ifMatch.kind === 'version' ? { version: ifMatch.version } : {}),
+        // Capacity is fixed once an event is published.
+        //
+        // This service structurally cannot check how many tickets have been
+        // sold — that lives in eventhub_ticketing, behind a REVOKE CONNECT it
+        // has no credential for. So lowering capacity from 500 to 50 after 300
+        // tickets were sold would put the system in a state its own invariants
+        // call impossible, silently and with nothing to detect it.
+        //
+        // Adding the predicate here rather than checking first keeps it atomic:
+        // a concurrent publish cannot slip between a check and the update.
+        ...(parsed.data.capacity !== undefined ? { status: 'DRAFT' as const } : {}),
       },
       data: {
         ...parsed.data,
@@ -292,11 +308,13 @@ events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (r
     if (count === 1) {
       const updated = await tx.event.findFirst({
         where: { id, deletedAt: null },
-        select: {
-          id: true, title: true, slug: true, description: true, status: true,
-          capacity: true, startsAt: true, endsAt: true, version: true,
-        },
+        select: SNAPSHOT_SELECT,
       });
+      // Emitted in the same transaction, so a downstream projection cannot
+      // drift. Without this, a consumer would hold whatever it learned at
+      // publish time and never hear about a change — an organiser publishes at
+      // capacity 500, patches to 200, and Ticketing keeps selling 500.
+      await emitEventSnapshot(tx, updated!, 'UPDATED');
       return { kind: 'updated' as const, event: updated! };
     }
 
@@ -309,16 +327,30 @@ events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (r
     // cross-tenant existence oracle — one line, and it looks entirely correct.
     const exists = await tx.event.findFirst({
       where: { id, deletedAt: null },
-      select: { version: true },
+      select: { version: true, status: true },
     });
 
-    return exists
-      ? { kind: 'conflict' as const, currentVersion: exists.version }
-      : { kind: 'missing' as const };
+    if (!exists) return { kind: 'missing' as const };
+
+    // Distinguish "you tried to change capacity on a published event" from a
+    // genuine version conflict. Both produce count 0, and reporting a version
+    // conflict for a rule violation sends the client into a retry loop that can
+    // never succeed.
+    if (parsed.data.capacity !== undefined && exists.status !== 'DRAFT') {
+      return { kind: 'capacity-locked' as const, status: exists.status };
+    }
+
+    return { kind: 'conflict' as const, currentVersion: exists.version };
   });
 
   if (outcome.kind === 'missing') {
     return res.status(404).json({ error: 'event not found' });
+  }
+
+  if (outcome.kind === 'capacity-locked') {
+    return res.status(409).json({
+      error: `capacity is fixed once an event is published (status is ${outcome.status})`,
+    });
   }
 
   if (outcome.kind === 'conflict') {
@@ -363,40 +395,15 @@ events.post('/:id/publish', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(a
 
     const event = await tx.event.findFirst({
       where: { id },
-      select: {
-        id: true, title: true, slug: true, status: true, capacity: true,
-        startsAt: true, endsAt: true, organiserId: true, version: true,
-      },
+      select: SNAPSHOT_SELECT,
     });
 
-    // THE POINT OF THE OUTBOX: this insert is in the SAME transaction as the
+    // THE POINT OF THE OUTBOX: this write is in the SAME transaction as the
     // status change above. You cannot atomically write to Postgres and publish
     // to Kafka - a crash between the two either loses the message or announces
-    // something that never happened. Committing both together makes the
-    // database the single source of truth, and a separate relay drains this
-    // table afterwards. That relay is Chapter 4; the row is written now so the
-    // pattern is in place before money depends on it.
-    await tx.outboxMessage.create({
-      data: {
-        tenantId,
-        eventType: 'event.published',
-        schemaVersion: 1,
-        // The Kafka partition key. Keyed by the event so all messages about one
-        // event stay ordered - never by tenantId, which would put a whole
-        // tenant's traffic on a single partition.
-        aggregateId: event!.id,
-        payload: {
-          eventId: event!.id,
-          tenantId,
-          title: event!.title,
-          slug: event!.slug,
-          capacity: event!.capacity,
-          startsAt: event!.startsAt.toISOString(),
-          endsAt: event!.endsAt.toISOString(),
-          organiserId: event!.organiserId,
-        },
-      },
-    });
+    // something that never happened. Committing both together makes the database
+    // the single source of truth, and a separate relay drains the table.
+    await emitEventSnapshot(tx, event!, 'PUBLISHED');
 
     return { kind: 'published' as const, event: event! };
   });
@@ -415,17 +422,81 @@ events.post('/:id/publish', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(a
 // Soft delete
 // ---------------------------------------------------------------------------
 events.delete('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, res) => {
-  const { count } = await withTenant(req.auth!.tenantId, (tx) =>
-    tx.event.updateMany({
-      where: { id: req.params.id, deletedAt: null },
-      data: { deletedAt: new Date(), version: { increment: 1 } },
-    }),
-  );
+  const id = req.params.id;
 
-  // Soft delete rather than DELETE, so the row survives for audit and Sessions
-  // pointing at it do not become dangling. It also frees the slug, because the
-  // unique index covers only rows where deletedAt IS NULL.
-  if (count === 0) return res.status(404).json({ error: 'event not found' });
+  const outcome = await withTenant(req.auth!.tenantId, async (tx) => {
+    // Soft delete rather than DELETE, so the row survives for audit and Sessions
+    // pointing at it do not become dangling. It also frees the slug, because the
+    // unique index covers only rows where deletedAt IS NULL.
+    const { count } = await tx.event.updateMany({
+      where: { id, deletedAt: null },
+      data: { deletedAt: new Date(), version: { increment: 1 } },
+    });
+
+    if (count === 0) return { kind: 'missing' as const };
+
+    const deleted = await tx.event.findFirst({ where: { id }, select: SNAPSHOT_SELECT });
+
+    // A deletion MUST be announced. Ticketing has no foreign key to this table
+    // and cannot discover the row is gone — without this message it keeps
+    // selling tickets for an event that no longer exists.
+    await emitEventSnapshot(tx, deleted!, 'DELETED');
+
+    return { kind: 'deleted' as const };
+  });
+
+  if (outcome.kind === 'missing') return res.status(404).json({ error: 'event not found' });
 
   return res.status(204).send();
+}));
+
+// ---------------------------------------------------------------------------
+// Cancel
+// ---------------------------------------------------------------------------
+//
+// Distinct from delete. A cancelled event still happened as far as everyone
+// downstream is concerned: refunds are owed, attendees must be told, and the
+// record stays visible. A deleted event is one that should not have existed.
+//
+// Ticketing's safety story depends on this arriving — it is the signal to stop
+// selling and start refunding, and there is no other way for it to find out.
+events.post('/:id/cancel', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, res) => {
+  const id = req.params.id;
+
+  const outcome = await withTenant(req.auth!.tenantId, async (tx) => {
+    // The allowed source states live in the WHERE clause, so two concurrent
+    // cancels cannot both match and emit.
+    const { count } = await tx.event.updateMany({
+      where: { id, deletedAt: null, status: { in: ['DRAFT', 'PUBLISHED'] } },
+      data: { status: 'CANCELLED', version: { increment: 1 } },
+    });
+
+    if (count === 0) {
+      const exists = await tx.event.findFirst({
+        where: { id, deletedAt: null },
+        select: { status: true },
+      });
+      return exists
+        ? { kind: 'wrong-state' as const, status: exists.status }
+        : { kind: 'missing' as const };
+    }
+
+    const cancelled = await tx.event.findFirst({ where: { id }, select: SNAPSHOT_SELECT });
+    await emitEventSnapshot(tx, cancelled!, 'CANCELLED');
+
+    return { kind: 'cancelled' as const, event: cancelled! };
+  });
+
+  if (outcome.kind === 'missing') {
+    return res.status(404).json({ error: 'event not found' });
+  }
+  if (outcome.kind === 'wrong-state') {
+    return res.status(409).json({ error: `cannot cancel an event in state ${outcome.status}` });
+  }
+
+  return res.json({
+    id: outcome.event.id,
+    status: outcome.event.status,
+    version: outcome.event.version,
+  });
 }));
