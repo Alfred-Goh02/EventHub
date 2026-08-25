@@ -242,12 +242,18 @@ jobs:
         env:
           TICKETING_APP_DATABASE_URL: ${{ env.TICKETING_APP_DATABASE_URL }}
         run: |
+          # Read the key BEFORE the subshell. A command substitution written
+          # inside `(cd services/ticketing && ... $(base64 services/auth/...))`
+          # is evaluated after the cd, so the path resolves relative to the
+          # WRONG directory and silently yields an empty value.
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
           (cd services/auth && node dist/index.js &)
           (cd services/ticketing && \
             PORT=3003 \
             DATABASE_URL="$TICKETING_DATABASE_URL" \
             APP_DATABASE_URL="$TICKETING_APP_DATABASE_URL" \
-            AUTH_PUBLIC_KEY_B64="$(base64 -w0 services/auth/keys/public.pem)" \
             node dist/index.js &)
 
           for i in $(seq 1 25); do
