@@ -135,10 +135,40 @@ model OutboxMessage {
   /// partition and adding brokers does nothing for the busiest customer.
   aggregateId String
 
+  /// The destination topic, chosen by the handler that emits the row.
+  ///
+  /// Deliberately stored rather than derived: 'event.published' does not
+  /// mechanically become 'events.activity', so without this the relay needs a
+  /// hardcoded map of every event type from every service. With it the relay is
+  /// routing-free — read row, produce to row.topic keyed by row.aggregateId —
+  /// and reusable for Ticketing's outbox with only a different connection string.
+  topic String
+
   payload     Json
   publishedAt DateTime?
   createdAt   DateTime  @default(now())
 
-  @@index([publishedAt, seq])
+  /// Failure handling. Without these, ONE row that cannot be serialised is
+  /// re-selected by ORDER BY seq on every poll, fails, is re-selected, forever —
+  /// and nothing behind it is ever published. The only symptom is a growing
+  /// backlog and a repeating log line.
+  ///
+  /// There is already a row in this table that will do exactly that: its payload
+  /// stores startsAt as an ISO-8601 string, and the natural Avro type for a
+  /// timestamp rejects a string.
+  attempts       Int       @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deadLetteredAt DateTime?
+
+  /// NOTE: there is deliberately NO @@index([publishedAt, seq]) here.
+  ///
+  /// Postgres does not treat IS NULL on a leading index column as fixing it, so
+  /// that index restricts to undelivered rows but cannot supply seq order — the
+  /// plan still sorts, and gets slower exactly as the backlog grows, which is
+  /// the wrong direction for the feedback loop. The replacement is a PARTIAL
+  /// index created as raw SQL in the migration, which Prisma cannot express. It
+  /// also self-empties as rows are published, so it stays a few pages forever
+  /// instead of tracking table size.
   @@index([tenantId])
 }

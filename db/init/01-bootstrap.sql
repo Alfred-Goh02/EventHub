@@ -27,6 +27,21 @@ CREATE ROLE eventhub_event_app   LOGIN          PASSWORD 'eventhub_event_app';
 -- tenant, so it gets its own role and its own policy instead of the superuser.
 CREATE ROLE eventhub_event_relay LOGIN          PASSWORD 'eventhub_event_relay';
 
+-- Bound the relay's transactions.
+--
+-- The drain holds a transaction open across a Kafka round-trip, so that
+-- FOR UPDATE SKIP LOCKED actually claims rows for the duration. An open
+-- transaction pins xmin and blocks VACUUM across the WHOLE cluster, so a relay
+-- that hangs mid-batch quietly degrades every other table in every database.
+--
+-- These are ALTER ROLE, which is cluster-level. They cannot live in the Event
+-- service's migration: eventhub_event_owner is deliberately not a superuser and
+-- has no CREATEROLE, so it cannot alter another role — attempting it fails with
+-- "permission denied to alter role". Role attributes belong here, where the
+-- superuser runs them.
+ALTER ROLE eventhub_event_relay SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_event_relay SET statement_timeout = '15s';
+
 -- ---------------------------------------------------------------------------
 -- One database per service. No cross-database joins exist in Postgres, so the
 -- service boundary is enforced by the engine rather than by discipline.
