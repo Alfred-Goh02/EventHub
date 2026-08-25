@@ -3,6 +3,7 @@ import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
+import { reservations } from './routes/reservations.js';
 
 const env = loadBaseEnv();
 const logger = createLogger('ticketing-service');
@@ -17,6 +18,8 @@ app.get('/health', (_req, res) => {
 app.get('/whoami', requireAuth, (req, res) => {
   res.json({ service: 'ticketing', ...req.auth });
 });
+
+app.use('/reservations', reservations);
 
 // Express 4 identifies an error handler by its ARITY: four parameters. Drop
 // `_next` and it silently becomes ordinary middleware that never runs on error.
