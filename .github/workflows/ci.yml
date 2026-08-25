@@ -231,6 +231,40 @@ jobs:
 
           pkill -f "node dist/index.js" || true
 
+      # The assertion the whole reservation design exists for.
+      #
+      # The naive read-then-write has NO protection under READ COMMITTED: both
+      # racers read the same count, both conclude they may proceed, and the seat
+      # is sold twice. This fires 40 concurrent buyers at 5 seats and asserts
+      # exactly 5 succeed, remaining never goes negative, and
+      # remaining + held + sold = total still holds.
+      - name: Assert seats cannot be oversold under concurrency
+        env:
+          TICKETING_APP_DATABASE_URL: ${{ env.TICKETING_APP_DATABASE_URL }}
+        run: |
+          # Read the key BEFORE the subshell. A command substitution written
+          # inside `(cd services/ticketing && ... $(base64 services/auth/...))`
+          # is evaluated after the cd, so the path resolves relative to the
+          # WRONG directory and silently yields an empty value.
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/auth && node dist/index.js &)
+          (cd services/ticketing && \
+            PORT=3003 \
+            DATABASE_URL="$TICKETING_DATABASE_URL" \
+            APP_DATABASE_URL="$TICKETING_APP_DATABASE_URL" \
+            node dist/index.js &)
+
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null \
+               && curl -sf http://localhost:3003/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          node scripts/verify-no-oversell.mjs
+          pkill -f "node dist/index.js" || true
+
       # The assertion that ties Chapter 4 together. Every piece is checked
       # separately above — the schema contract, the broker round-trip, the RLS
       # policies — but "does a row written by a service actually become a message
