@@ -46,6 +46,9 @@ jobs:
       # even open a connection to eventhub_auth.
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@localhost:5432/eventhub_event
       EVENT_APP_DATABASE_URL: postgresql://eventhub_event_app:eventhub_event_app@localhost:5432/eventhub_event
+      # Ticketing: a third database, again with its own credentials.
+      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@localhost:5432/eventhub_ticketing
+      TICKETING_APP_DATABASE_URL: postgresql://eventhub_ticketing_app:eventhub_ticketing_app@localhost:5432/eventhub_ticketing
       JWT_ISSUER: https://auth.eventhub.local
       JWT_AUDIENCE: eventhub-api
       NODE_ENV: test
@@ -97,6 +100,12 @@ jobs:
         working-directory: services/event
         env:
           DATABASE_URL: ${{ env.EVENT_DATABASE_URL }}
+        run: pnpm exec prisma migrate deploy
+
+      - name: Apply migrations (ticketing)
+        working-directory: services/ticketing
+        env:
+          DATABASE_URL: ${{ env.TICKETING_DATABASE_URL }}
         run: pnpm exec prisma migrate deploy
 
       - name: Seed
@@ -301,13 +310,38 @@ jobs:
           # relay rather than being exempt.
           check "$EVENT_DATABASE_URL" event "'_prisma_migrations'"
 
+          # Ticketing has NO exemptions. Nothing here is looked up before tenant
+          # context exists: every request carries a verified JWT, and the
+          # consumer reads tenantId off the message before writing.
+          check "$TICKETING_DATABASE_URL" ticketing "'_prisma_migrations'"
+
       # Database-per-service must hold at the CONNECTION boundary, not merely at
       # the table grants. If this ever starts succeeding, the isolation has been
       # quietly weakened.
-      - name: Assert Event cannot connect to Auth's database
+      - name: Assert services cannot connect to each other's databases
         run: |
-          if psql "postgresql://eventhub_event_app:eventhub_event_app@localhost:5432/eventhub_auth" -tAc 'SELECT 1' 2>/dev/null; then
-            echo "ISOLATION FAILED: the event role opened a session against eventhub_auth"
-            exit 1
-          fi
-          echo "event role is refused CONNECT to eventhub_auth, as intended"
+          refuse() {
+            local role="$1" db="$2"
+            if psql "postgresql://$role:$role@localhost:5432/$db" -tAc 'SELECT 1' >/dev/null 2>&1; then
+              echo "ISOLATION FAILED: $role opened a session against $db"
+              exit 1
+            fi
+            echo "  refused   $role -> $db"
+          }
+
+          # Every cross-service direction. Database-per-service must hold at the
+          # CONNECTION boundary, not merely at the table grants — otherwise a
+          # leaked credential can still enumerate another service's schema from
+          # pg_catalog even when the table reads are denied.
+          refuse eventhub_event_app     eventhub_auth
+          refuse eventhub_event_app     eventhub_ticketing
+          refuse eventhub_ticketing_app eventhub_auth
+          refuse eventhub_ticketing_app eventhub_event
+          refuse eventhub_auth_app      eventhub_event
+          refuse eventhub_auth_app      eventhub_ticketing
+
+          # And the positive control: the correct pairing must still work, or
+          # this assertion would pass for the wrong reason.
+          psql "$TICKETING_APP_DATABASE_URL" -tAc 'SELECT 1' >/dev/null \
+            || { echo "the ticketing role cannot reach its OWN database"; exit 1; }
+          echo "  connected eventhub_ticketing_app -> eventhub_ticketing"
