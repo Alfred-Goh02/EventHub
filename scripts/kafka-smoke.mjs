@@ -15,7 +15,14 @@
 import { Kafka, logLevel } from 'kafkajs';
 
 const BROKER = process.env['KAFKA_BROKERS'] ?? 'localhost:9092';
-const TOPIC = 'events.activity';
+// Its own throwaway topic, NOT events.activity.
+//
+// This script produces plain JSON. events.activity carries Avro with the
+// Confluent wire format (a magic byte plus a 4-byte schema id), so a JSON
+// message sitting on it is undecodable to a real consumer - and an undecodable
+// message blocks that partition until someone intervenes. A broker smoke test
+// must not be able to poison a production topic.
+const TOPIC = 'smoke.roundtrip';
 
 const kafka = new Kafka({
   clientId: 'eventhub-smoke',
