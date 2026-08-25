@@ -22,5 +22,99 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------------------------------------------------------------------------
+  # Kafka in KRaft mode — one process that is both broker and controller, with
+  # no ZooKeeper. ZooKeeper was removed from Kafka in 4.0; every tutorial older
+  # than about 2024 still shows a second container for it, and you do not need it.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: eventhub-kafka
+    restart: unless-stopped
+    ports:
+      # Only the host listener is published. Containers use kafka:29092 instead.
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # THE PART EVERYONE GETS WRONG.
+      #
+      # A Kafka client does not keep talking to the address it first dialled. It
+      # asks the broker for metadata, and the broker replies with its ADVERTISED
+      # address — which the client then connects to for all real work.
+      #
+      # So one address cannot serve both audiences. A container reaching
+      # kafka:29092 must be told "kafka:29092"; a process on Windows reaching
+      # localhost:9092 must be told "localhost:9092". Advertise only the internal
+      # name and your host tools connect, fetch metadata, then fail trying to
+      # resolve a hostname that means nothing outside the Docker network.
+      #
+      # Hence two listeners with two advertised addresses.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      # Single broker, so nothing can be replicated anywhere. These default to 3
+      # and the broker refuses to create its internal topics without them.
+      # Production would be 3 with min.insync.replicas=2.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Do not wait for other consumers to join before rebalancing. Saves three
+      # seconds on every local start; must not be 0 in production.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # KRaft needs a cluster id at format time. Fixed here so a rebuilt volume
+      # produces the same cluster rather than a random one.
+      CLUSTER_ID: EventHubLocalCluster1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Confluent Schema Registry. Holds the Avro schemas and enforces compatibility
+  # at REGISTRATION time — an incompatible producer is rejected before it can
+  # publish a message that breaks four consumers at 3am.
+  #
+  # It stores schemas in a Kafka topic (_schemas), so it needs the broker, not a
+  # database of its own. It works against KRaft Kafka; it never needed ZooKeeper.
+  # ---------------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.8.0
+    container_name: eventhub-schema-registry
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      # The INTERNAL listener: this container talks to Kafka over the Docker network.
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      # BACKWARD: a new schema must be able to read data written by the previous
+      # one, so consumers can be upgraded before producers. Adding an optional
+      # field is fine; removing a required one is rejected at registration.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/subjects >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
 volumes:
   postgres-data:
+  kafka-data:
