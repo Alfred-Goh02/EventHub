@@ -20,8 +20,38 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'auth' });
 });
 
+/**
+ * Email, normalised at the SCHEMA boundary rather than at each use site.
+ *
+ * issueInvite() lowercases before storing, so a user invited as
+ * "Bob.Smith@Acme.COM" is stored as "bob.smith@acme.com". /login did NOT
+ * lowercase before looking up, and User is @@unique([tenantId, email]) on the
+ * stored value -- so that user got 401 when signing in with the exact address
+ * they were invited at, and only the lowercased form worked. Demonstrated
+ * against the running service.
+ *
+ * Normalising here rather than in each handler is the point: a route that
+ * forgets to lowercase is a lockout that looks exactly like a wrong password,
+ * and the next email-shaped input would have forgotten it again.
+ *
+ * Only case and surrounding whitespace are touched. The local part of an
+ * address is case-SENSITIVE per RFC 5321 and lowercasing it is technically
+ * lossy, but every mainstream provider treats it case-insensitively, and
+ * matching what is already in the column matters more than standards purity
+ * that would lock people out.
+ */
+const emailField = z
+  .string()
+  // .trim() must come BEFORE .email(), not in the transform after it. Zod runs
+  // validation in declaration order, so trimming afterwards would still reject
+  // "  alice@acme.com  " with a 400 -- and a pasted address carrying a trailing
+  // space is a copy-paste artefact, not a malformed address.
+  .trim()
+  .email()
+  .transform((e) => e.toLowerCase());
+
 const inviteSchema = z.object({
-  email: z.string().email(),
+  email: emailField,
   role: z.enum(['ADMIN', 'ORGANIZER', 'ATTENDEE']).default('ATTENDEE'),
 });
 
@@ -115,7 +145,7 @@ app.post('/register', async (req, res) => {
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: emailField,
   password: z.string(),
 });
 

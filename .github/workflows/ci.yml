@@ -208,6 +208,20 @@ jobs:
           curl -sf http://localhost:3001/me -H "Authorization: Bearer $TOKEN"
 
           echo ""
+          echo "--- the same address in a different case must still log in ---"
+          # issueInvite() lowercases before storing, /login did not lowercase
+          # before looking up, and User is unique on the stored value -- so a
+          # user invited as "Bob.Smith@Acme.COM" got 401 with the exact address
+          # they were invited at, and only the lowercased form worked. A lockout
+          # that looks identical to a wrong password.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/login \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tenant-ID: tenant_acme' \
+            -d '{"email":"ALICE@ACME.COM","password":"hunter2222"}')
+          test "$CODE" = "200" || { echo "expected 200 for an upper-case address, got $CODE"; kill $SERVER_PID; exit 1; }
+          echo "upper-case address accepted ($CODE)"
+
+          echo ""
           echo "--- registering without an invite must FAIL ---"
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/register \
             -H 'Content-Type: application/json' \
