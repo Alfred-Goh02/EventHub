@@ -152,6 +152,20 @@ jobs:
           git diff --exit-code -- contracts/generated \
             || { echo "contracts/generated is stale — run: node scripts/generate-avro-types.mjs"; exit 1; }
 
+      # Up to date is not the same as correct.
+      #
+      # The step above only proves the committed output matches what the
+      # generator produces today. It said yes for two chapters while that output
+      # referenced an interface that was never declared: the generator collected
+      # nested ENUMS but not nested RECORDS, so every array-of-record field
+      # emitted `items: Array<ReservationLine>` with no ReservationLine anywhere
+      # in the file. Nothing imported these files and no tsconfig included them,
+      # so they were documentation that happened to end in .ts.
+      #
+      # Compiling them is what turns that from invisible into a red build.
+      - name: Generated Avro types actually compile
+        run: pnpm --filter @eventhub/contracts build
+
       - name: Generate JWT keypair
         working-directory: services/auth
         run: node scripts/generate-keys.mjs

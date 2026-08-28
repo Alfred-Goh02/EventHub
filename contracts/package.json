@@ -1,0 +1,13 @@
+{
+  "name": "@eventhub/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@eventhub/tsconfig": "workspace:*",
+    "typescript": "5.7.3"
+  }
+}

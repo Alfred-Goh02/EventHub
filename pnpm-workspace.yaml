@@ -1,3 +1,7 @@
 packages:
   - "services/*"
   - "packages/*"
+  # The Avro contracts. A package purely so the generated types get COMPILED:
+  # they went two chapters referencing an interface that was never declared,
+  # because nothing imported them and no tsconfig included them.
+  - "contracts"

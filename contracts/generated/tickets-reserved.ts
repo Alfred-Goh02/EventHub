@@ -9,6 +9,11 @@ export type ReservationState =
   | 'CANCELLED'
   | 'CONFIRMED';
 
+export interface ReservationLine {
+  ticketTypeId: string;
+  quantity: number;
+}
+
 /**
  * A seat hold was taken, or released. Unlike events.activity this topic is NOT
  * compacted: for reservations the SEQUENCE is the information — a consumer
