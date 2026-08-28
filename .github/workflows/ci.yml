@@ -252,7 +252,7 @@ jobs:
       # is sold twice. This fires 40 concurrent buyers at 5 seats and asserts
       # exactly 5 succeed, remaining never goes negative, and
       # remaining + held + sold = total still holds.
-      - name: Assert seats cannot be oversold, and prices cannot move under a buyer
+      - name: Assert the reservation and payment invariants end to end
         env:
           TICKETING_APP_DATABASE_URL: ${{ env.TICKETING_APP_DATABASE_URL }}
         run: |
@@ -284,6 +284,17 @@ jobs:
           # the receipt looks perfectly consistent with the ticket type it was
           # read from.
           node scripts/verify-price-locked.mjs
+
+          # Every outcome of the payment path, including the two that only
+          # matter when something goes wrong.
+          #
+          # A declined card must return the seats to a plain hold rather than
+          # cancelling the reservation, and an UNANSWERED provider must leave
+          # the seats held and the attempt unsettled -- the money may have moved,
+          # and releasing the seats would resell something already paid for.
+          # This also runs the sweeper against a PENDING_PAYMENT reservation
+          # whose hold has expired, and asserts it does NOT reclaim the seats.
+          node scripts/verify-payment-path.mjs
           pkill -f "node dist/index.js" || true
 
       # The cross-service assertion, and the one that would have caught the
