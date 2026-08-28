@@ -33,7 +33,10 @@ export function createPool(connectionString: string): pg.Pool {
  * pointed at an over-privileged credential works perfectly and is simply far
  * more dangerous if it leaks.
  */
-export async function assertRelayIsLeastPrivilege(pool: pg.Pool): Promise<void> {
+export async function assertRelayIsLeastPrivilege(
+  pool: pg.Pool,
+  forbiddenTable: string,
+): Promise<void> {
   const client = await pool.connect();
   try {
     const who = await client.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
@@ -49,20 +52,45 @@ export async function assertRelayIsLeastPrivilege(pool: pg.Pool): Promise<void> 
       );
     }
 
-    // Must FAIL. If this succeeds, the credential is wrong.
-    let couldReadEvents = false;
-    try {
-      await client.query('SELECT 1 FROM "Event" LIMIT 1');
-      couldReadEvents = true;
-    } catch {
-      // Expected: permission denied for table Event.
+    /**
+     * The table must EXIST before its inaccessibility proves anything.
+     *
+     * The first version of this check hardcoded "Event" and simply required the
+     * SELECT to fail. Pointed at the Ticketing database — which has no Event
+     * table at all — it passed on "relation does not exist", i.e. because the
+     * table was ABSENT rather than because access was denied. A check that
+     * passes because the thing it guards is missing is worse than no check: it
+     * reports a privilege boundary that was never tested.
+     *
+     * So: confirm the table is there, THEN confirm reading it is refused.
+     */
+    const exists = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM pg_class
+        WHERE relname = $1 AND relnamespace = 'public'::regnamespace AND relkind = 'r'`,
+      [forbiddenTable],
+    );
+
+    if (Number(exists.rows[0]?.n ?? 0) === 0) {
+      throw new Error(
+        `refusing to start: RELAY_FORBIDDEN_TABLE is "${forbiddenTable}" but no such table ` +
+          'exists in this database, so the privilege check would pass without testing anything. ' +
+          'Set it to a business table that DOES exist here.',
+      );
     }
 
-    if (couldReadEvents) {
+    let couldRead = false;
+    try {
+      await client.query(`SELECT 1 FROM "${forbiddenTable}" LIMIT 1`);
+      couldRead = true;
+    } catch {
+      // Expected: permission denied.
+    }
+
+    if (couldRead) {
       throw new Error(
-        'refusing to start: the relay credential can read the Event table. It should have ' +
-          'SELECT on OutboxMessage only — it reads across every tenant, so it must not ' +
-          'also be able to read tenant data.',
+        `refusing to start: the relay credential can read "${forbiddenTable}". It should have ` +
+          'SELECT on OutboxMessage only — it reads across every tenant, so it must not also ' +
+          'be able to read tenant data.',
       );
     }
   } finally {

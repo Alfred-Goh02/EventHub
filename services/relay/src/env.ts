@@ -40,6 +40,16 @@ const schema = z.object({
    * fails, and is re-selected forever — and because the drain is ordered by seq,
    * nothing behind it is ever published. The only symptom is a growing backlog.
    */
+  /**
+   * A business table that EXISTS in this relay's database and that the relay
+   * must NOT be able to read. Asserted at boot.
+   *
+   * Configurable because it differs per database, and because the check is
+   * meaningless if the named table is absent - it would then pass on "relation
+   * does not exist" without testing any privilege at all.
+   */
+  RELAY_FORBIDDEN_TABLE: z.string().min(1).default('Event'),
+
   RELAY_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
 });
 

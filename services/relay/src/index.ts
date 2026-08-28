@@ -93,7 +93,7 @@ const runOnce = process.argv.includes('--once');
 async function main(): Promise<void> {
   // Fails closed: refuses to start if the credential can read business tables
   // or bypass row security.
-  await assertRelayIsLeastPrivilege(pool);
+  await assertRelayIsLeastPrivilege(pool, env.RELAY_FORBIDDEN_TABLE);
 
   await publisher.connect();
 
