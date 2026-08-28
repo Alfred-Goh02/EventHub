@@ -37,6 +37,7 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   refreshTokens RefreshToken[]
+  passwordResets PasswordResetToken[]
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -84,4 +85,51 @@ model RefreshToken {
 
   @@index([userId])
   @@index([familyId])
+}
+
+/// A password reset in flight.
+///
+/// Same primitive as Invite and RefreshToken: 32 random bytes handed out once,
+/// only the SHA-256 hash stored, single-use, with a short expiry. Minted by
+/// secret-token.ts, which all three now share.
+///
+/// It carries its own tenantId for the same reason RefreshToken does — the
+/// lookup happens BEFORE any tenant context exists, so the tenant is a RESULT
+/// of the query rather than an input to it. That is also why this table is
+/// RLS-exempt: a tenant policy would filter out the very row that says which
+/// tenant to use. The exemption is justified in the migration and listed in
+/// ci.yml, because an exemption nobody wrote down is indistinguishable from a
+/// policy somebody forgot.
+///
+/// The TTL is 30 minutes, not the invite's 7 days. An invite waits on a human
+/// who may not be at their desk; a reset is requested by someone sitting there
+/// right now, and every extra minute is extra time for a token that has escaped.
+model PasswordResetToken {
+  id       String @id @default(cuid())
+  userId   String
+  tenantId String
+
+  tokenHash String @unique
+
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  /// Superseded rather than spent.
+  ///
+  /// Without this column a victim's own successful reset would leave an
+  /// attacker's earlier token live for the rest of its TTL — the user does the
+  /// one thing they are told to do, and it buys them nothing. Issuing a new
+  /// token revokes the old ones, and completing a reset revokes the siblings,
+  /// so at most one is ever live per user.
+  revokedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Sibling invalidation runs on every issue and every completion, so it must
+  /// not be a sequential scan. RefreshToken carries the same index for the same
+  /// reason.
+  @@index([userId])
+  @@index([tenantId])
 }

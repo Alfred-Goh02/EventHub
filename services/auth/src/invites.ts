@@ -1,14 +1,8 @@
-import { createHash, randomBytes } from 'node:crypto';
 import type { Role } from '@eventhub/types';
 import { prisma } from './db.js';
+import { hashSecretToken as hashToken, newSecretToken } from './secret-token.js';
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-// SHA-256, not argon2 — the input is already 256 bits of entropy, so there is
-// nothing to brute force and a slow hash would buy nothing. Same reasoning as
-// refresh tokens.
-const hashToken = (token: string) =>
-  createHash('sha256').update(token).digest('hex');
 
 /**
  * Creates an invite and returns the raw token EXACTLY ONCE.
@@ -23,7 +17,7 @@ export async function issueInvite(params: {
   role: Role;
   invitedBy: string;
 }): Promise<{ token: string; expiresAt: Date }> {
-  const token = randomBytes(32).toString('base64url');
+  const token = newSecretToken();
   const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
 
   await prisma.invite.create({
@@ -69,21 +63,4 @@ export async function lookupInvite(token: string): Promise<InviteLookup> {
     email: invite.email,
     role: invite.role,
   };
-}
-
-/**
- * Marks an invite accepted, and reports whether THIS caller was the one that
- * did it. Returns false if someone else got there first.
- *
- * The `acceptedAt: null` predicate is what makes it single-use under
- * concurrency: two simultaneous requests both pass lookupInvite, but only one
- * updateMany matches a row, so only one gets count 1. Checking `acceptedAt`
- * and then updating as separate steps would let both through.
- */
-export async function claimInvite(inviteId: string): Promise<boolean> {
-  const { count } = await prisma.invite.updateMany({
-    where: { id: inviteId, acceptedAt: null, revokedAt: null },
-    data: { acceptedAt: new Date() },
-  });
-  return count === 1;
 }
