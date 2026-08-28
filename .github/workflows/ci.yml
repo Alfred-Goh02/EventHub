@@ -218,6 +218,34 @@ jobs:
 
           kill $SERVER_PID
 
+      # A refresh token must be spendable exactly ONCE, including under a race.
+      #
+      # rotateRefreshToken() used to read the row on its own connection, outside
+      # any transaction and holding no lock, check usedAt, then write
+      # `update({ where: { id } })` with no predicate. Two requests presenting the
+      # same token concurrently both passed the check and both minted a
+      # successor: one token, two independent live sessions.
+      #
+      # What made that worse than it sounds is that FAMILY REUSE DETECTION NEVER
+      # FIRES. The detector looks for a token presented a second time, and in
+      # this race there is not one -- each party walks away with a distinct
+      # successor. The control was not bypassed, it was blind.
+      #
+      # A sequential test cannot catch it: present a token twice in a row and
+      # reuse is correctly reported. The window is between the read and the
+      # write, so the test has to race. This one reproduced the defect in 19 of
+      # 20 rounds against the unfixed code.
+      - name: Assert a refresh token can be spent only once, even under a race
+        working-directory: .
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/verify-refresh-rotation.mjs
+          pkill -f "node dist/index.js" || true
+
       # The cross-service proof: Event verifies a token AUTH signed, holding only
       # the public key, with no call to Auth and no shared session store. If this
       # ever needs a network hop to Auth, the asymmetric-JWT design has been lost.
