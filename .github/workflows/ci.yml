@@ -302,6 +302,20 @@ jobs:
           node scripts/verify-projection-e2e.mjs
           pkill -f "node dist/index.js" || true
 
+      # Runs LAST, after every other test has moved inventory around.
+      #
+      # The CHECK constraint already guarantees the arithmetic
+      # (remaining + held + sold = total). This checks something the constraint
+      # structurally cannot: that the counters match the RESERVATIONS EXPLAINING
+      # THEM — held against HELD and PENDING_PAYMENT items, sold against
+      # CONFIRMED ones. A constraint only ever sees one row, so it cannot notice
+      # a counter that moved without a reservation to justify it.
+      #
+      # This is the single assertion worth running after any chaotic sequence,
+      # and it is where a sweeper or payment bug will surface.
+      - name: Assert inventory reconciles with its reservations
+        run: node scripts/verify-inventory-reconciliation.mjs
+
       # The assertion that ties Chapter 4 together. Every piece is checked
       # separately above — the schema contract, the broker round-trip, the RLS
       # policies — but "does a row written by a service actually become a message
