@@ -281,6 +281,16 @@ async function main() {
        VALUES ($1,$2,$3,$4,1,$5)`,
       [`${otherRes}_i`, TENANT, otherRes, ttOk, PRICE_OK],
     );
+    // Move the counters too. Seeding a hold without decrementing remaining
+    // leaves inventory that no reservation explains, and
+    // verify-inventory-reconciliation correctly fails on it — a test that
+    // corrupts the thing a later test checks is worse than no test.
+    await db.query(
+      `UPDATE "TicketType" SET remaining = remaining - 1, held = held + 1,
+              version = version + 1, "updatedAt" = now()
+        WHERE id = $1`,
+      [ttOk],
+    );
   });
 
   const stolen = await payFor(otherRes);
