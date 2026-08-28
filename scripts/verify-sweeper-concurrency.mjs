@@ -36,6 +36,7 @@ const TENANT = 'tenant_acme';
 const HOLDS = 30;
 const SEATS_EACH = 2;
 const TOTAL = HOLDS * SEATS_EACH;
+const PRICE_CENTS = 1000;
 
 const run = `swp_${Date.now()}`;
 const eventId = `${run}_evt`;
@@ -81,8 +82,8 @@ async function main() {
   await db.query(
     `INSERT INTO "TicketType"
        (id,"tenantId","eventId",name,"priceCents",total,remaining,held,sold,"updatedAt")
-     VALUES ($1,$2,$3,'General',1000,$4,0,$4,0,now())`,
-    [ticketTypeId, TENANT, eventId, TOTAL],
+     VALUES ($1,$2,$3,'General',$5,$4,0,$4,0,now())`,
+    [ticketTypeId, TENANT, eventId, TOTAL, PRICE_CENTS],
   );
 
   for (let i = 0; i < HOLDS; i += 1) {
@@ -94,9 +95,13 @@ async function main() {
       [rid, TENANT, eventId],
     );
     await db.query(
-      `INSERT INTO "ReservationItem" (id,"tenantId","reservationId","ticketTypeId",quantity)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [`${rid}_i`, TENANT, rid, ticketTypeId, SEATS_EACH],
+      // unitPriceCents is NOT NULL: the price is captured when the hold is taken
+      // so that editing a ticket type cannot change what a buyer already agreed
+      // to. This seeder bypasses the reservation endpoint, so it has to supply
+      // what that endpoint would have.
+      `INSERT INTO "ReservationItem" (id,"tenantId","reservationId","ticketTypeId",quantity,"unitPriceCents")
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [`${rid}_i`, TENANT, rid, ticketTypeId, SEATS_EACH, PRICE_CENTS],
     );
   }
   await db.query('COMMIT');

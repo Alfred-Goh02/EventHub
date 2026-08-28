@@ -238,7 +238,7 @@ jobs:
       # is sold twice. This fires 40 concurrent buyers at 5 seats and asserts
       # exactly 5 succeed, remaining never goes negative, and
       # remaining + held + sold = total still holds.
-      - name: Assert seats cannot be oversold under concurrency
+      - name: Assert seats cannot be oversold, and prices cannot move under a buyer
         env:
           TICKETING_APP_DATABASE_URL: ${{ env.TICKETING_APP_DATABASE_URL }}
         run: |
@@ -263,6 +263,13 @@ jobs:
           done
 
           node scripts/verify-no-oversell.mjs
+
+          # The other half of what a reservation promises. Overselling is the
+          # failure everyone thinks of; being charged a price you never agreed to
+          # is the same class of bug and just as invisible from outside, because
+          # the receipt looks perfectly consistent with the ticket type it was
+          # read from.
+          node scripts/verify-price-locked.mjs
           pkill -f "node dist/index.js" || true
 
       # The cross-service assertion, and the one that would have caught the

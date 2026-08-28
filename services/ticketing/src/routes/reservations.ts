@@ -173,6 +173,38 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     }
 
     // -----------------------------------------------------------------------
+    // 2b. Capture the price BEFORE anything is written.
+    //
+    // What the buyer pays must be what they were quoted when the hold was taken,
+    // not whatever priceCents happens to say when they get round to paying. An
+    // organiser editing a price mid-checkout would otherwise silently change the
+    // amount charged for a cart someone had already agreed to.
+    //
+    // It also makes the charge amount reconstructible from the reservation
+    // alone, which is what reconciliation needs: the amount must not depend on a
+    // mutable row somewhere else that may have moved since.
+    //
+    // This read is deliberately here rather than later. It takes no row lock, so
+    // it costs a round trip and nothing in throughput, and it stays on the cheap
+    // side of the contended UPDATE below.
+    // -----------------------------------------------------------------------
+    const priced = await tx.ticketType.findMany({
+      where: { id: { in: ordered.map(([ticketTypeId]) => ticketTypeId) }, eventId },
+      select: { id: true, priceCents: true },
+    });
+    const priceOf = new Map(priced.map((t) => [t.id, t.priceCents]));
+
+    for (const [ticketTypeId] of ordered) {
+      if (!priceOf.has(ticketTypeId)) {
+        // Thrown, not returned, so the transaction rolls back and takes the
+        // idempotency-key claim with it. Returning here would COMMIT the claim,
+        // and the retry of a request that never did anything would then be told
+        // its key is already in flight instead of getting the same 400 again.
+        throw Object.assign(new Error('inventory'), { kind: 'unknown-ticket-type', ticketTypeId });
+      }
+    }
+
+    // -----------------------------------------------------------------------
     // 3. Uncontended inserts BEFORE the contended update.
     //
     // Statement order is the whole performance story. The conditional UPDATE
@@ -199,6 +231,7 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
           reservationId: reservation.id,
           ticketTypeId,
           quantity,
+          unitPriceCents: priceOf.get(ticketTypeId)!,
         })),
       });
     } catch (err) {
