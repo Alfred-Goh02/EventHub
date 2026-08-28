@@ -295,6 +295,16 @@ jobs:
           # This also runs the sweeper against a PENDING_PAYMENT reservation
           # whose hold has expired, and asserts it does NOT reclaim the seats.
           node scripts/verify-payment-path.mjs
+
+          # The job that decides what happens to a customer whose card may or may
+          # not have been charged.
+          #
+          # Two attempts that are IDENTICAL from this side -- both answered "no
+          # answer" -- and differ only in what actually happened at the provider.
+          # One must end CONFIRMED, the other must return its hold. Guessing
+          # either way is how a seat gets resold after being paid for, or marked
+          # sold when nobody paid.
+          node scripts/verify-payment-reconciliation.mjs
           pkill -f "node dist/index.js" || true
 
       # The cross-service assertion, and the one that would have caught the

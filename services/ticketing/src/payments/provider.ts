@@ -47,6 +47,24 @@ export interface ChargeRequest {
 
 export interface PaymentProvider {
   charge(req: ChargeRequest): Promise<ChargeOutcome>;
+
+  /**
+   * Ask the provider what became of an attempt.
+   *
+   * This is the half of the interface that makes `unknown` recoverable rather
+   * than merely recorded. Reconciliation must ASK; it must never guess. A job
+   * that assumed unanswered charges had failed would release seats that had
+   * genuinely been paid for, which is the same bug as overselling with an extra
+   * step and a refund.
+   *
+   * Read-only and therefore safe to run twice, which is why reconciliation needs
+   * no claim marker: two reconcilers may both ask, and the guarded UPDATE that
+   * follows decides which one settles the row.
+   *
+   * The amount is passed because this fake derives its answer from it. A real
+   * implementation looks the charge up by the idempotency key alone.
+   */
+  lookup(req: ChargeRequest): Promise<ChargeOutcome>;
 }
 
 /**
@@ -62,8 +80,13 @@ export interface PaymentProvider {
  * card numbers pick an outcome the same way.
  *
  *   ...01  ->  declined
- *   ...02  ->  no answer (the interesting one)
+ *   ...02  ->  no answer, and the charge DID go through
+ *   ...03  ->  no answer, and the charge never arrived
  *   else   ->  succeeds
+ *
+ * 02 and 03 are indistinguishable at charge time — that is the entire point.
+ * Both return `unknown`, and only lookup() can tell them apart. A design that
+ * could tell them apart from the client side would not need reconciliation.
  */
 export class FakePaymentProvider implements PaymentProvider {
   constructor(private readonly latencyMs = 0) {}
@@ -78,13 +101,30 @@ export class FakePaymentProvider implements PaymentProvider {
     if (marker === 1) {
       return { status: 'failed', reason: 'card_declined' };
     }
-    if (marker === 2) {
+    if (marker === 2 || marker === 3) {
       return { status: 'unknown', reason: 'provider_timeout' };
     }
 
     // The reference is derived from the idempotency key rather than random, so
     // that charging the same attempt twice would produce the same reference and
     // a duplicate is recognisable rather than merely suspected.
+    return { status: 'succeeded', providerRef: `fake_ch_${req.idempotencyKey}` };
+  }
+
+  async lookup(req: ChargeRequest): Promise<ChargeOutcome> {
+    const marker = req.amountCents % 100;
+
+    // The money moved; the reply was lost. Reconciliation must finish the sale.
+    if (marker === 2) {
+      return { status: 'succeeded', providerRef: `fake_ch_${req.idempotencyKey}` };
+    }
+    // The request never landed. Reconciliation must return the hold.
+    if (marker === 3) {
+      return { status: 'failed', reason: 'no_such_charge' };
+    }
+    if (marker === 1) {
+      return { status: 'failed', reason: 'card_declined' };
+    }
     return { status: 'succeeded', providerRef: `fake_ch_${req.idempotencyKey}` };
   }
 }
@@ -112,6 +152,23 @@ export function withTimeout(provider: PaymentProvider, ms: number): PaymentProvi
 
       try {
         return await Promise.race([provider.charge(req), timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+
+    // A lookup that times out is also `unknown` — the attempt simply stays
+    // unsettled and the next reconciliation pass asks again. Nothing is
+    // released and nothing is confirmed on a question we could not get an
+    // answer to.
+    async lookup(req) {
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<ChargeOutcome>((resolve) => {
+        timer = setTimeout(() => resolve({ status: 'unknown', reason: 'client_timeout' }), ms);
+      });
+
+      try {
+        return await Promise.race([provider.lookup(req), timeout]);
       } finally {
         if (timer) clearTimeout(timer);
       }
