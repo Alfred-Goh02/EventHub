@@ -5,13 +5,27 @@ import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
 import { pay } from './routes/pay.js';
+import { webhooks } from './routes/webhooks.js';
 import { createProjectionConsumer } from './consumer.js';
 
 const env = loadBaseEnv();
 const logger = createLogger('ticketing-service');
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    /**
+     * Keep the RAW bytes. The payment webhook's signature is computed over the
+     * body exactly as sent, and re-serialising the parsed object produces
+     * different bytes -- key order, whitespace, number formatting -- so the
+     * signature would never match. This hook is the only place the original
+     * buffer is still available.
+     */
+    verify: (req, _res, buf) => {
+      (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  }),
+);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'ticketing' });
@@ -24,6 +38,9 @@ app.get('/whoami', requireAuth, (req, res) => {
 app.use('/reservations', reservations);
 // Mounted on the same base path: /reservations/:id/pay.
 app.use('/reservations', pay);
+// Unauthenticated by design: the caller is the payment provider, not a user.
+// The HMAC signature is the authentication. See routes/webhooks.ts.
+app.use('/webhooks', webhooks);
 
 // Express 4 identifies an error handler by its ARITY: four parameters. Drop
 // `_next` and it silently becomes ordinary middleware that never runs on error.
