@@ -260,6 +260,52 @@ jobs:
           node scripts/verify-refresh-rotation.mjs
           pkill -f "node dist/index.js" || true
 
+      # The password reset flow, including the failure that returns success.
+      #
+      # The highest-value assertion here is the dullest: that the password
+      # ACTUALLY CHANGES. "User" is the one table in this database under FORCE
+      # ROW LEVEL SECURITY, so a reset written outside withTenant matches zero
+      # rows -- and with a guarded updateMany that is not an error, it is a count
+      # of 0. The endpoint would return 200, the token would be spent, every
+      # session would be revoked, and the password would be untouched. The user
+      # is signed out everywhere and locked out of an account whose reset link is
+      # now used, and NOTHING about that is visible in the response.
+      #
+      # Also races two redemptions of one link with different passwords. Under
+      # read-then-write both succeed and the account keeps whichever committed
+      # last -- so the victim believes they set their password while the
+      # attacker's is the live one. Measured: 10 of 10 races had two winners
+      # before the guard went in.
+      - name: Assert password reset works and each token spends once
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/verify-password-reset.mjs
+          pkill -f "node dist/index.js" || true
+
+      # The dev token sink writes live invite and password-reset credentials to
+      # the log so a developer can click them while there is no mail service.
+      # That is exactly the leak the hash-only storage design exists to prevent,
+      # so it must be impossible to leave switched on in production.
+      #
+      # A comment saying "never enable this in production" is not a control.
+      # Refusing to boot is. Same shape as the relay and ticketing refuse-to-start
+      # checks.
+      - name: Assert the dev token sink cannot run in production
+        working-directory: services/auth
+        run: |
+          set +e
+          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PORT=3098 node dist/index.js > /tmp/sink.log 2>&1
+          CODE=$?
+          set -e
+          test "$CODE" != "0" || { echo "the service started with the dev sink enabled in production"; exit 1; }
+          grep -q "refusing to start" /tmp/sink.log \
+            || { echo "exited non-zero but not for the right reason:"; cat /tmp/sink.log; exit 1; }
+          echo "correctly refused to start"
+
       # The cross-service proof: Event verifies a token AUTH signed, holding only
       # the public key, with no call to Auth and no shared session store. If this
       # ever needs a network hop to Auth, the asymmetric-JWT design has been lost.
@@ -519,7 +565,10 @@ jobs:
           #   Tenant       - read before tenant context exists, to resolve a slug
           #   RefreshToken - found by token hash; tenant is a result, not an input
           #   Invite       - same as RefreshToken
-          check "$DATABASE_URL" auth "'_prisma_migrations','Tenant','RefreshToken','Invite'"
+          #   PasswordResetToken - same as RefreshToken. A policy would filter out
+          #                  the row that says which tenant to set, so the reset
+          #                  would be impossible rather than merely restricted.
+          check "$DATABASE_URL" auth "'_prisma_migrations','Tenant','RefreshToken','Invite','PasswordResetToken'"
 
           # Event has no exemptions. Every table is tenant-scoped, including
           # OutboxMessage, which carries a second role-targeted policy for the

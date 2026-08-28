@@ -1,19 +1,15 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { prisma } from './db.js';
+import { hashSecretToken as hashToken, newSecretToken } from './secret-token.js';
 
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
-// SHA-256 rather than argon2 on purpose: the input is already 256 bits of
-// entropy, so there is nothing to brute-force and slow hashing buys nothing.
-const hashToken = (token: string) =>
-  createHash('sha256').update(token).digest('hex');
 
 export async function issueRefreshToken(
   userId: string,
   tenantId: string,
   familyId?: string,
 ): Promise<string> {
-  const token = randomBytes(32).toString('base64url');
+  const token = newSecretToken();
 
   await prisma.refreshToken.create({
     data: {
@@ -54,7 +50,7 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
     return { ok: false, reason: 'expired' };
   }
 
-  const token = randomBytes(32).toString('base64url');
+  const token = newSecretToken();
 
   /**
    * THE CLAIM, and why it is a guarded UPDATE rather than the plain one that
