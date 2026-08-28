@@ -302,6 +302,20 @@ jobs:
           node scripts/verify-projection-e2e.mjs
           pkill -f "node dist/index.js" || true
 
+      # Drains TICKETING's outbox with the same relay binary.
+      #
+      # Added because the payment-path review found that the reservation handler
+      # had been writing rows to tickets.reserved since it was built, while no
+      # Avro schema was registered for that topic and nothing was draining that
+      # table. Eight rows had accumulated; every one would have dead-lettered
+      # the moment a relay was pointed at it. Nothing in CI noticed, because
+      # nothing was looking at that topic.
+      #
+      # It also demonstrates why `topic` is a stored column: draining a second
+      # service's outbox needs a different connection string and nothing else.
+      - name: Drain Ticketing's outbox and decode the messages
+        run: node scripts/verify-ticketing-relay.mjs
+
       # Runs LAST, after every other test has moved inventory around.
       #
       # The CHECK constraint already guarantees the arithmetic
