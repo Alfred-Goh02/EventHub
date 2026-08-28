@@ -146,6 +146,18 @@ model ReservationItem {
   ticketTypeId  String
   quantity      Int
 
+  /// The unit price AT HOLD TIME, copied from TicketType when the hold is taken.
+  ///
+  /// Without it the amount charged is whatever priceCents says at pay time, not
+  /// what the buyer was shown. An organiser editing the price while someone is
+  /// in checkout would silently change what they pay, and they would have agreed
+  /// to a different number.
+  ///
+  /// It also makes the charge amount reconstructible from the reservation alone,
+  /// which is what payment reconciliation needs — the amount must not depend on
+  /// a mutable row somewhere else.
+  unitPriceCents Int
+
   reservation Reservation @relation(fields: [tenantId, reservationId], references: [tenantId, id], onDelete: Restrict)
   ticketType  TicketType  @relation(fields: [tenantId, ticketTypeId], references: [tenantId, id], onDelete: Restrict)
 
@@ -262,4 +274,73 @@ model OutboxMessage {
   /// SORTS, degrading exactly as the backlog grows. The partial index is raw
   /// SQL in the migration.
   @@index([tenantId])
+}
+
+enum PaymentStatus {
+  /// Sent to the provider, or about to be. The row exists BEFORE the call, so a
+  /// crash mid-charge leaves evidence that a charge may have happened.
+  PENDING
+  SUCCEEDED
+  FAILED
+  /// The provider was asked and could not say. Needs a human or a later retry —
+  /// deliberately distinct from FAILED, because assuming failure when the money
+  /// moved is the expensive mistake.
+  UNKNOWN
+}
+
+/// One attempt to charge for a reservation.
+///
+/// This table is what makes the reconciliation job writable. Without it, a
+/// process that dies mid-charge leaves a reservation stuck in PENDING_PAYMENT
+/// with nothing recording that a charge was ever attempted, no provider
+/// reference to ask about, and no amount to compare — so the only options are
+/// to release the seats (when the money may have moved) or to leave them held
+/// forever. Neither is acceptable, and both are avoidable by writing this row
+/// BEFORE calling the provider.
+///
+/// One row per ATTEMPT, not per reservation. That is what makes a retry
+/// chargeable: the provider idempotency key is this row's id, so a fresh attempt
+/// carries a fresh key. Deriving the key from reservationId alone would make
+/// every retry collide with the original failed charge and return its result
+/// forever.
+model Payment {
+  id       String @id @default(cuid())
+  tenantId String
+
+  reservationId String
+  /// From the verified token, never the request body.
+  userId String
+
+  /// Computed from ReservationItem.unitPriceCents at hold time, so the amount
+  /// cannot drift if someone edits the ticket price mid-checkout.
+  amountCents Int
+  currency    String @default("SGD")
+
+  status PaymentStatus @default(PENDING)
+
+  /// The provider's own charge identifier, once known. Null while PENDING, and
+  /// null forever if the provider never answered — which is exactly the case
+  /// reconciliation has to resolve.
+  providerRef String?
+
+  failureReason String?
+
+  /// Set when the provider call starts and when it settles. The gap between
+  /// them is the window in which a crash leaves an UNKNOWN.
+  startedAt DateTime  @default(now())
+  settledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Scoped by tenant, like every unique index in this database — unique
+  /// enforcement is not subject to row security, so a global unique would let a
+  /// 23505 reveal that another tenant already used a value.
+  @@unique([tenantId, id])
+  @@index([tenantId, reservationId])
+  /// NOTE: the reconciliation index is raw SQL in the migration, because it is
+  /// PARTIAL (WHERE "settledAt" IS NULL) and Prisma cannot express a predicate.
+  /// Same reason as Reservation_sweep_idx and OutboxMessage_undelivered_idx: the
+  /// job only ever asks for attempts that never settled, so the index should hold
+  /// only those and stay small no matter how much payment history accumulates.
 }
