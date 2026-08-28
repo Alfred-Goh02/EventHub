@@ -316,6 +316,20 @@ jobs:
       - name: Drain Ticketing's outbox and decode the messages
         run: node scripts/verify-ticketing-relay.mjs
 
+      # Two sweepers racing the same expired holds.
+      #
+      # Targets a failure the schema cannot catch: a DOUBLE INVENTORY RETURN
+      # passes both TicketType CHECK constraints. Returning the same seats twice
+      # keeps remaining + held + sold = total perfectly true — it just moves the
+      # total in the wrong direction and oversells silently, because a constraint
+      # only ever sees one row.
+      #
+      # Two things prevent it and this proves both: FOR UPDATE SKIP LOCKED in the
+      # SAME transaction as the release, and `AND status = 'HELD'` on the
+      # expiring UPDATE.
+      - name: Assert two sweepers return each seat exactly once
+        run: node scripts/verify-sweeper-concurrency.mjs
+
       # Runs LAST, after every other test has moved inventory around.
       #
       # The CHECK constraint already guarantees the arithmetic
