@@ -26,8 +26,19 @@ const OUT = join(ROOT, 'contracts', 'generated');
 
 const pascal = (s) => s.replace(/(^|[^A-Za-z0-9])([a-z])/g, (_, __, c) => c.toUpperCase());
 
-/** Renders an Avro type as a TypeScript type, collecting nested enums as it goes. */
-function tsType(t, enums) {
+/**
+ * Renders an Avro type as a TypeScript type, collecting the named types it meets
+ * along the way into `ctx` so the caller can emit declarations for them.
+ *
+ * Both enums AND records have to be collected. An earlier version collected only
+ * enums and returned `t.name` for a record, which produced output referencing an
+ * interface that was never declared — `items: Array<ReservationLine>` with no
+ * ReservationLine anywhere in the file. It went unnoticed because nothing
+ * imported the generated types and no tsconfig covered them, so the files were
+ * documentation that merely looked like code. Hence contracts/tsconfig.json and
+ * the CI step that type-checks this output.
+ */
+function tsType(t, ctx) {
   if (typeof t === 'string') {
     switch (t) {
       case 'string': case 'bytes': return 'string';
@@ -40,18 +51,33 @@ function tsType(t, enums) {
 
   if (Array.isArray(t)) {
     // A union. ["null", "string"] is the idiomatic nullable field.
-    return [...new Set(t.map((m) => tsType(m, enums)))].join(' | ');
+    return [...new Set(t.map((m) => tsType(m, ctx)))].join(' | ');
   }
 
   if (t.type === 'enum') {
-    enums.set(t.name, t.symbols);
+    ctx.enums.set(t.name, t.symbols);
     return t.name;
   }
-  if (t.type === 'array') return `Array<${tsType(t.items, enums)}>`;
-  if (t.type === 'map') return `Record<string, ${tsType(t.values, enums)}>`;
-  if (t.type === 'record') return t.name;
+  if (t.type === 'array') return `Array<${tsType(t.items, ctx)}>`;
+  if (t.type === 'map') return `Record<string, ${tsType(t.values, ctx)}>`;
+  if (t.type === 'record') {
+    if (!ctx.records.has(t.name)) {
+      // Claim the name BEFORE recursing into the fields. Avro permits a record
+      // to reference itself, and without this the recursion would not terminate.
+      ctx.records.set(t.name, null);
+      ctx.records.set(t.name, {
+        doc: t.doc,
+        fields: (t.fields ?? []).map((f) => ({
+          name: f.name,
+          type: tsType(f.type, ctx),
+          doc: f.doc,
+        })),
+      });
+    }
+    return t.name;
+  }
 
-  return tsType(t.type, enums);
+  return tsType(t.type, ctx);
 }
 
 function wrap(text, indent = ' * ') {
@@ -68,13 +94,14 @@ function wrap(text, indent = ' * ') {
 }
 
 function generate(schema, sourceFile) {
-  const enums = new Map();
+  const ctx = { enums: new Map(), records: new Map() };
   const fields = schema.fields.map((f) => ({
     name: f.name,
-    type: tsType(f.type, enums),
+    type: tsType(f.type, ctx),
     doc: f.doc,
     optional: Array.isArray(f.type) && f.type.includes('null') && 'default' in f,
   }));
+  const { enums } = ctx;
 
   const out = [];
   out.push('// GENERATED FILE — do not edit by hand.');
@@ -85,6 +112,20 @@ function generate(schema, sourceFile) {
   for (const [name, symbols] of enums) {
     out.push(`export type ${name} =`);
     out.push(symbols.map((s) => `  | '${s}'`).join('\n') + ';');
+    out.push('');
+  }
+
+  // Nested records, declared before the record that uses them. TypeScript hoists
+  // interfaces so the order is not required, but reading top-down is easier when
+  // a type is defined before it is referenced.
+  for (const [name, rec] of ctx.records) {
+    if (rec.doc) out.push(...wrap(rec.doc));
+    out.push(`export interface ${name} {`);
+    for (const f of rec.fields) {
+      if (f.doc) out.push(...wrap(f.doc).map((l) => '  ' + l));
+      out.push(`  ${f.name}: ${f.type};`);
+    }
+    out.push('}');
     out.push('');
   }
 

@@ -1,0 +1,18 @@
+{
+  "// why": [
+    "The generated types had a real defect for two chapters: tsType() collected",
+    "nested enums but not nested records, so every schema with an array-of-record",
+    "field emitted `items: Array<ReservationLine>` with no ReservationLine",
+    "anywhere in the file. Nothing caught it, because nothing imported these",
+    "files and no tsconfig included them — they were documentation that happened",
+    "to have a .ts extension.",
+    "",
+    "This config exists so `tsc --noEmit` compiles them. noEmit because these are",
+    "types only: there is nothing to build, only something to check."
+  ],
+  "extends": "@eventhub/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["generated/**/*"]
+}
