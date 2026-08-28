@@ -4,6 +4,7 @@ import { createLogger } from '@eventhub/logger';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
+import { createProjectionConsumer } from './consumer.js';
 
 const env = loadBaseEnv();
 const logger = createLogger('ticketing-service');
@@ -28,8 +29,29 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   res.status(500).json({ error: 'internal error' });
 });
 
+const consumer = createProjectionConsumer({
+  brokers: (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',').map((b) => b.trim()),
+  registryUrl: process.env['SCHEMA_REGISTRY_URL'] ?? 'http://localhost:8081',
+  logger,
+});
+
+async function shutdown(signal: string): Promise<void> {
+  logger.info({ signal }, 'shutting down');
+  await consumer.stop();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
 async function main() {
   await assertRuntimeRoleCannotBypassRls();
+
+  // Started before the HTTP listener, so the service is not answering requests
+  // about events it has not yet heard of. It still may be behind — that is what
+  // the ConsumerCheckpoint lag is for — but it will not be behind by the whole
+  // topic simply because nothing was consuming.
+  await consumer.start();
 
   app.listen(env.PORT, () => {
     logger.info(`ticketing-service listening on port ${env.PORT}`);
