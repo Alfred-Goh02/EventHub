@@ -192,14 +192,33 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
       select: { id: true, expiresAt: true, version: true },
     });
 
-    await tx.reservationItem.createMany({
-      data: ordered.map(([ticketTypeId, quantity]) => ({
-        tenantId,
-        reservationId: reservation.id,
-        ticketTypeId,
-        quantity,
-      })),
-    });
+    try {
+      await tx.reservationItem.createMany({
+        data: ordered.map(([ticketTypeId, quantity]) => ({
+          tenantId,
+          reservationId: reservation.id,
+          ticketTypeId,
+          quantity,
+        })),
+      });
+    } catch (err) {
+      // The composite FK to (tenantId, ticketTypeId) fires HERE, before the
+      // inventory guard below ever runs — so an unknown ticket type surfaces as
+      // a P2003 rather than reaching the guard's clean "unknown-ticket-type"
+      // path. Without this translation it becomes a 500 for what is plainly a
+      // bad request.
+      //
+      // Note the FK is doing real work beyond typo-catching: because it is
+      // composite, a ticket type belonging to ANOTHER tenant is not merely
+      // forbidden, it does not exist as far as this statement is concerned.
+      if ((err as { code?: string }).code === 'P2003') {
+        throw Object.assign(new Error('inventory'), {
+          kind: 'unknown-ticket-type',
+          ticketTypeId: ordered[0]![0],
+        });
+      }
+      throw err;
+    }
 
     // -----------------------------------------------------------------------
     // 4. THE CONTENDED STATEMENT, as late as possible.

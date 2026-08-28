@@ -265,6 +265,43 @@ jobs:
           node scripts/verify-no-oversell.mjs
           pkill -f "node dist/index.js" || true
 
+      # The cross-service assertion, and the one that would have caught the
+      # defect the Chapter 4 design review found: only /publish emitted an
+      # outbox row, so Ticketing's projection was stale by construction for
+      # every other state change.
+      #
+      # Creates and publishes an event in the Event service, drains the relay,
+      # waits for Ticketing's projection to catch up, sells a ticket, cancels the
+      # event, and asserts the sale is then refused. Ticketing has no foreign key
+      # to the Event table and no credential for that database — Kafka is the
+      # ONLY way it can learn any of this.
+      - name: Verify Event to Ticketing projection and the sales rule
+        run: |
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/auth && node dist/index.js &)
+          (cd services/event && \
+            PORT=3002 \
+            DATABASE_URL="$EVENT_DATABASE_URL" \
+            APP_DATABASE_URL="$EVENT_APP_DATABASE_URL" \
+            node dist/index.js &)
+          (cd services/ticketing && \
+            PORT=3003 \
+            DATABASE_URL="$TICKETING_DATABASE_URL" \
+            APP_DATABASE_URL="$TICKETING_APP_DATABASE_URL" \
+            node dist/index.js &)
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3001/health >/dev/null \
+               && curl -sf http://localhost:3002/health >/dev/null \
+               && curl -sf http://localhost:3003/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          node scripts/verify-projection-e2e.mjs
+          pkill -f "node dist/index.js" || true
+
       # The assertion that ties Chapter 4 together. Every piece is checked
       # separately above — the schema contract, the broker round-trip, the RLS
       # policies — but "does a row written by a service actually become a message

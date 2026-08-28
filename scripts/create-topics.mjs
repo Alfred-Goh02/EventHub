@@ -80,6 +80,16 @@ const TOPICS = [
     note: 'Community posts and reactions.',
   },
   {
+    topic: 'events.activity.dlq',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // Where an undecodable message goes so it stops blocking its partition.
+    //
+    // Deliberately NOT compacted: the whole point is to keep every failure for
+    // a human to look at, and compaction would discard all but the last per key.
+    note: 'Dead letters from the events.activity consumer. Inspect, never auto-retry.',
+  },
+  {
     topic: 'smoke.roundtrip',
     numPartitions: 3,
     replicationFactor: 1,
