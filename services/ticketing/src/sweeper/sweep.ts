@@ -67,6 +67,37 @@ export async function sweepOnce(
 
     result.claimed = claimed.length;
 
+    /**
+     * THREE PASSES, and the reason is lock ordering ACROSS the batch.
+     *
+     * This used to be a single loop: expire a reservation, return its inventory,
+     * emit its message, then move to the next one. Its comment claimed the
+     * TicketType updates were "in sorted id order", and they were — within one
+     * reservation. Across the batch they were not.
+     *
+     * A sweep holding reservations A{tt_b} and B{tt_a} therefore locked tt_b and
+     * then tt_a, while a concurrent cart {tt_a, tt_b} sorts and locks tt_a then
+     * tt_b. Two writers, opposite order, one deadlock — and the sweeper was
+     * exactly the actor the sorting was supposed to keep in step.
+     *
+     * Postgres detects it and aborts one side with 40P01, so nothing corrupts:
+     * the reservation path retries, and the sweep loop catches and retries. It
+     * shows up as failed checkouts and churn under load, which is the kind of
+     * thing that gets blamed on the database.
+     *
+     *   pass 1  expire the reservations and collect what they owe back.
+     *           Locks Reservation rows only — those are already held by the
+     *           FOR UPDATE above, so no new lock order is introduced.
+     *   pass 2  return inventory, ONE update per ticket type, sorted across the
+     *           WHOLE batch. This is the only pass that touches TicketType.
+     *   pass 3  emit. Touches OutboxMessage only.
+     *
+     * Aggregating also collapses N reservations sharing a ticket type into one
+     * UPDATE instead of N, which is fewer round trips and fewer row versions.
+     */
+    const owed = new Map<string, number>();
+    const released: Array<{ r: (typeof claimed)[number]; lines: Array<{ ticketTypeId: string; qty: string }> }> = [];
+
     for (const r of claimed) {
       /**
        * The guard that makes a double release impossible.
@@ -103,41 +134,50 @@ export async function sweepOnce(
         `SELECT "ticketTypeId", sum(quantity)::text AS qty
            FROM "ReservationItem"
           WHERE "reservationId" = $1
-          GROUP BY "ticketTypeId"
-          ORDER BY "ticketTypeId"`,
+          GROUP BY "ticketTypeId"`,
         [r.id],
       );
 
-      /**
-       * One UPDATE per ticket type, in sorted id order.
-       *
-       * The reservation path sorts its cart's ticket types before locking, so
-       * that concurrent carts take rows in the same sequence and one simply
-       * waits. The sweeper must use the SAME order or it becomes the one actor
-       * that takes them in a different sequence — which is precisely how a
-       * deadlock forms. `ORDER BY "ticketTypeId"` above is doing real work.
-       *
-       * A single UPDATE ... FROM would be fewer round trips, but Postgres gives
-       * no guarantee about the order it locks the rows it joins to.
-       */
       for (const line of lines) {
         const qty = Number(line.qty);
-        await client.query(
-          `UPDATE "TicketType"
-              SET remaining = remaining + $2,
-                  held = held - $2,
-                  version = version + 1,
-                  "updatedAt" = now()
-            WHERE id = $1`,
-          [line.ticketTypeId, qty],
-        );
+        owed.set(line.ticketTypeId, (owed.get(line.ticketTypeId) ?? 0) + qty);
         result.seatsReturned += qty;
       }
 
-      // Same transaction as the release it describes. Without a RELEASED
-      // message, a consumer building live availability decrements on RESERVED
-      // and increments on nothing, so every abandoned cart permanently reduces
-      // its view — and with TTL holds that is the common path, not an edge case.
+      released.push({ r, lines });
+      result.expired += 1;
+    }
+
+    /**
+     * Pass 2 — the only statements in this transaction that lock TicketType.
+     *
+     * Sorted with localeCompare to match the reservation path exactly, which
+     * sorts its cart the same way. What matters is not which ordering is chosen
+     * but that every writer chooses the SAME one; ticket type ids are cuids, so
+     * byte order and locale order coincide anyway.
+     *
+     * A single UPDATE ... FROM would be fewer round trips still, but Postgres
+     * gives no guarantee about the order it locks the rows it joins to — which
+     * would put us straight back where this started.
+     */
+    for (const ticketTypeId of [...owed.keys()].sort((a, b) => a.localeCompare(b))) {
+      await client.query(
+        `UPDATE "TicketType"
+            SET remaining = remaining + $2,
+                held = held - $2,
+                version = version + 1,
+                "updatedAt" = now()
+          WHERE id = $1`,
+        [ticketTypeId, owed.get(ticketTypeId)],
+      );
+    }
+
+    // Pass 3 — the messages, in the same transaction as the releases they
+    // describe. Without a RELEASED message, a consumer building live
+    // availability decrements on RESERVED and increments on nothing, so every
+    // abandoned cart permanently reduces its view — and with TTL holds that is
+    // the common path, not an edge case.
+    for (const { r, lines } of released) {
       await client.query(
         `INSERT INTO "OutboxMessage"
            ("id", "tenantId", topic, "eventType", "schemaVersion", "aggregateId", payload, "createdAt")
@@ -160,8 +200,6 @@ export async function sweepOnce(
           }),
         ],
       );
-
-      result.expired += 1;
     }
 
     await client.query('COMMIT');
