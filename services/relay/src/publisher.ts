@@ -81,15 +81,52 @@ export function createPublisher(opts: {
   // Subject ids are cached: the registry is consulted once per subject, not once
   // per message. A lookup per message would put an HTTP round-trip inside a
   // transaction that is already holding row locks.
-  const subjectIds = new Map<string, number>();
+  /**
+   * How long a resolved schema id is trusted before asking the registry again.
+   *
+   * This cache used to be permanent for the life of the process, which is a
+   * silent correctness bug rather than a staleness nuisance. A contract change
+   * does not restart the relay, so after registering v2 of a schema the relay
+   * keeps encoding against the v1 id it fetched at startup — and avsc DROPS keys
+   * that are absent from the writer schema. The producer succeeds, the message
+   * is valid Avro under the id it names, and the consumer decodes it cleanly
+   * with the new field at its default. Nothing errors anywhere.
+   *
+   * On events.activity that is worse still: the topic is COMPACTED and keyed by
+   * event id, so for an event that never changes again the v1-encoded snapshot
+   * is what compaction retains permanently. Restarting the relay repairs future
+   * messages only.
+   *
+   * One HTTP GET per topic per minute is a rounding error next to that.
+   */
+  const SCHEMA_ID_TTL_MS = 60_000;
+  const subjectIds = new Map<string, { id: number; fetchedAt: number }>();
 
   async function schemaIdFor(topic: string): Promise<number> {
     const cached = subjectIds.get(topic);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined && Date.now() - cached.fetchedAt < SCHEMA_ID_TTL_MS) {
+      return cached.id;
+    }
 
     // TopicNameStrategy: the subject for a topic's values is `<topic>-value`.
     const id = await registry.getLatestSchemaId(`${topic}-value`);
-    subjectIds.set(topic, id);
+
+    /**
+     * Warm the id -> schema cache HERE, where a failure is still classified
+     * transient.
+     *
+     * registry.encode() fetches the schema by id on a cache miss, and that fetch
+     * is an HTTP call that can fail for entirely transient reasons. Because the
+     * catch around encode() labels everything PermanentPublishError, a registry
+     * blip inside that window would dead-letter a perfectly good message — and
+     * nothing in this repository ever clears deadLetteredAt.
+     *
+     * Doing the fetch here moves it to the transient side of the boundary, so
+     * encode() below can only fail for the reason its catch actually claims.
+     */
+    await registry.getSchema(id);
+
+    subjectIds.set(topic, { id, fetchedAt: Date.now() });
     return id;
   }
 
@@ -140,6 +177,38 @@ export function createPublisher(opts: {
       try {
         value = await registry.encode(id, message);
       } catch (err) {
+        /**
+         * Only a VALIDATION failure is permanent, and this used to say "any
+         * failure at all".
+         *
+         * encode() does two things: it may fetch the schema by id over HTTP, and
+         * it validates the payload against it. Labelling both permanent meant a
+         * registry blip — a 5xx, a reset connection — was recorded as "this
+         * payload can never encode" and dead-lettered on the FIRST attempt, with
+         * nothing in this repository able to clear deadLetteredAt afterwards.
+         * The operator would be sent to the .avsc file by a message that named
+         * the wrong cause entirely.
+         *
+         * schemaIdFor() now warms the schema before we get here, so the fetch is
+         * on the transient side of the boundary. This narrows the catch as well,
+         * because belt and braces is the right posture for a write-once poison
+         * flag.
+         *
+         * Matched by NAME rather than instanceof: the registry's error classes
+         * are not exported from the package root, and reaching into its dist/
+         * for a private module would break on any repackaging.
+         */
+        const name = err instanceof Error ? err.name : '';
+        const isPayloadProblem =
+          name === 'ConfluentSchemaRegistryValidationError' ||
+          name === 'ConfluentSchemaRegistryArgumentError' ||
+          name === 'ConfluentSchemaRegistryInvalidSchemaError';
+
+        if (!isPayloadProblem) {
+          // Transient: let the backoff in drain.ts have it, and keep retrying.
+          throw err;
+        }
+
         throw new PermanentPublishError(
           `payload does not match the registered schema for ${row.topic}: ` +
             (err instanceof Error ? err.message : String(err)),
