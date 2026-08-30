@@ -71,6 +71,12 @@ function reconcile(graceMs) {
       ...process.env,
       SWEEPER_DATABASE_URL: SWEEPER_URL,
       RECONCILE_GRACE_MS: String(graceMs),
+      // The reconciler refuses to start unless the grace period is more than
+      // twice the provider timeout -- below that it examines charges still in
+      // flight and releases the seats of customers mid-checkout. So the two
+      // are set together here rather than leaving the default 8s timeout to
+      // contradict a deliberately short grace.
+      PAYMENT_TIMEOUT_MS: '50',
       LOG_LEVEL: 'error',
     },
     encoding: 'utf8',
@@ -180,7 +186,7 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log('\n3. past the grace window, the provider is asked');
   // -------------------------------------------------------------------------
-  reconcile(1);
+  reconcile(200);
 
   const paid = await state(paidRes);
   const paidInv = await inventory(ttPaid);
@@ -209,7 +215,7 @@ async function main() {
   // A double held->sold satisfies both TicketType CHECK constraints — remaining
   // + held + sold stays equal to total, the numbers are simply wrong — so the
   // schema cannot catch this and the guard has to.
-  reconcile(1);
+  reconcile(200);
   const paidAgain = await inventory(ttPaid);
   const lostAgain = await inventory(ttLost);
   const paidState = await state(paidRes);

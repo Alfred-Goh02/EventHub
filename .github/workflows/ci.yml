@@ -512,8 +512,23 @@ jobs:
       # perfectly and is simply far more dangerous if it leaks.
       - name: Assert the relay cannot read business tables
         run: |
-          if psql "postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event" \
-               -tAc 'SELECT 1 FROM "Event" LIMIT 1' 2>/dev/null; then
+          RELAY_URL="postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event"
+
+          # POSITIVE CONTROL FIRST. The refusal below passes whenever psql fails
+          # for ANY reason -- a wrong password, a wrong port, a missing binary --
+          # so on its own it would report "refused as intended" while proving
+          # nothing. This is the third assertion of that shape found in this
+          # repository, so the control is not optional.
+          #
+          # The relay MUST be able to read its outbox; that is its entire job.
+          psql "$RELAY_URL" -tAc 'SELECT 1 FROM "OutboxMessage" LIMIT 1' >/dev/null 2>&1 || {
+            echo "CONTROL FAILED: the relay credential cannot read its OWN outbox."
+            echo "The connection is broken, so the refusal below would prove nothing."
+            exit 1
+          }
+          echo "relay can read OutboxMessage, as it must"
+
+          if psql "$RELAY_URL" -tAc 'SELECT 1 FROM "Event" LIMIT 1' 2>/dev/null; then
             echo "PRIVILEGE FAILURE: the relay role can read the Event table"
             exit 1
           fi
