@@ -25,6 +25,50 @@ const logger = createLogger('auth-service');
 const RESET_URL_BASE = process.env['PUBLIC_APP_URL'] ?? 'http://localhost:3000';
 
 const app = express();
+
+/**
+ * Whether to believe X-Forwarded-For, and why this cannot just be turned on.
+ *
+ * /forgot-password rate-limits per IP, and `req.ip` is the SOCKET address unless
+ * Express is told otherwise. Both settings are wrong in the other's environment:
+ *
+ *   unset, behind a proxy   every request appears to come from the proxy, so the
+ *                           20/hour per-IP budget is shared by the entire
+ *                           deployment. Password reset stops working for
+ *                           everyone, and the limiter answers 202 either way, so
+ *                           it fails SILENTLY.
+ *   set, NOT behind a proxy any client can send its own X-Forwarded-For and get
+ *                           a fresh budget per request, so the limit is
+ *                           decorative.
+ *
+ * There is no default that is safe in both, so it is configuration with no
+ * guess: TRUST_PROXY is the number of proxy hops in front of this service (1 for
+ * a single load balancer), or unset for direct exposure. A hop count rather than
+ * `true` because `true` trusts the whole chain, and the left-hand entries of
+ * X-Forwarded-For are supplied by the client.
+ *
+ * The per-ACCOUNT limit does not depend on any of this: it keys on
+ * (tenantId, email), so a victim is protected from mail-bombing even when the IP
+ * is useless. The per-IP limit is the one that stops an attacker walking a list.
+ */
+const trustProxy = process.env['TRUST_PROXY'];
+if (trustProxy) {
+  const hops = Number(trustProxy);
+  if (!Number.isInteger(hops) || hops < 1) {
+    throw new Error(
+      `TRUST_PROXY must be a positive integer number of proxy hops, got ${JSON.stringify(trustProxy)}`,
+    );
+  }
+  app.set('trust proxy', hops);
+  logger.info({ hops }, 'trusting X-Forwarded-For');
+} else {
+  logger.warn(
+    'TRUST_PROXY is not set, so req.ip is the socket address. If this service sits behind a ' +
+      'load balancer, every request shares one IP and the per-IP password-reset limit will ' +
+      'throttle the whole deployment.',
+  );
+}
+
 app.use(express.json());
 
 app.get('/health', (_req, res) => {

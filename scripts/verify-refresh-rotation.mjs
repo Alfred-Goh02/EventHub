@@ -23,7 +23,10 @@
  * Run: node scripts/verify-refresh-rotation.mjs
  */
 
+import { createHash } from 'node:crypto';
 import pg from 'pg';
+
+const sha256 = (t) => createHash('sha256').update(t).digest('hex');
 
 const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
 const AUTH_APP_URL =
@@ -163,6 +166,56 @@ async function main() {
     // That is not a failure, and asserting on it would make this flaky.
     console.log('    --    no racer lost this round; nothing to assert about revocation');
   }
+
+  // -------------------------------------------------------------------------
+  console.log('');
+  console.log('4. a session cannot be extended forever');
+  // -------------------------------------------------------------------------
+  // Every rotation issues a successor with a fresh 30-day expiry, so the sliding
+  // window never closes on an active chain -- including one an attacker is
+  // keeping alive. Reuse detection only fires if the legitimate holder presents
+  // a token the thief already spent; if the thief takes over the chain and the
+  // victim never refreshes again, nothing ever notices.
+  //
+  // The absolute ceiling is measured from the FIRST token in the family, so
+  // ageing the family past it is enough to test the rule without waiting.
+  const aged = await login();
+  const { rows: fam } = await db.query(
+    `SELECT "familyId" FROM "RefreshToken" WHERE "tokenHash" = $1`,
+    [sha256(aged)],
+  );
+  const agedFamilyId = fam[0]?.familyId;
+  if (!agedFamilyId) fail("could not find the family for a token just issued");
+
+  await db.query(
+    `UPDATE "RefreshToken" SET "createdAt" = now() - interval '91 days' WHERE "familyId" = $1`,
+    [agedFamilyId],
+  );
+
+  const tooOld = await refresh(aged);
+  check(tooOld.status === 401, `a family older than the ceiling is refused, got ${tooOld.status}`);
+
+  const { rows: live } = await db.query(
+    `SELECT count(*)::int AS n FROM "RefreshToken" WHERE "familyId" = $1 AND "revokedAt" IS NULL`,
+    [agedFamilyId],
+  );
+  // Refused is not enough: the family is revoked, so the outstanding successor
+  // cannot be presented either. Reaching the ceiling ENDS the session.
+  check(live[0].n === 0, `the family is revoked, got ${live[0].n} live token(s)`);
+
+  // And a family just inside the ceiling still rotates, so the check is not
+  // simply refusing everything.
+  const young = await login();
+  const { rows: fam2 } = await db.query(
+    `SELECT "familyId" FROM "RefreshToken" WHERE "tokenHash" = $1`,
+    [sha256(young)],
+  );
+  await db.query(
+    `UPDATE "RefreshToken" SET "createdAt" = now() - interval '89 days' WHERE "familyId" = $1`,
+    [fam2[0].familyId],
+  );
+  const stillOk = await refresh(young);
+  check(stillOk.status === 200, `a family inside the ceiling still rotates, got ${stillOk.status}`);
 
   await db.end();
 
