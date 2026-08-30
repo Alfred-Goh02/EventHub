@@ -17,6 +17,23 @@ const publisher = createPublisher({
 let stopping = false;
 
 /**
+ * The drain currently in progress, if any.
+ *
+ * `stopping` is only read BETWEEN loop iterations, so on SIGTERM the shutdown
+ * path used to disconnect the publisher and end the pool while a batch was
+ * mid-publish. The transaction then aborts, so nothing is corrupted — the
+ * attempt increments roll back with it — but rows already handed to Kafka are
+ * republished on restart, and the operator sees a stack of connection errors on
+ * every deploy that look like a fault rather than a shutdown.
+ *
+ * Holding the promise lets shutdown wait for the batch to finish committing.
+ */
+let inFlight: Promise<unknown> | null = null;
+
+/** How long a shutdown waits for an in-flight batch before giving up on it. */
+const SHUTDOWN_GRACE_MS = 10_000;
+
+/**
  * Drain, then sleep only if there was nothing to do.
  *
  * A busy relay loops immediately so a backlog drains at full speed; an idle one
@@ -26,10 +43,15 @@ let stopping = false;
 async function loop(): Promise<void> {
   while (!stopping) {
     try {
-      const result = await drainOnce(pool, publisher, logger, {
+      // Kept in a typed local as well as the untyped `inFlight` handle, so
+      // awaiting it here still narrows to DrainResult.
+      const pending = drainOnce(pool, publisher, logger, {
         batchSize: env.RELAY_BATCH_SIZE,
         maxAttempts: env.RELAY_MAX_ATTEMPTS,
       });
+      inFlight = pending;
+      const result = await pending;
+      inFlight = null;
 
       if (result.claimed > 0) {
         logger.info(result, 'drained');
@@ -73,6 +95,17 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');
   stopping = true;
   metricsServer.close();
+
+  // Let the batch in progress commit before pulling the broker and the pool out
+  // from under it. Bounded, because a drain blocked on an unreachable broker
+  // must not turn a deploy into a hang -- if the grace expires we tear down
+  // anyway and those rows are simply redelivered, which the design already
+  // requires every consumer to tolerate.
+  if (inFlight) {
+    logger.info('waiting for the in-flight drain to finish');
+    await Promise.race([inFlight.catch(() => {}), sleep(SHUTDOWN_GRACE_MS)]);
+  }
+
   await publisher.disconnect().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);
