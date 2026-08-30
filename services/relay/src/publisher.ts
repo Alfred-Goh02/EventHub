@@ -9,6 +9,36 @@ export interface Publisher {
 }
 
 /**
+ * A failure that will happen again no matter how many times it is retried.
+ *
+ * The relay used to treat every publish failure the same way and dead-letter on
+ * attempt count alone. That conflates two opposite situations:
+ *
+ *   PERMANENT   the payload does not match its schema. It never will. Retrying
+ *               wastes attempts and delays the row leaving the queue.
+ *   TRANSIENT   the broker or the registry is unreachable. The message is
+ *               perfectly fine and will publish as soon as they return.
+ *
+ * Under the old rule a broker outage spanning a handful of drains walked the
+ * ENTIRE BACKLOG to maxAttempts and dead-lettered all of it — permanently,
+ * because nothing clears deadLetteredAt, and silently, because losing a message
+ * to a retry ceiling looks exactly like losing it to a bad payload.
+ *
+ * Only this error dead-letters. Everything else backs off forever and gets
+ * louder, which is the right failure direction for delivery: a stuck queue is
+ * recoverable, an abandoned one is not.
+ */
+export class PermanentPublishError extends Error {
+  override readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = 'PermanentPublishError';
+    this.cause = cause;
+  }
+}
+
+/**
  * Publishes outbox rows to Kafka, Avro-encoded against the Schema Registry.
  *
  * Why the registry rather than encoding with a local .avsc: the Confluent wire
@@ -94,7 +124,28 @@ export function createPublisher(opts: {
         ...row.payload,
       };
 
-      const value = await registry.encode(id, message);
+      /**
+       * Encoding is the one failure here that is PERMANENT.
+       *
+       * A payload that does not match its registered schema will not match it on
+       * the next attempt either — retrying is pure waste, and worse, it delays
+       * the row's own dead-lettering while every retry writes another log line.
+       *
+       * Everything else in this method is transient by contrast: the Schema
+       * Registry can be briefly unreachable, and the broker certainly can. Those
+       * must NOT be dead-lettered, because the message is fine and the world
+       * will recover. See drain.ts for what the distinction buys.
+       */
+      let value: Buffer;
+      try {
+        value = await registry.encode(id, message);
+      } catch (err) {
+        throw new PermanentPublishError(
+          `payload does not match the registered schema for ${row.topic}: ` +
+            (err instanceof Error ? err.message : String(err)),
+          err,
+        );
+      }
 
       await producer.send({
         topic: row.topic,

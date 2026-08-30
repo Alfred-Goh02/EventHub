@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
-import type { Publisher } from './publisher.js';
+import { PermanentPublishError, type Publisher } from './publisher.js';
 
 export interface OutboxRow {
   id: string;
@@ -85,10 +85,26 @@ export async function drainOnce(
         const attempts = row.attempts + 1;
         const message = err instanceof Error ? err.message : String(err);
 
-        if (attempts >= opts.maxAttempts) {
-          // Dead-letter rather than retry forever. A row that cannot be
-          // serialised will never succeed, and because the drain is ordered by
-          // seq, leaving it in place blocks every message behind it.
+        /**
+         * WHAT gets dead-lettered, not HOW MANY TIMES it has failed.
+         *
+         * This used to be `attempts >= maxAttempts` alone, which treated a
+         * payload that can never encode and a broker that is briefly down as the
+         * same thing. A broker outage spanning a few drains therefore walked the
+         * whole backlog to the ceiling and abandoned it — permanently, since
+         * nothing clears deadLetteredAt, and silently, since a message lost to a
+         * retry ceiling looks identical to one lost to a bad payload.
+         *
+         * Now only a PermanentPublishError does it: the payload does not match
+         * its registered schema, so no number of retries will help and holding
+         * the row helps nobody. Anything else is transient and keeps retrying.
+         */
+        const permanent = err instanceof PermanentPublishError;
+
+        if (permanent) {
+          // Dead-letter immediately rather than after maxAttempts. A poison row
+          // is poison on the first attempt; spending the ceiling on it only
+          // delays the operator finding out.
           await client.query(
             `UPDATE "OutboxMessage"
                 SET attempts = $2, "lastError" = $3, "deadLetteredAt" = now()
@@ -98,7 +114,8 @@ export async function drainOnce(
           result.deadLettered += 1;
           logger.error(
             { messageId: row.id, seq: row.seq, topic: row.topic, attempts, err: message },
-            'outbox row dead-lettered after repeated failures — it will not be retried',
+            'outbox row dead-lettered: its payload does not match the registered schema, ' +
+              'so it will never publish and will not be retried',
           );
         } else {
           // Exponential backoff with a ceiling. A broker that is down should not
@@ -112,10 +129,37 @@ export async function drainOnce(
             [row.id, attempts, message.slice(0, 2000), String(delaySeconds)],
           );
           result.failed += 1;
-          logger.warn(
-            { messageId: row.id, seq: row.seq, attempts, retryInSeconds: delaySeconds, err: message },
-            'outbox publish failed, will retry',
-          );
+
+          /**
+           * Past the old ceiling this gets LOUD rather than lossy.
+           *
+           * The row keeps retrying, because a transient failure that has lasted
+           * a long time is still transient — the broker being down for an hour
+           * is not a reason to throw the messages away. But an operator needs to
+           * know the queue is stuck, and a warn line among many is not that.
+           *
+           * `maxAttempts` therefore no longer decides an outcome; it decides
+           * when to start shouting.
+           */
+          if (attempts >= opts.maxAttempts) {
+            logger.error(
+              {
+                messageId: row.id,
+                seq: row.seq,
+                topic: row.topic,
+                attempts,
+                retryInSeconds: delaySeconds,
+                err: message,
+              },
+              'outbox row STUCK: still failing after the retry ceiling and still being retried — ' +
+                'the broker or schema registry is likely unreachable',
+            );
+          } else {
+            logger.warn(
+              { messageId: row.id, seq: row.seq, attempts, retryInSeconds: delaySeconds, err: message },
+              'outbox publish failed, will retry',
+            );
+          }
         }
       }
     }
