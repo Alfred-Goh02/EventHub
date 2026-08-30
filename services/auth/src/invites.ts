@@ -64,3 +64,43 @@ export async function lookupInvite(token: string): Promise<InviteLookup> {
     role: invite.role,
   };
 }
+
+/**
+ * Withdraws every live invite for an address within one tenant.
+ *
+ * `Invite.revokedAt` was read in two places and written in none, so the column
+ * was decorative and a mis-sent invitation could not be taken back: it stayed
+ * redeemable for its full seven days, and whoever received it could join the
+ * tenant at the role it named.
+ *
+ * By EMAIL rather than by id, because there is no endpoint that lists invites —
+ * an admin has no way to learn an id, and "revoke the invitation I sent to this
+ * address" is the operation they actually have in mind. It also handles the case
+ * where the same address was invited more than once.
+ *
+ * THE tenantId FILTER IS LOAD-BEARING. Invite is deliberately RLS-exempt, so
+ * unlike almost every other write in this service there is no policy underneath
+ * to catch a missing scope — an admin of one tenant would otherwise be able to
+ * revoke another tenant's invitations. The exemption buys the pre-tenant-context
+ * lookup that /register needs, and the price is that every OTHER query against
+ * this table has to carry its own scope.
+ *
+ * Already-accepted invites are left alone: revoking one would not remove the
+ * user it created, so it would only make the audit trail lie.
+ */
+export async function revokeInvitesFor(params: {
+  tenantId: string;
+  email: string;
+}): Promise<number> {
+  const { count } = await prisma.invite.updateMany({
+    where: {
+      tenantId: params.tenantId,
+      email: params.email.toLowerCase(),
+      acceptedAt: null,
+      revokedAt: null,
+    },
+    data: { revokedAt: new Date() },
+  });
+
+  return count;
+}

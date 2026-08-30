@@ -276,6 +276,25 @@ jobs:
       # last -- so the victim believes they set their password while the
       # attacker's is the live one. Measured: 10 of 10 races had two winners
       # before the guard went in.
+      # Invite.revokedAt was read in two places and written in none, so a
+      # mis-sent invitation stayed redeemable for its full seven days.
+      #
+      # The cross-tenant half is what needs a test rather than a reading:
+      # Invite is deliberately RLS-EXEMPT, because a tenant policy would filter
+      # out the very row that tells /register which tenant to use. So unlike
+      # almost every other write in this service there is no policy underneath
+      # to catch a missing scope, and the tenantId filter in the query is the
+      # only thing stopping one admin revoking every tenant’s invitations.
+      - name: Assert an invitation can be withdrawn, and only within its tenant
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/verify-invite-revocation.mjs
+          pkill -f "node dist/index.js" || true
+
       - name: Assert password reset works and each token spends once
         run: |
           (cd services/auth && node dist/index.js &)

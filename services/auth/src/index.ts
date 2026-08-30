@@ -9,7 +9,7 @@ import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
 import { requireAuth, requireRole } from './middleware/auth.js';
 import { issueRefreshToken, rotateRefreshToken, revokeFamily } from './tokens.js';
-import { issueInvite, lookupInvite } from './invites.js';
+import { issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
 import { issueResetToken, lookupResetToken } from './password-reset.js';
 import { emitDevToken } from './dev-sink.js';
 import { createRateLimiter } from './rate-limit.js';
@@ -97,6 +97,35 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
   });
 
   return res.status(201).json({ email, role, expiresAt });
+}));
+
+const revokeInviteSchema = z.object({ email: emailField });
+
+/**
+ * POST /invites/revoke — withdraw an invitation that has not been used yet.
+ *
+ * ADMIN-gated and tenant-scoped from the VERIFIED TOKEN, never from the body.
+ * The tenant matters more here than on most routes: Invite is RLS-exempt, so
+ * there is no policy underneath to catch a missing scope, and an admin of one
+ * tenant could otherwise revoke another tenant's invitations.
+ *
+ * Answers 200 with a count rather than 404 on nothing-to-do. "No live invite for
+ * that address" is not an error — it is the state the caller was asking for, and
+ * distinguishing it would tell an admin whether an address they do not control
+ * has a pending invitation in their tenant.
+ */
+app.post('/invites/revoke', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
+  const parsed = revokeInviteSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+
+  const revoked = await revokeInvitesFor({
+    tenantId: req.auth!.tenantId,
+    email: parsed.data.email,
+  });
+
+  return res.json({ email: parsed.data.email, revoked });
 }));
 
 const registerSchema = z.object({
