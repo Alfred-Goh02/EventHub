@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { createLogger } from '@eventhub/logger';
 import { withTenantRetry } from '../db.js';
 import { ah } from '../async.js';
 import { requireAuth } from '../auth.js';
@@ -6,6 +7,8 @@ import { emit } from '../outbox.js';
 import { FakePaymentProvider, withTimeout, type PaymentProvider } from '../payments/provider.js';
 
 export const pay: Router = Router();
+
+const logger = createLogger('payment-route');
 
 /**
  * How long to wait for the provider before calling it an unknown.
@@ -253,12 +256,24 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
      * back on sale and be resold while the customer's card had in fact been
      * charged.
      */
-    await withTenantRetry(tenantId, async (tx) => {
-      await tx.payment.updateMany({
+    const marked = await withTenantRetry(tenantId, async (tx) => {
+      const settledPayment = await tx.payment.updateMany({
         where: { id: intent.paymentId, status: 'PENDING' },
         data: { status: 'UNKNOWN', failureReason: outcome.reason },
       });
+      return settledPayment.count === 1;
     });
+
+    if (!marked) {
+      // Someone else settled this attempt while the provider was not answering
+      // us. Nothing was written, and telling the caller their payment "is being
+      // confirmed" would point them at an attempt that is already closed.
+      return res.status(409).json({
+        reservationId,
+        paymentId: intent.paymentId,
+        error: 'this payment was already resolved by another process',
+      });
+    }
 
     return res.status(202).json({
       reservationId,
@@ -282,16 +297,53 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
      * The hold clock is NOT extended. The original expiresAt still stands, so a
      * failed payment cannot be used to hold seats indefinitely by retrying.
      */
-    await withTenantRetry(tenantId, async (tx) => {
-      await tx.payment.updateMany({
+    const released = await withTenantRetry(tenantId, async (tx) => {
+      const settledPayment = await tx.payment.updateMany({
         where: { id: intent.paymentId, status: 'PENDING' },
         data: { status: 'FAILED', failureReason: outcome.reason, settledAt: new Date() },
       });
+
+      /**
+       * THE GATE, and the reason it has to be here.
+       *
+       * The reservation UPDATE below is guarded on `status: 'PENDING_PAYMENT'`
+       * and NOTHING ELSE. Nothing in the schema ties a PENDING_PAYMENT
+       * reservation to the attempt that owns it — paymentStartedAt is a bare
+       * timestamp. So without this gate, a superseded attempt drives another
+       * attempt's state machine:
+       *
+       *   1. The webhook settles attempt P1 as FAILED and returns R to HELD.
+       *   2. The buyer clicks pay again. P2 opens, R -> PENDING_PAYMENT.
+       *   3. P1's late reply finally arrives here. The payment UPDATE matches
+       *      zero rows — P1 is already FAILED — and used to be discarded.
+       *   4. The reservation UPDATE then matches P2's row and flips R back to
+       *      HELD while P2's charge is still live.
+       *
+       * The seats are now held rather than pending, so the sweeper may expire
+       * and resell them under a live charge; and a third /pay can win phase 1
+       * and charge the same buyer again.
+       *
+       * A rowCount of zero here means this request no longer owns the
+       * reservation, so it must not touch it. settleAttempt already works this
+       * way; this was the one copy that did not.
+       */
+      if (settledPayment.count === 0) return false;
+
       await tx.reservation.updateMany({
         where: { id: reservationId, status: 'PENDING_PAYMENT' },
         data: { status: 'HELD', paymentStartedAt: null, version: { increment: 1 } },
       });
+
+      return true;
     });
+
+    if (!released) {
+      return res.status(409).json({
+        reservationId,
+        paymentId: intent.paymentId,
+        error: 'this payment was already resolved by another process',
+      });
+    }
 
     return res.status(402).json({
       reservationId,
@@ -304,10 +356,44 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
 
   // Success.
   const settled = await withTenantRetry(tenantId, async (tx) => {
-    await tx.payment.updateMany({
+    /**
+     * The rowCount here is NOT decoration, and discarding it was a bug.
+     *
+     * Between phase 1 and here, the webhook or the reconciler may have settled
+     * this same attempt — they resolve the identical fact by different routes.
+     * If they did, this matches zero rows, and everything below is then
+     * operating on a reservation this request did not transition.
+     */
+    const recorded = await tx.payment.updateMany({
       where: { id: intent.paymentId, status: 'PENDING' },
       data: { status: 'SUCCEEDED', providerRef: outcome.providerRef, settledAt: new Date() },
     });
+
+    if (recorded.count === 0) {
+      /**
+       * We no longer own this attempt, so we must not act on its outcome.
+       *
+       * The reservation UPDATE below is guarded on PENDING_PAYMENT alone, with
+       * nothing tying it to intent.paymentId. If a retry has already opened a
+       * SECOND attempt, that guard matches the second attempt's row — and this
+       * request would confirm it, move held -> sold, and emit tickets.purchased
+       * carrying a paymentId that settled nothing. Returning early is the only
+       * safe move; the truth is read below.
+       */
+      const [reservation, payment] = await Promise.all([
+        tx.reservation.findFirst({ where: { id: reservationId }, select: { status: true } }),
+        tx.payment.findFirst({ where: { id: intent.paymentId }, select: { status: true } }),
+      ]);
+
+      return {
+        alreadySettled: true,
+        reservationStatus: reservation?.status ?? null,
+        paymentStatus: payment?.status ?? null,
+        // Our provider call said SUCCEEDED and the stored attempt says FAILED.
+        // Two sources disagree about whether money moved.
+        discrepancy: payment?.status === 'FAILED',
+      };
+    }
 
     /**
      * Guarded, like every other transition here. If reconciliation or another
@@ -322,7 +408,42 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
       data: { status: 'CONFIRMED', confirmedAt: new Date(), version: { increment: 1 } },
     });
 
-    if (confirmed.count === 0) return { alreadySettled: true };
+    if (confirmed.count === 0) {
+      /**
+       * Somebody else resolved this attempt first. WHICH WAY they resolved it is
+       * not knowable from a rowCount of zero, so read it rather than assume.
+       *
+       * This used to `return { alreadySettled: true }` and the handler answered
+       * 200 with status CONFIRMED regardless. That is a lie in the case that
+       * matters: the reconciler can conclude the charge never arrived, return
+       * the reservation to HELD, and then this request's own late provider
+       * response says succeeded. Both guarded updates match nothing, and the
+       * buyer is told they are confirmed while holding a reservation that will
+       * simply expire.
+       */
+      const [reservation, payment] = await Promise.all([
+        tx.reservation.findFirst({ where: { id: reservationId }, select: { status: true } }),
+        tx.payment.findFirst({ where: { id: intent.paymentId }, select: { status: true, providerRef: true } }),
+      ]);
+
+      return {
+        alreadySettled: true,
+        reservationStatus: reservation?.status ?? null,
+        paymentStatus: payment?.status ?? null,
+        /**
+         * Reaching here means we DID record the charge as SUCCEEDED — the early
+         * return above covers the other case — but the reservation was no longer
+         * awaiting payment, so nobody will confirm it.
+         *
+         * That is money taken for seats not allocated, which is the worst state
+         * this endpoint can produce and the one the CI invariant looks for:
+         * no SUCCEEDED payment may point at a non-CONFIRMED reservation.
+         * The transaction is not rolled back, because the charge is real and
+         * deleting the record of it would make the money untraceable.
+         */
+        discrepancy: reservation?.status !== 'CONFIRMED',
+      };
+    }
 
     for (const line of intent.lines) {
       // `held: { gte: quantity }` is a guard, not decoration: it makes an
@@ -401,6 +522,39 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
 
     return { alreadySettled: false };
   });
+
+  /**
+   * Report what actually happened, not what this request hoped would happen.
+   *
+   * Only a reservation this call confirmed — or that it found already CONFIRMED
+   * — may be answered 200 CONFIRMED. Anything else means another actor resolved
+   * the attempt differently, and telling the buyer "CONFIRMED" would hand them a
+   * receipt for seats they do not have.
+   */
+  if (settled.alreadySettled && settled.reservationStatus !== 'CONFIRMED') {
+    if (settled.discrepancy) {
+      // Our provider call returned SUCCEEDED and the stored attempt says FAILED.
+      // One of the two is wrong about whether money moved, and nothing here can
+      // decide which. Loud, because the resolution is a refund or a manual sale.
+      logger.error(
+        {
+          reservationId,
+          paymentId: intent.paymentId,
+          providerRef: outcome.providerRef,
+          paymentStatus: settled.paymentStatus,
+          reservationStatus: settled.reservationStatus,
+        },
+        'PAYMENT DISCREPANCY: the provider answered succeeded but the reservation was not confirmed',
+      );
+    }
+
+    return res.status(409).json({
+      reservationId,
+      status: settled.reservationStatus,
+      paymentId: intent.paymentId,
+      error: 'this payment was resolved by another process and did not confirm the reservation',
+    });
+  }
 
   return res.status(200).json({
     reservationId,
