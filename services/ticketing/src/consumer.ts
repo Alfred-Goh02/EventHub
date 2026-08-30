@@ -8,6 +8,39 @@ const DLQ = 'events.activity.dlq';
 const GROUP = 'ticketing-event-projection';
 
 /**
+ * When the projection consumer last heartbeat to its group.
+ *
+ * Module-level so a request handler can read it without a handle on the
+ * consumer. Written by the HEARTBEAT event below; read by
+ * projectionIsCurrent().
+ */
+let lastHeartbeatAt: number | null = null;
+
+/**
+ * When a fetch last came back EMPTY, i.e. the broker had nothing more to give.
+ *
+ * This is the half that actually means "caught up". A heartbeat only proves the
+ * consumer holds an assignment, and kafkajs starts heartbeating as soon as the
+ * group is joined -- which is BEFORE the backlog is replayed. On a cold start
+ * against a compacted topic that window can be long, and it is exactly the
+ * window in which this service must not claim an event does not exist.
+ *
+ * An empty fetch is the cheapest honest answer to "is there more": the consumer
+ * asked the broker and was told no.
+ */
+let caughtUpAt: number | null = null;
+
+/**
+ * How long without a heartbeat before this consumer is assumed to be behind.
+ *
+ * kafkajs heartbeats every heartbeatInterval (3s by default), so 15s is several
+ * missed beats rather than one unlucky pause. Erring long matters: a false
+ * "behind" costs a retry, while a false "current" tells a customer an event
+ * does not exist when it does.
+ */
+const HEARTBEAT_STALE_MS = 15_000;
+
+/**
  * Keeps EventProjection in step with the Event service.
  *
  * This service CANNOT join to eventhub_event — CONNECT is revoked and it holds
@@ -169,9 +202,24 @@ export function createProjectionConsumer(opts: {
       // database needs no bootstrap endpoint.
       await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
 
+      // A heartbeat proves the consumer holds an assignment and is being fed.
+      // It is the one cheap signal that separates "idle and caught up" from
+      // "disconnected and arbitrarily behind" -- see projectionIsCurrent().
+      consumer.on(consumer.events.HEARTBEAT, () => {
+        lastHeartbeatAt = Date.now();
+      });
+
+      // A fetch that returned no batches means the broker had nothing more.
+      // That, and not the heartbeat, is what "caught up" means here.
+      consumer.on(consumer.events.FETCH, ({ payload }) => {
+        if (payload.numberOfBatches === 0) caughtUpAt = Date.now();
+      });
+
+
       await consumer.run({
         autoCommit: false,
         eachMessage: async (payload) => {
+          lastHeartbeatAt = Date.now();
           await handle(payload);
           // Only now. A crash before this redelivers, which dedupe absorbs;
           // committing first would skip the message permanently.
@@ -196,19 +244,55 @@ export function createProjectionConsumer(opts: {
 }
 
 /**
- * How far behind the projection is, for the 404-versus-503 decision.
+ * Whether this service is in a position to say an event does not exist.
  *
- * A missing projection row means one of two very different things: the event
- * genuinely does not exist, or this service has not caught up yet. Telling a
- * customer an event does not exist when it does is the worse error, so lag is
- * measured rather than assumed.
+ * REPLACES projectionLagSeconds(), which measured the wrong thing and was never
+ * called — a combination that hid the mistake. It returned wall-clock seconds
+ * since the last checkpoint WRITE and called that "lag", but a checkpoint is
+ * only written when a message is applied. On a healthy, fully caught-up system
+ * with no new events it therefore reported enormous numbers: measured 12329
+ * seconds on a stack that was perfectly up to date. Wiring it into the 404/503
+ * decision as written turned every legitimate 404 into a 503 on any quiet
+ * system, which is worse than the bug it was meant to fix.
+ *
+ * The honest distinction is not "how long since I saw a message" — an idle topic
+ * and a broken consumer look identical by that measure. It takes TWO signals,
+ * and dropping either one reintroduces a different version of the same bug:
+ *
+ *   LIVENESS      the consumer still heartbeats, so it holds an assignment and
+ *                 is being fed. Without this, a crashed or disconnected consumer
+ *                 keeps answering 404 while falling arbitrarily behind.
+ *   COMPLETENESS  a fetch came back EMPTY, so the broker has confirmed there is
+ *                 nothing more right now. Without this, a COLD START looks
+ *                 current: kafkajs heartbeats as soon as the group is joined,
+ *                 which is before a compacted topic has been replayed — exactly
+ *                 the window this decision exists for.
+ *
+ * True consumer lag — comparing committed offsets to the topic high-water mark —
+ * would be strictly better and is not available here: it needs eachBatch's
+ * offsetLag() or an admin call, and this consumer uses eachMessage precisely so
+ * that the offset commit can follow each database transaction. An empty fetch is
+ * the cheapest honest substitute: the consumer asked and was told no.
+ *
+ * The residual gap is inherent to eventual consistency: an event published
+ * milliseconds ago may not have arrived yet, and no signal inside this process
+ * can know that. That window is the reason the reservation route treats a
+ * missing row as retryable rather than final whenever it has any doubt.
  */
-export async function projectionLagSeconds(): Promise<number | null> {
-  const rows = await prisma.$queryRaw<Array<{ lag: number | null }>>`
-    SELECT extract(epoch FROM now() - max("updatedAt"))::float8 AS lag
-      FROM "ConsumerCheckpoint"
-     WHERE "consumerGroup" = ${GROUP}
-  `;
-  const lag = rows[0]?.lag;
-  return lag === null || lag === undefined ? null : Math.round(lag);
+export function projectionIsCurrent(): boolean {
+  // Liveness: the consumer still holds its assignment.
+  if (lastHeartbeatAt === null || Date.now() - lastHeartbeatAt >= HEARTBEAT_STALE_MS) return false;
+
+  // Completeness: the broker has told us, recently, that there is nothing more.
+  // Without this a consumer still replaying its backlog would look current,
+  // which is the very case this decision exists for.
+  if (caughtUpAt === null || Date.now() - caughtUpAt >= HEARTBEAT_STALE_MS) return false;
+
+  return true;
+}
+
+/** Seconds since the consumer last heartbeat, or null if it never has. */
+export function secondsSinceHeartbeat(): number | null {
+  if (lastHeartbeatAt === null) return null;
+  return Math.round((Date.now() - lastHeartbeatAt) / 1000);
 }

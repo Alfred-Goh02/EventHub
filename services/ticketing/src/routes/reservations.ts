@@ -5,11 +5,19 @@ import { withTenantRetry } from '../db.js';
 import { ah } from '../async.js';
 import { requireAuth } from '../auth.js';
 import { emit } from '../outbox.js';
+import { projectionIsCurrent, secondsSinceHeartbeat } from '../consumer.js';
+import { createLogger } from '@eventhub/logger';
 
 export const reservations: Router = Router();
 
 /** How long a hold survives without payment. */
+const logger = createLogger('reservations');
+
 const HOLD_TTL_MS = 10 * 60 * 1000;
+
+
+/** What to put in Retry-After. One consumer poll plus room to actually apply it. */
+const PROJECTION_RETRY_AFTER_S = 2;
 
 /** How long a claimed idempotency key is held before another attempt may take it. */
 const LEASE_TTL_MS = 60 * 1000;
@@ -357,8 +365,41 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
       return res.status(422).json({ error: 'this Idempotency-Key was used with a different request body' });
     case 'retry':
       return res.status(503).json({ error: 'please retry' });
-    case 'unknown-event':
+    case 'unknown-event': {
+      /**
+       * A missing projection row means one of two very different things, and
+       * this used to answer 404 for both.
+       *
+       * Either the event genuinely does not exist, or THIS SERVICE HAS NOT
+       * CAUGHT UP YET. Ticketing learns about events by consuming a topic, so
+       * there is always a window after publication in which the event is real
+       * and the projection does not know it. Answering 404 in that window tells
+       * a customer an event does not exist while it is on sale — and a client
+       * that trusts 404 will not retry.
+       *
+       * ConsumerCheckpoint exists precisely to tell those apart, and the schema
+       * comment on it has described this behaviour since it was written. But
+       * projectionLagSeconds() was exported and called by NOTHING: the mechanism
+       * was built, the documentation described it, and the decision it was built
+       * for was never actually made.
+       *
+       * A null lag means there is no checkpoint row at all — the consumer has
+       * never committed anything — so this service cannot claim any event is
+       * missing.
+       */
+      if (!projectionIsCurrent()) {
+        logger.warn(
+          { eventId, secondsSinceHeartbeat: secondsSinceHeartbeat() },
+          'answering 503 rather than 404: the projection consumer is not current, so a missing row proves nothing',
+        );
+        res.setHeader('Retry-After', String(PROJECTION_RETRY_AFTER_S));
+        return res.status(503).json({
+          error: 'this service has not caught up with recent events yet; please retry',
+        });
+      }
+
       return res.status(404).json({ error: 'event not found' });
+    }
     case 'not-on-sale':
       return res.status(409).json({ error: `event is not on sale (status ${outcome.status})` });
     case 'sold-out':
