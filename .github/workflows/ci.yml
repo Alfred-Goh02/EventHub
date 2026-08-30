@@ -561,6 +561,40 @@ jobs:
             echo "[$label] every non-exempt table has RLS enabled and forced"
           }
 
+          # POSITIVE CONTROL. Without this the assertion above cannot fail.
+          #
+          # `test -z "$MISSING"` passes on an empty result, and a query that
+          # matches NOTHING returns an empty result too. So a wrong relkind, a
+          # wrong namespace filter, or a rename in pg_class would make every
+          # database report "fully covered" while checking nothing at all.
+          #
+          # This repo has shipped that exact bug twice -- a relay boot assertion
+          # that passed on "relation does not exist", and a codegen check that
+          # confirmed broken output was current. An assertion that cannot fail is
+          # worse than no assertion, because it reads as evidence.
+          #
+          # The control runs the same query with NO exemptions and requires it to
+          # find something. It always can: _prisma_migrations is exempt in every
+          # database precisely because it has no RLS, so a working query sees at
+          # least one row here.
+          control() {
+            local url="$1" label="$2"
+            FOUND=$(psql "$url" -tAc "
+              SELECT count(*)
+              FROM pg_class
+              WHERE relkind = 'r'
+                AND relnamespace = 'public'::regnamespace
+                AND NOT (relrowsecurity AND relforcerowsecurity);
+            ")
+            test "$FOUND" -ge 1 || {
+              echo "[$label] CONTROL FAILED: the coverage query found $FOUND tables without RLS."
+              echo "[$label] It should see at least _prisma_migrations. The query is not looking at"
+              echo "[$label] anything, so the check above proves nothing."
+              exit 1
+            }
+            echo "[$label] control ok: the query can see $FOUND table(s) without RLS"
+          }
+
           # Auth exemptions, each justified in its migration:
           #   Tenant       - read before tenant context exists, to resolve a slug
           #   RefreshToken - found by token hash; tenant is a result, not an input
@@ -568,16 +602,19 @@ jobs:
           #   PasswordResetToken - same as RefreshToken. A policy would filter out
           #                  the row that says which tenant to set, so the reset
           #                  would be impossible rather than merely restricted.
+          control "$DATABASE_URL" auth
           check "$DATABASE_URL" auth "'_prisma_migrations','Tenant','RefreshToken','Invite','PasswordResetToken'"
 
           # Event has no exemptions. Every table is tenant-scoped, including
           # OutboxMessage, which carries a second role-targeted policy for the
           # relay rather than being exempt.
+          control "$EVENT_DATABASE_URL" event
           check "$EVENT_DATABASE_URL" event "'_prisma_migrations'"
 
           # Ticketing has NO exemptions. Nothing here is looked up before tenant
           # context exists: every request carries a verified JWT, and the
           # consumer reads tenantId off the message before writing.
+          control "$TICKETING_DATABASE_URL" ticketing
           check "$TICKETING_DATABASE_URL" ticketing "'_prisma_migrations'"
 
       # Database-per-service must hold at the CONNECTION boundary, not merely at
@@ -594,6 +631,32 @@ jobs:
             echo "  refused   $role -> $db"
           }
 
+          # The positive control, built from the SAME URL template as refuse().
+          #
+          # refuse() passes whenever psql fails for ANY reason. A typo in that
+          # template -- wrong port, wrong host, a stray character -- would make
+          # all six refusals pass while testing nothing, and the run would print
+          # six reassuring "refused" lines.
+          #
+          # The previous control used $TICKETING_APP_DATABASE_URL, which proved
+          # psql worked and that env var was right, but shared no code with the
+          # string refuse() actually builds. This one exercises the template.
+          permit() {
+            local role="$1" db="$2"
+            psql "postgresql://$role:$role@localhost:5432/$db" -tAc 'SELECT 1' >/dev/null 2>&1 || {
+              echo "CONTROL FAILED: $role could not reach its OWN database $db."
+              echo "The URL template is wrong, so every refusal below proves nothing."
+              exit 1
+            }
+            echo "  connected $role -> $db"
+          }
+
+          # Run the control FIRST. If the template is broken, fail here rather
+          # than after printing six false negatives.
+          permit eventhub_auth_app      eventhub_auth
+          permit eventhub_event_app     eventhub_event
+          permit eventhub_ticketing_app eventhub_ticketing
+
           # Every cross-service direction. Database-per-service must hold at the
           # CONNECTION boundary, not merely at the table grants — otherwise a
           # leaked credential can still enumerate another service's schema from
@@ -605,8 +668,12 @@ jobs:
           refuse eventhub_auth_app      eventhub_event
           refuse eventhub_auth_app      eventhub_ticketing
 
-          # And the positive control: the correct pairing must still work, or
-          # this assertion would pass for the wrong reason.
+          # A second control, on the ENV VAR rather than the template above.
+          #
+          # permit() proves the string refuse() builds is right. This proves the
+          # environment variable every other step uses is right too -- they are
+          # different failures, and only this one would catch a bad
+          # TICKETING_APP_DATABASE_URL.
           psql "$TICKETING_APP_DATABASE_URL" -tAc 'SELECT 1' >/dev/null \
-            || { echo "the ticketing role cannot reach its OWN database"; exit 1; }
-          echo "  connected eventhub_ticketing_app -> eventhub_ticketing"
+            || { echo "TICKETING_APP_DATABASE_URL does not reach its own database"; exit 1; }
+          echo "  connected via TICKETING_APP_DATABASE_URL"
