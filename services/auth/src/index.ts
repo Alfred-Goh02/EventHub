@@ -3,7 +3,8 @@ import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
-import { withTenant } from './db.js';
+import { ah } from './async.js';
+import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
 import { requireAuth, requireRole } from './middleware/auth.js';
@@ -68,7 +69,7 @@ const inviteSchema = z.object({
 // Creating an invite requires being an ADMIN of the tenant you are inviting to.
 // Both facts come from the verified token: requireAuth establishes who, and
 // requireRole establishes whether they may. Neither is client-supplied.
-app.post('/invites', requireAuth, requireRole('ADMIN'), async (req, res) => {
+app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
   const parsed = inviteSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.flatten() });
@@ -96,7 +97,7 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), async (req, res) => {
   });
 
   return res.status(201).json({ email, role, expiresAt });
-});
+}));
 
 const registerSchema = z.object({
   token: z.string().min(1),
@@ -107,7 +108,7 @@ const registerSchema = z.object({
 // someone already inside that tenant — so the registering user never gets to
 // state which tenant they are joining, and there is nothing to lie about.
 // The email is pinned by the invite too, for the same reason.
-app.post('/register', async (req, res) => {
+app.post('/register', ah(async (req, res) => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.flatten() });
@@ -178,14 +179,14 @@ app.post('/register', async (req, res) => {
     logger.error({ err }, 'register failed');
     return res.status(500).json({ error: 'internal error' });
   }
-});
+}));
 
 const loginSchema = z.object({
   email: emailField,
   password: z.string(),
 });
 
-app.post('/login', async (req, res) => {
+app.post('/login', ah(async (req, res) => {
   const tenantId = req.header('X-Tenant-ID');
   if (!tenantId) {
     return res.status(400).json({ error: 'X-Tenant-ID header is required' });
@@ -217,9 +218,9 @@ app.post('/login', async (req, res) => {
   const accessToken = await signAccessToken(user.id, tenantId, user.role);
   const refreshToken = await issueRefreshToken(user.id, tenantId);
   return res.json({ accessToken, refreshToken });
-});
+}));
 
-app.get('/me', requireAuth, async (req, res) => {
+app.get('/me', requireAuth, ah(async (req, res) => {
   const user = await withTenant(req.auth!.tenantId, (tx) =>
     tx.user.findUnique({
       where: { id: req.auth!.userId },
@@ -227,9 +228,9 @@ app.get('/me', requireAuth, async (req, res) => {
     }),
   );
   return res.json(user);
-});
+}));
 
-app.post('/refresh', async (req, res) => {
+app.post('/refresh', ah(async (req, res) => {
   const parsed = z.object({ refreshToken: z.string() }).safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'refreshToken is required' });
@@ -257,9 +258,9 @@ app.post('/refresh', async (req, res) => {
 
   const accessToken = await signAccessToken(result.userId, result.tenantId, user.role);
   return res.json({ accessToken, refreshToken: result.token });
-});
+}));
 
-app.post('/logout', async (req, res) => {
+app.post('/logout', ah(async (req, res) => {
   const parsed = z.object({ refreshToken: z.string() }).safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'refreshToken is required' });
@@ -267,7 +268,7 @@ app.post('/logout', async (req, res) => {
 
   await revokeFamily(parsed.data.refreshToken);
   return res.status(204).send();
-});
+}));
 
 /**
  * Rate limits for /forgot-password.
@@ -303,7 +304,7 @@ const forgotSchema = z.object({ email: emailField });
  * answer, and the alternative — fan out to every tenant holding the address —
  * means more unauthenticated mail for the same ambiguity.
  */
-app.post('/forgot-password', async (req, res) => {
+app.post('/forgot-password', ah(async (req, res) => {
   const tenantId = req.header('X-Tenant-ID');
   if (!tenantId) {
     return res.status(400).json({ error: 'X-Tenant-ID header is required' });
@@ -351,7 +352,7 @@ app.post('/forgot-password', async (req, res) => {
   }
 
   return res.status(202).json(accepted);
-});
+}));
 
 const resetSchema = z.object({
   token: z.string().min(1),
@@ -369,7 +370,7 @@ const resetSchema = z.object({
  * used" from "never existed" tells someone probing tokens which guesses were
  * close, and matches what /register already does for invites.
  */
-app.post('/reset-password', async (req, res) => {
+app.post('/reset-password', ah(async (req, res) => {
   const parsed = resetSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.flatten() });
@@ -479,8 +480,26 @@ app.post('/reset-password', async (req, res) => {
     logger.error({ err }, 'password reset failed');
     return res.status(500).json({ error: 'internal error' });
   }
+}));
+
+// Express 4 identifies an error handler by its ARITY: four parameters. Drop
+// `_next` and it silently becomes ordinary middleware that never runs on error.
+//
+// Auth had none at all, and eight unwrapped async handlers feeding it nothing.
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error({ err }, 'unhandled error');
+  res.status(500).json({ error: 'internal error' });
 });
 
-app.listen(env.PORT, () => {
-  logger.info(`auth-service listening on port ${env.PORT}`);
+async function main(): Promise<void> {
+  await assertRuntimeRoleCannotBypassRls();
+
+  app.listen(env.PORT, () => {
+    logger.info(`auth-service listening on port ${env.PORT}`);
+  });
+}
+
+main().catch((err) => {
+  logger.error({ err }, 'auth-service failed to start');
+  process.exit(1);
 });
