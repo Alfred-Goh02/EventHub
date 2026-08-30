@@ -4,6 +4,28 @@ import { hashSecretToken as hashToken, newSecretToken } from './secret-token.js'
 
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * How long a login may be extended by rotation before the user must sign in
+ * again. Ninety days.
+ *
+ * Every rotation issues a successor with a fresh 30-day expiry, so the sliding
+ * window never closes on its own: a session used once a month lives forever, and
+ * so does a STOLEN token used once a month. Reuse detection only fires if the
+ * legitimate holder presents the same token the thief already spent — if the
+ * thief simply takes over the chain and the victim never refreshes again,
+ * nothing ever notices.
+ *
+ * An absolute ceiling is the backstop for that. It cannot be extended by any
+ * amount of activity, so a compromised chain has a definite end date even when
+ * nothing detects it.
+ *
+ * Measured from the FIRST token in the family rather than a stored column: the
+ * family already records its own birth as `min(createdAt)`, and there is an
+ * index on familyId to find it with. A new column would be a migration and a
+ * second source of truth for a fact the table already holds.
+ */
+const ABSOLUTE_SESSION_MS = 90 * 24 * 60 * 60 * 1000;
+
 export async function issueRefreshToken(
   userId: string,
   tenantId: string,
@@ -44,6 +66,26 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
   if (record.usedAt) {
     await revokeFamilyById(record.familyId);
     return { ok: false, reason: 'reused' };
+  }
+
+  /**
+   * The absolute ceiling, checked before the sliding one.
+   *
+   * Rotation resets `expiresAt` to +30 days every time, so the sliding window
+   * alone never closes on an active chain — including one an attacker is keeping
+   * alive. This asks how old the FAMILY is, which no amount of rotation changes.
+   *
+   * The family is revoked rather than merely refused, so the outstanding
+   * successor cannot be presented either: reaching the ceiling ends the session,
+   * it does not pause it.
+   */
+  const [family] = await prisma.$queryRaw<Array<{ startedAt: Date | null }>>`
+    SELECT min("createdAt") AS "startedAt" FROM "RefreshToken" WHERE "familyId" = ${record.familyId}
+  `;
+
+  if (family?.startedAt && Date.now() - family.startedAt.getTime() > ABSOLUTE_SESSION_MS) {
+    await revokeFamilyById(record.familyId);
+    return { ok: false, reason: 'expired' };
   }
 
   if (record.expiresAt < new Date()) {
