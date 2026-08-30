@@ -48,6 +48,8 @@ function fail(msg) {
   process.exit(1);
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const db = new pg.Client({ connectionString: APP_URL });
 
 async function tx(fn) {
@@ -76,7 +78,19 @@ function reconcile(graceMs) {
       // flight and releases the seats of customers mid-checkout. So the two
       // are set together here rather than leaving the default 8s timeout to
       // contradict a deliberately short grace.
-      PAYMENT_TIMEOUT_MS: '50',
+      // 50ms was too tight and made this test flaky on a loaded runner.
+      //
+      // The reconciler wraps its provider in withTimeout(PAYMENT_TIMEOUT_MS),
+      // and a lookup that loses that race returns `unknown` -- which is
+      // CORRECT behaviour, and leaves the attempt unsettled. So on a busy CI
+      // box the reconciler would report 'still unresolved' and the assertions
+      // below would fail for a reason that has nothing to do with what they
+      // test. Observed on main twice.
+      //
+      // 300ms is still far below anything a real provider needs, and the
+      // grace period is raised with it to stay clear of the
+      // grace > 2x timeout floor the reconciler enforces.
+      PAYMENT_TIMEOUT_MS: '300',
       LOG_LEVEL: 'error',
     },
     encoding: 'utf8',
@@ -186,7 +200,18 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log('\n3. past the grace window, the provider is asked');
   // -------------------------------------------------------------------------
-  reconcile(200);
+  /**
+   * Wait past the grace window before asking the reconciler to act.
+   *
+   * The job only examines attempts older than RECONCILE_GRACE_MS, so whether it
+   * sees these two depended on how long the preceding HTTP calls and process
+   * spawn happened to take. That is not a property worth testing: it made the
+   * run pass or fail on incidental latency rather than on behaviour.
+   *
+   * Sleeping makes the precondition explicit and deterministic.
+   */
+  await sleep(1200);
+  reconcile(1000);
 
   const paid = await state(paidRes);
   const paidInv = await inventory(ttPaid);
@@ -215,7 +240,18 @@ async function main() {
   // A double held->sold satisfies both TicketType CHECK constraints — remaining
   // + held + sold stays equal to total, the numbers are simply wrong — so the
   // schema cannot catch this and the guard has to.
-  reconcile(200);
+  /**
+   * Wait past the grace window before asking the reconciler to act.
+   *
+   * The job only examines attempts older than RECONCILE_GRACE_MS, so whether it
+   * sees these two depended on how long the preceding HTTP calls and process
+   * spawn happened to take. That is not a property worth testing: it made the
+   * run pass or fail on incidental latency rather than on behaviour.
+   *
+   * Sleeping makes the precondition explicit and deterministic.
+   */
+  await sleep(1200);
+  reconcile(1000);
   const paidAgain = await inventory(ttPaid);
   const lostAgain = await inventory(ttLost);
   const paidState = await state(paidRes);
