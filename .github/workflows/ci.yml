@@ -443,6 +443,44 @@ jobs:
       # event, and asserts the sale is then refused. Ticketing has no foreign key
       # to the Event table and no credential for that database — Kafka is the
       # ONLY way it can learn any of this.
+      # "I have never heard of that event" and "I have not caught up yet" are
+      # very different answers, and Ticketing used to give 404 for both.
+      #
+      # It learns about events by consuming a topic, so there is always a window
+      # in which an event is real, on sale, and absent from the projection.
+      # Answering 404 there tells a customer an event does not exist while they
+      # are trying to buy a ticket for it, and a client that trusts 404 will not
+      # retry.
+      #
+      # ConsumerCheckpoint was built for exactly this decision and the schema
+      # comment has described it since it was written -- but the function that
+      # measured it was exported and called by NOTHING, and measured the wrong
+      # thing besides. This step starts Ticketing FRESH so the cold-start window
+      # is real, and asserts both halves: 503 with Retry-After before it is
+      # ready, 404 once the broker has confirmed there is nothing more to read.
+      - name: Assert a missing event is only reported as not-found once caught up
+        run: |
+          # Read the key BEFORE the subshell: a command substitution written
+          # inside `(cd services/ticketing && ... $(base64 services/auth/...))`
+          # is evaluated after the cd, so the path resolves relative to the
+          # WRONG directory and silently yields an empty value.
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/ticketing && \
+            PORT=3003 \
+            DATABASE_URL="$TICKETING_DATABASE_URL" \
+            APP_DATABASE_URL="$TICKETING_APP_DATABASE_URL" \
+            node dist/index.js &)
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3001/health >/dev/null \
+               && curl -sf http://localhost:3003/health >/dev/null; then break; fi
+            sleep 1
+          done
+          PROJECTION_COLD_START=1 node scripts/verify-projection-freshness.mjs
+          pkill -f "node dist/index.js" || true
+
       - name: Verify Event to Ticketing projection and the sales rule
         run: |
           AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
