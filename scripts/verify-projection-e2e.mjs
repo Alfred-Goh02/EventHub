@@ -20,6 +20,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { Kafka, logLevel } from 'kafkajs';
+import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import pg from 'pg';
 
 const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
@@ -31,6 +33,9 @@ const TICKETING_APP =
 const RELAY_URL =
   process.env['RELAY_DATABASE_URL'] ??
   'postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event';
+
+const BROKERS = (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',');
+const REGISTRY = process.env['SCHEMA_REGISTRY_URL'] ?? 'http://localhost:8081';
 
 const TENANT = 'tenant_acme';
 const stamp = Date.now();
@@ -160,18 +165,107 @@ async function main() {
   console.log('  reservation after CANCELLED: 409');
 
   // -------------------------------------------------------------------------
-  // 5. Dedup: replaying the topic must not change the projection. This is what
-  //    makes at-least-once delivery safe.
+  // 5. Dedup: REPLAYING A MESSAGE THE CONSUMER HAS ALREADY APPLIED must change
+  //    nothing. This is what makes at-least-once delivery safe.
+  //
+  //    This used to count rows in ProcessedMessage and call it done. That
+  //    asserts the consumer WRITES bookkeeping, not that the bookkeeping is ever
+  //    READ -- delete the ON CONFLICT check and the count stays exactly the
+  //    same, because the rows are still inserted. The comment above it described
+  //    a replay test that did not exist.
+  //
+  //    So: take a messageId the consumer has demonstrably already processed,
+  //    and publish a DIFFERENT payload under it.
   // -------------------------------------------------------------------------
+  const eventDb = new pg.Client({ connectionString: RELAY_URL });
+  await eventDb.connect();
+  const { rows: lastPublished } = await eventDb.query(
+    `SELECT id, payload FROM "OutboxMessage"
+      WHERE "aggregateId" = $1 AND "publishedAt" IS NOT NULL
+      ORDER BY seq DESC LIMIT 1`,
+    [eventId],
+  );
+  await eventDb.end();
+
+  if (lastPublished.length === 0) fail('no published outbox row to replay — nothing to test dedup with');
+
+  // The relay sets messageId = the outbox row id, which is precisely why that id
+  // is stable across relay retries and usable as a dedup key.
+  const replayId = lastPublished[0].id;
+  const original = lastPublished[0].payload;
+
+  const before = await waitForProjection(db, eventId, () => true, 'the projection before replay');
+
+  /**
+   * The replay carries a HIGHER version and a different title, deliberately.
+   *
+   * If it were an identical copy, the projection would be unchanged whether
+   * dedup worked or not, and the test would prove nothing. If it carried a lower
+   * or equal version, the MONOTONIC GUARD would reject it and the test would be
+   * measuring that instead.
+   *
+   * A higher version means the version guard would happily let this through. The
+   * only thing that can stop it is dedup, so an unchanged projection isolates
+   * exactly the mechanism under test.
+   */
+  const registry = new SchemaRegistry({ host: REGISTRY });
+  // The same resolution the relay uses, so the replay is encoded byte-identically
+  // to a real message rather than against some other schema version.
+  const schemaId = await registry.getLatestSchemaId('events.activity-value');
+
+  const value = await registry.encode(schemaId, {
+    ...original,
+    messageId: replayId,
+    occurredAt: new Date().toISOString(),
+    version: Number(original.version ?? 0) + 100,
+    title: 'REPLAYED — this must never reach the projection',
+  });
+
+  const kafka = new Kafka({ clientId: 'verify-dedup', brokers: BROKERS, logLevel: logLevel.ERROR });
+  const producer = kafka.producer();
+  await producer.connect();
+  await producer.send({ topic: 'events.activity', messages: [{ key: eventId, value }] });
+  await producer.disconnect();
+
+  // Give the consumer more than enough time to have applied it if it were going
+  // to. A pass here is "nothing happened", so the wait has to be long enough
+  // that nothing-happened is a conclusion rather than a race.
+  await sleep(8000);
+
+  const after = await waitForProjection(db, eventId, () => true, 'the projection after replay');
+
+  if (after.sourceVersion !== before.sourceVersion) {
+    fail(
+      `the replay was applied: sourceVersion moved ${before.sourceVersion} -> ${after.sourceVersion}. ` +
+        'A message the consumer had already processed changed the projection.',
+    );
+  }
+  if (after.status !== before.status || after.capacity !== before.capacity) {
+    fail(`the replay changed the projection: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+  }
+
+  // And the title specifically, since that is what the replay tried to overwrite.
   await db.query('BEGIN');
   await db.query(`SELECT set_config('app.tenant_id', $1, true)`, [TENANT]);
+  const { rows: titleRows } = await db.query(
+    `SELECT title FROM "EventProjection" WHERE id = $1`,
+    [eventId],
+  );
   const { rows: dupRows } = await db.query(
     `SELECT count(*)::int AS n FROM "ProcessedMessage" WHERE "tenantId" = $1`,
     [TENANT],
   );
   await db.query('COMMIT');
+
+  if (String(titleRows[0]?.title ?? '').startsWith('REPLAYED')) {
+    fail('the replayed title reached the projection — dedup did not stop it');
+  }
   if (dupRows[0].n === 0) fail('no ProcessedMessage rows — deduplication is not recording anything');
-  console.log(`  ${dupRows[0].n} messages recorded for deduplication`);
+
+  console.log(
+    `  replayed messageId ${replayId} with version +100 and a new title; projection unchanged ` +
+      `(v${after.sourceVersion}, ${dupRows[0].n} messages recorded)`,
+  );
 
   await db.end();
   console.log('');
