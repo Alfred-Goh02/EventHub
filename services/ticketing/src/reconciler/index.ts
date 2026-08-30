@@ -49,6 +49,34 @@ if (!parsed.success) {
 }
 const env = parsed.data;
 
+/**
+ * The grace period MUST outlast the provider timeout, and nothing enforced it.
+ *
+ * The two values live in different processes, parsed from different schemas —
+ * the API reads PAYMENT_TIMEOUT_MS, this job reads both — so the relationship
+ * between them existed only in a comment, and a comment cannot fail a deploy.
+ *
+ * Set grace below the timeout and the reconciler starts examining charges that
+ * are STILL IN FLIGHT. It asks the provider, is told "no such charge" because
+ * the charge has not landed yet, and releases the seats of a customer who is
+ * mid-checkout. A job written to repair state becomes the thing breaking it, and
+ * it does so most aggressively exactly when the provider is slow — which is
+ * precisely when there are unsettled attempts for it to find.
+ *
+ * The 2x margin is not arithmetic for its own sake: a charge can begin just
+ * before the endpoint's own timeout expires, so the real worst case is close to
+ * one full timeout after startedAt, and the reconciler should not be arriving at
+ * that moment either.
+ */
+if (env.RECONCILE_GRACE_MS <= env.PAYMENT_TIMEOUT_MS * 2) {
+  throw new Error(
+    `refusing to start: RECONCILE_GRACE_MS (${env.RECONCILE_GRACE_MS}ms) must be more than twice ` +
+      `PAYMENT_TIMEOUT_MS (${env.PAYMENT_TIMEOUT_MS}ms). Below that, this job looks up charges that ` +
+      'are still in flight, is told they do not exist, and releases the seats of customers who are ' +
+      'mid-checkout.',
+  );
+}
+
 const logger = createLogger('payment-reconciler');
 
 const pool = new pg.Pool({

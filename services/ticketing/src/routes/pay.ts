@@ -17,7 +17,33 @@ const logger = createLogger('payment-route');
  * bounds how long a reservation can sit in PENDING_PAYMENT because of a single
  * request, and therefore how long its seats are unavailable to anyone else.
  */
-const PROVIDER_TIMEOUT_MS = Number(process.env['PAYMENT_TIMEOUT_MS'] ?? 8000);
+const PROVIDER_TIMEOUT_MS = (() => {
+  const raw = process.env['PAYMENT_TIMEOUT_MS'];
+  if (raw === undefined || raw === '') return 8000;
+
+  const parsed = Number(raw);
+
+  /**
+   * Validated rather than coerced, because the failure mode of a bare Number()
+   * here is spectacular and silent.
+   *
+   * `Number('8s')` is NaN, and `setTimeout(fn, NaN)` fires IMMEDIATELY. The
+   * provider call would lose every race against its own timeout, so every single
+   * payment would return `unknown` — seats held, nothing settled, the
+   * reconciler left to resolve a queue that grows as fast as people check out.
+   * Nothing crashes and no log says why.
+   *
+   * The reconciler already validates this same variable with zod; the request
+   * path was the one place reading it raw.
+   */
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `PAYMENT_TIMEOUT_MS must be a positive number of milliseconds, got ${JSON.stringify(raw)}`,
+    );
+  }
+
+  return parsed;
+})();
 
 /** Not modelled per ticket type yet; the Payment column defaults to the same value. */
 const CURRENCY = 'SGD';
