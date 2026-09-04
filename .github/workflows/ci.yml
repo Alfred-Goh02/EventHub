@@ -627,6 +627,32 @@ jobs:
       - name: Assert the projection cannot move backwards
         run: node scripts/verify-projection-monotonic.mjs
 
+      # Neither can the consumer checkpoint.
+      #
+      # It is written on EVERY message, including ones the dedup check just
+      # discarded -- consuming a redelivery really does mean this partition has
+      # been read that far -- and it was an unconditional
+      # SET "lastOffset" = EXCLUDED."lastOffset".
+      #
+      # Replays are routine here, not exceptional: the consumer subscribes
+      # fromBeginning against a COMPACTED topic, so one happens on a cold start
+      # against a wiped database, on a group reset, and unprompted if Kafka
+      # expires the group offsets after a period of inactivity. Each rewound
+      # the recorded offset to 0 and climbed back, so an operator reading the
+      # table mid-replay saw a checkpoint that was confidently wrong.
+      #
+      # The schema comment on this table was ALSO wrong, and that is the more
+      # interesting half: it claimed the table disambiguates 404 from 503. That
+      # was the intent; projectionLagSeconds() was built for it, measured the
+      # wrong thing, and was replaced in #35 by projectionIsCurrent(), which
+      # reads two in-memory signals and never touches this table. The comment
+      # is corrected rather than deleted, because a comment describing a
+      # control that does not exist is how the next reader comes to trust a
+      # number no code depends on -- which this repository has already lost a
+      # mechanism to once.
+      - name: Assert the consumer checkpoint cannot rewind on a replay
+        run: node scripts/verify-checkpoint-monotonic.mjs
+
       # Drains TICKETING's outbox with the same relay binary.
       #
       # Added because the payment-path review found that the reservation handler
