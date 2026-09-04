@@ -2,6 +2,7 @@ import { Kafka, logLevel, type Consumer, type EachMessagePayload } from 'kafkajs
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import type { Logger } from '@eventhub/logger';
 import { withTenant, prisma } from './db.js';
+import { PROJECTION_UPSERT_SQL } from './projection-upsert.js';
 
 const TOPIC = 'events.activity';
 const DLQ = 'events.activity.dlq';
@@ -143,37 +144,39 @@ export function createProjectionConsumer(opts: {
       if (inserted === 0) {
         opts.logger.debug({ messageId }, 'already applied, skipping');
       } else {
-        const existing = await tx.eventProjection.findFirst({
-          where: { id: eventId },
-          select: { sourceVersion: true },
-        });
+        /**
+         * The monotonic guard, evaluated by Postgres rather than by this
+         * process. See projection-upsert.ts for why that distinction matters:
+         * the read-then-write it replaces was safe only because of a
+         * deployment property (one partition per aggregate) that is invisible
+         * from here and stops holding during a rebalance.
+         *
+         * $executeRawUnsafe, but the SQL is a module constant and every value
+         * is a bound parameter -- "unsafe" refers to the caller supplying the
+         * statement text, not to the arguments, which are still parameterised.
+         * $executeRaw cannot be used because it demands a tagged template, and
+         * a tagged template cannot be shared with the verifier that runs this
+         * exact statement.
+         */
+        const applied = await tx.$executeRawUnsafe(
+          PROJECTION_UPSERT_SQL,
+          eventId,
+          tenantId,
+          String(decoded['title'] ?? ''),
+          String(decoded['slug'] ?? ''),
+          String(decoded['status'] ?? ''),
+          Number(decoded['capacity'] ?? 0),
+          new Date(String(decoded['startsAt'])),
+          new Date(String(decoded['endsAt'])),
+          String(decoded['organiserId'] ?? ''),
+          Boolean(decoded['deleted']),
+          version,
+        );
 
-        // The monotonic guard. A redelivered or late message carrying an older
-        // version is discarded rather than silently reverting the projection.
-        if (existing && existing.sourceVersion >= version) {
-          opts.logger.debug(
-            { eventId, incoming: version, stored: existing.sourceVersion },
-            'stale snapshot ignored',
-          );
-        } else {
-          const data = {
-            tenantId,
-            title: String(decoded['title'] ?? ''),
-            slug: String(decoded['slug'] ?? ''),
-            status: String(decoded['status'] ?? ''),
-            capacity: Number(decoded['capacity'] ?? 0),
-            startsAt: new Date(String(decoded['startsAt'])),
-            endsAt: new Date(String(decoded['endsAt'])),
-            organiserId: String(decoded['organiserId'] ?? ''),
-            deleted: Boolean(decoded['deleted']),
-            sourceVersion: version,
-          };
-
-          await tx.eventProjection.upsert({
-            where: { id: eventId },
-            create: { id: eventId, ...data },
-            update: data,
-          });
+        // 0 is not an error: it is the WHERE clause discarding a snapshot
+        // older than what is already stored.
+        if (applied === 0) {
+          opts.logger.debug({ eventId, incoming: version }, 'stale snapshot ignored');
         }
       }
 

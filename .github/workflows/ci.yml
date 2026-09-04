@@ -599,6 +599,34 @@ jobs:
           node scripts/verify-projection-e2e.mjs
           pkill -f "node dist/index.js" || true
 
+      # The projection must not be movable BACKWARDS by a concurrent older
+      # snapshot.
+      #
+      # The monotonic guard used to be a read and then a write. Two writers
+      # both read version 5, one carrying 6 and one carrying 7; both pass the
+      # check; both write; whichever commits last wins. If that is the 6, a
+      # CANCELLED event returns to PUBLISHED and becomes sellable again.
+      #
+      # What was actually holding it up was a property of the DEPLOYMENT, not
+      # of the code: messages are keyed by aggregate id, so one event maps to
+      # one partition and one consumer, sequentially. That is invisible from
+      # the consumer, and it stops holding during a rebalance or the day
+      # somebody raises the partition count. Nothing fails at that moment --
+      # the projection is just wrong sometimes. The guard now lives in the
+      # WHERE clause of the write, where Postgres evaluates it under the row
+      # lock ON CONFLICT already takes.
+      #
+      # The statement is IMPORTED from the built module rather than copied, so
+      # the assertion cannot drift from the code. The read-then-write shape is
+      # reproduced alongside it and its going backwards is asserted too: if
+      # that control ever came out right, the test would not be reproducing
+      # the race and every other line in it would be meaningless.
+      #
+      # Needs only the database and the compiled consumer, so it runs after
+      # the services above have been stopped.
+      - name: Assert the projection cannot move backwards
+        run: node scripts/verify-projection-monotonic.mjs
+
       # Drains TICKETING's outbox with the same relay binary.
       #
       # Added because the payment-path review found that the reservation handler
