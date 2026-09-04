@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { ah } from '../async.js';
 import { settleAttempt } from '../payments/settle.js';
+import { attachPoolErrorHandler } from '../pool.js';
 
 export const webhooks: Router = Router();
 
@@ -71,24 +72,42 @@ if (!lookupUrl) {
  * The pool is deliberately NOT exported. A cross-tenant credential inside the
  * API process is only safe while nothing else can reach it.
  */
-const lookupPool = new pg.Pool({
-  connectionString: lookupUrl,
-  max: 2,
-  connectionTimeoutMillis: 5_000,
-  idleTimeoutMillis: 30_000,
-});
+const lookupPool = attachPoolErrorHandler(
+  new pg.Pool({
+    connectionString: lookupUrl,
+    // Named so pg_stat_activity says which pool a connection belongs to. An
+    // operator looking at a stuck backend should not have to guess, and the
+    // resilience verifier uses it to find exactly the connection it means to
+    // terminate rather than any connection on the same role.
+    application_name: 'webhook-tenant-lookup',
+    max: 2,
+    connectionTimeoutMillis: 5_000,
+    idleTimeoutMillis: 30_000,
+  }),
+  logger,
+  'webhook-tenant-lookup',
+);
 
 /**
  * The pool the settlement actually runs on: the ordinary restricted role, the
  * one RLS applies to. Raw pg rather than Prisma because settleAttempt is shared
  * with the reconciler, which cannot use Prisma at all.
  */
-const appPool = new pg.Pool({
-  connectionString: process.env['APP_DATABASE_URL'],
-  max: 5,
-  connectionTimeoutMillis: 5_000,
-  idleTimeoutMillis: 30_000,
-});
+const appPool = attachPoolErrorHandler(
+  new pg.Pool({
+    connectionString: process.env['APP_DATABASE_URL'],
+    // Named so pg_stat_activity says which pool a connection belongs to. An
+    // operator looking at a stuck backend should not have to guess, and the
+    // resilience verifier uses it to find exactly the connection it means to
+    // terminate rather than any connection on the same role.
+    application_name: 'webhook-settlement',
+    max: 5,
+    connectionTimeoutMillis: 5_000,
+    idleTimeoutMillis: 30_000,
+  }),
+  logger,
+  'webhook-settlement',
+);
 
 const event = z.object({
   paymentId: z.string().min(1),

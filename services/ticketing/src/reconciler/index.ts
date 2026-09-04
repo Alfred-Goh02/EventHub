@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { FakePaymentProvider, withTimeout } from '../payments/provider.js';
 import { reconcileOnce } from './reconcile.js';
+import { attachPoolErrorHandler } from '../pool.js';
 
 /**
  * The payment reconciler: a separate process, on the sweeper's credential.
@@ -79,12 +80,21 @@ if (env.RECONCILE_GRACE_MS <= env.PAYMENT_TIMEOUT_MS * 2) {
 
 const logger = createLogger('payment-reconciler');
 
-const pool = new pg.Pool({
-  connectionString: env.SWEEPER_DATABASE_URL,
-  max: 2,
-  connectionTimeoutMillis: 10_000,
-  idleTimeoutMillis: 30_000,
-});
+const pool = attachPoolErrorHandler(
+  new pg.Pool({
+    connectionString: env.SWEEPER_DATABASE_URL,
+    // Named so pg_stat_activity says which pool a connection belongs to. An
+    // operator looking at a stuck backend should not have to guess, and the
+    // resilience verifier uses it to find exactly the connection it means to
+    // terminate rather than any connection on the same role.
+    application_name: 'payment-reconciler',
+    max: 2,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000,
+  }),
+  logger,
+  'payment-reconciler',
+);
 
 const provider = withTimeout(
   new FakePaymentProvider(env.PAYMENT_FAKE_LATENCY_MS),

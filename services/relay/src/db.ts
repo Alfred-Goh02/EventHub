@@ -1,4 +1,54 @@
 import pg from 'pg';
+import type { Logger } from '@eventhub/logger';
+
+/**
+ * Stops a terminated idle connection from killing the process.
+ *
+ * pg.Pool is an EventEmitter, and an EventEmitter that emits 'error' with no
+ * listener THROWS — which in Node is an uncaught exception and an exit. So the
+ * three lines below are not a logging nicety; they are the difference between
+ * the pool quietly replacing a connection and the relay dying. Reproduced by
+ * terminating one idle backend against the unfixed code:
+ *
+ *   node:events:487
+ *         throw er; // Unhandled 'error' event
+ *   error: terminating connection due to administrator command
+ *
+ * Nothing exotic gets you there. A Postgres restart, a managed failover, a
+ * maintenance script running pg_terminate_backend, idle_session_timeout, or a
+ * load balancer reaping an idle TCP connection all produce it — and the relay,
+ * which exists to survive exactly this kind of interruption and republish what
+ * it had not yet delivered, was the process least able to tolerate it.
+ *
+ * Swallowed on purpose. This fires for a client sitting IDLE in the pool, so no
+ * query is in flight and no caller is waiting; pg has already discarded the
+ * client, and the next checkout opens a fresh one. An error on a client that is
+ * CHECKED OUT does not arrive here — it rejects that query() instead, where
+ * drainOnce's own error handling takes it and the attempt rolls back.
+ *
+ * Ticketing carries its own copy of this, in services/ticketing/src/pool.ts,
+ * because the two services share no database package. Both are named the same
+ * thing so scripts/verify-pool-resilience.mjs can require that EVERY
+ * `new pg.Pool(` in this repository is wrapped in a call to it.
+ */
+function attachPoolErrorHandler(pool: pg.Pool, logger: Logger, name: string): pg.Pool {
+  pool.on('error', (err) => {
+    /**
+     * Fields, not the error object. pg's DatabaseError carries a `client`
+     * property, and a structured logger serialising it walks the whole
+     * client -- connection parameters, the socket, pg's entire builtin type
+     * OID table. One termination produced a log line several kilobytes long,
+     * and a Postgres restart terminates every connection at once. The
+     * SQLSTATE is the diagnosis: 57P01 admin_shutdown, 08006 connection_failure.
+     */
+    const e = err as NodeJS.ErrnoException & { code?: string };
+    logger.warn(
+      { pool: name, code: e.code, reason: e.message },
+      'idle database connection was terminated; the pool will replace it',
+    );
+  });
+  return pool;
+}
 
 /**
  * Raw `pg`, not Prisma.
@@ -8,19 +58,28 @@ import pg from 'pg';
  * paying for a generated client would be the worst of both. The relay touches
  * exactly one table with four statements; a query builder earns nothing here.
  */
-export function createPool(connectionString: string): pg.Pool {
-  return new pg.Pool({
-    connectionString,
-    // Small on purpose. The relay is one drain loop plus a metrics endpoint; a
-    // large pool would just hold idle connections a service actually needs.
-    max: 4,
-    // Bounded so a wedged connection is replaced rather than leaked. The role
-    // also carries idle_in_transaction_session_timeout and statement_timeout,
-    // set in db/init/01-bootstrap.sql — an open transaction pins xmin and blocks
-    // VACUUM across the whole cluster, so this matters beyond the relay.
-    connectionTimeoutMillis: 10_000,
-    idleTimeoutMillis: 30_000,
-  });
+export function createPool(connectionString: string, logger: Logger): pg.Pool {
+  return attachPoolErrorHandler(
+    new pg.Pool({
+      connectionString,
+      // Named so pg_stat_activity says which pool a connection belongs to. An
+      // operator looking at a stuck backend should not have to guess, and the
+      // resilience verifier uses it to find exactly the connection it means to
+      // terminate rather than any connection on the same role.
+      application_name: 'eventhub-relay',
+      // Small on purpose. The relay is one drain loop plus a metrics endpoint; a
+      // large pool would just hold idle connections a service actually needs.
+      max: 4,
+      // Bounded so a wedged connection is replaced rather than leaked. The role
+      // also carries idle_in_transaction_session_timeout and statement_timeout,
+      // set in db/init/01-bootstrap.sql — an open transaction pins xmin and blocks
+      // VACUUM across the whole cluster, so this matters beyond the relay.
+      connectionTimeoutMillis: 10_000,
+      idleTimeoutMillis: 30_000,
+    }),
+    logger,
+    'eventhub-relay',
+  );
 }
 
 /**
