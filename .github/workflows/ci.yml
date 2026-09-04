@@ -179,6 +179,30 @@ jobs:
         working-directory: services/auth
         run: node scripts/generate-keys.mjs
 
+      # Can a fresh clone actually START these services?
+      #
+      # Every service ships a .env.example whose first line says "Copy to .env
+      # and adjust". Nothing checked that the copy WORKS -- this workflow sets
+      # its environment from the env: block above instead, so .env.example was
+      # the one piece of configuration here that no job ever exercised. It
+      # drifted exactly the way an unexercised file does: Ticketing's omitted
+      # PAYMENT_WEBHOOK_SECRET, and Ticketing REFUSES TO START without it, on
+      # purpose, because a webhook route with no secret is an unauthenticated
+      # write path into payment state. The refusal was right; the instructions
+      # were wrong; nothing could tell the difference.
+      #
+      # This boots each service on a scratch port with ITS .env.example and
+      # NOTHING ELSE -- deliberately not inheriting this job's environment,
+      # since inheriting is precisely how a missing variable stays invisible.
+      # One printed exemption: AUTH_PUBLIC_KEY_B64 is generated rather than
+      # configured, so it comes from the keypair generated in the step above,
+      # which is what the setup instructions tell a human to do.
+      #
+      # Placed here, before anything long-running starts, because the Ticketing
+      # instance it boots joins the real projection consumer group.
+      - name: Assert every service boots from its own .env.example
+        run: node scripts/verify-env-example.mjs
+
       # The check that actually matters: does the COMPILED output boot and serve?
       # Type-checking proves the code is consistent, not that it runs.
       - name: Smoke test the compiled service
