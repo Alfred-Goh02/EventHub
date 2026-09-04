@@ -3,6 +3,7 @@ import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import type { Logger } from '@eventhub/logger';
 import { withTenant, prisma } from './db.js';
 import { PROJECTION_UPSERT_SQL } from './projection-upsert.js';
+import { CHECKPOINT_UPSERT_SQL } from './checkpoint-upsert.js';
 
 const TOPIC = 'events.activity';
 const DLQ = 'events.activity.dlq';
@@ -180,19 +181,29 @@ export function createProjectionConsumer(opts: {
         }
       }
 
-      // Written in the SAME transaction, so it cannot claim to be caught up on
-      // data it did not apply. This is what lets a request distinguish "no such
-      // event" (404) from "this service is behind" (503).
-      await tx.$executeRaw`
-        INSERT INTO "ConsumerCheckpoint"
-          ("id", "consumerGroup", "topic", "partition", "lastOffset", "lastMessageOccurred", "updatedAt")
-        VALUES (gen_random_uuid()::text, ${GROUP}, ${topic}, ${partition}, ${BigInt(message.offset)},
-                ${decoded['occurredAt'] ? new Date(String(decoded['occurredAt'])) : null}, now())
-        ON CONFLICT ("consumerGroup", "topic", "partition") DO UPDATE
-          SET "lastOffset" = EXCLUDED."lastOffset",
-              "lastMessageOccurred" = EXCLUDED."lastMessageOccurred",
-              "updatedAt" = now()
-      `;
+      /**
+       * Written in the SAME transaction, so it cannot claim progress the
+       * projection did not make.
+       *
+       * It runs on every message, INCLUDING ones the dedup check above just
+       * discarded — consuming a redelivery really does mean this partition has
+       * been read that far. That is why the statement has to refuse to move
+       * backwards: this consumer subscribes fromBeginning against a COMPACTED
+       * topic, so replays are routine, and an unguarded write rewound the
+       * recorded offset to 0 on every one of them.
+       *
+       * NOT the 404-vs-503 mechanism, whatever the schema comment used to say.
+       * That decision is made by projectionIsCurrent(), from two in-memory
+       * signals, and never reads this table. See checkpoint-upsert.ts.
+       */
+      await tx.$executeRawUnsafe(
+        CHECKPOINT_UPSERT_SQL,
+        GROUP,
+        topic,
+        partition,
+        BigInt(message.offset),
+        decoded['occurredAt'] ? new Date(String(decoded['occurredAt'])) : null,
+      );
     });
   }
 

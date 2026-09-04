@@ -223,14 +223,29 @@ model ProcessedMessage {
   @@index([processedAt])
 }
 
-/// How far behind the projection is.
+/// How far each partition has been consumed. An OPERATIONAL RECORD, not a
+/// control — nothing in request handling reads it.
 ///
 /// Written in the SAME transaction as the projection update, so it cannot claim
-/// to be caught up on data it did not apply. It exists to disambiguate a missing
-/// projection row: lag near zero means the event genuinely does not exist (404),
-/// while high lag means this service is behind (503 with Retry-After). Without
-/// it, both look identical and a customer is told an event does not exist when
-/// it does.
+/// progress the projection did not make, and guarded so it cannot move
+/// backwards: the consumer subscribes fromBeginning against a compacted topic,
+/// so replays are routine, and an unguarded write rewound this to 0 on each one.
+/// See src/checkpoint-upsert.ts.
+///
+/// THIS COMMENT USED TO CLAIM THE TABLE DISAMBIGUATES 404 FROM 503 — that a lag
+/// near zero means the event genuinely does not exist, and a high lag means this
+/// service is behind. That was the intent and it is not what happens. The
+/// function built for it, projectionLagSeconds(), measured wall-clock since the
+/// last checkpoint WRITE and called that lag, which on a healthy idle system
+/// reads as hours; it was replaced by projectionIsCurrent(), which reads a
+/// recent heartbeat and a recent EMPTY fetch from the consumer's own memory and
+/// never touches this table.
+///
+/// The comment is corrected rather than deleted because the wrong version is
+/// instructive: this repository has already lost a mechanism to exactly this —
+/// documented, exported, and called by nothing. A comment describing a control
+/// that does not exist is how the next reader comes to trust a number no code
+/// depends on.
 model ConsumerCheckpoint {
   id            String @id @default(cuid())
   consumerGroup String
