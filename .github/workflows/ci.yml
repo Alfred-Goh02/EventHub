@@ -412,6 +412,25 @@ jobs:
           # whose hold has expired, and asserts it does NOT reclaim the seats.
           node scripts/verify-payment-path.mjs
 
+          # The gate that was missing for the whole of Chapter 6: an event
+          # cancelled AFTER a hold was taken was still chargeable.
+          #
+          # POST /reservations always refused to open a hold on an event that
+          # was not PUBLISHED. /pay checked nothing at all, so the expensive
+          # half of the flow was the unguarded one -- the organiser calls the
+          # event off, the cancellation reaches the projection, and a buyer
+          # already in checkout is charged for something that is not happening.
+          #
+          # Two failures, not one. The obvious assertion is that the charge is
+          # refused. The one that took a second attempt to get right is that
+          # refusing must ROLL BACK: the gate throws so the phase-1 transaction
+          # takes the HELD -> PENDING_PAYMENT transition with it. A version
+          # that returned instead answered 409 correctly and still stranded the
+          # reservation in PENDING_PAYMENT, which the sweeper skips by design --
+          # so those seats would be held until a human noticed. Measured: the
+          # returning version passes the status-code assertion and fails this.
+          node scripts/verify-cancelled-event-gate.mjs
+
           # The job that decides what happens to a customer whose card may or may
           # not have been charged.
           #
