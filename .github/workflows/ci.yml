@@ -653,6 +653,59 @@ jobs:
       - name: Assert the consumer checkpoint cannot rewind on a replay
         run: node scripts/verify-checkpoint-monotonic.mjs
 
+      # A message the consumer cannot use must be KEPT, not dropped.
+      #
+      # There were two ways to be unprocessable and only one left a trace. An
+      # UNDECODABLE message was dead-lettered -- correct. A message that
+      # decoded cleanly and carried no messageId, tenantId or eventId was
+      # logged at ERROR and then simply RETURNED, while the caller went on to
+      # commit the offset. The message was gone and the only evidence was a log
+      # line nobody greps.
+      #
+      # Those are the same situation: permanently unprocessable, would block
+      # the partition forever if retried, not the consumer's fault. The second
+      # is the sharper one, because it cannot be recorded in ProcessedMessage
+      # either -- that table is tenant-scoped under FORCE RLS and the whole
+      # problem is the missing tenant. The dead-letter topic is the only place
+      # it can go.
+      #
+      # eventId is a plain Avro string, so an EMPTY one is a perfectly valid
+      # message on the wire. That is what makes this reachable rather than
+      # theoretical. A genuinely undecodable payload is sent alongside it as a
+      # positive control: if that did not reach the DLQ either, the test would
+      # be measuring a broken producer rather than the consumer.
+      #
+      # Runs last among the Kafka assertions because it deliberately writes two
+      # poison messages to events.activity.
+      - name: Assert an unusable message is dead-lettered rather than dropped
+        run: |
+          # Needs the projection consumer actually running -- this assertion is
+          # about what the consumer does with a message, not about the topic.
+          #
+          # Ticketing refuses to start without AUTH_PUBLIC_KEY_B64, and the first
+          # version of this step did not export it. The service never came up,
+          # and the verifier's positive control said so in the right words:
+          # "the undecodable message did NOT reach the dead-letter topic -- the
+          # consumer is not running ... so nothing below proves anything".
+          # Without that control the run would have reported only the real
+          # assertion failing and sent someone hunting in the consumer.
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/ticketing && \
+            PORT=3003 \
+            DATABASE_URL="$TICKETING_DATABASE_URL" \
+            APP_DATABASE_URL="$TICKETING_APP_DATABASE_URL" \
+            node dist/index.js &)
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3003/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          node scripts/verify-dlq-malformed.mjs
+          pkill -f "node dist/index.js" || true
+
       # Drains TICKETING's outbox with the same relay binary.
       #
       # Added because the payment-path review found that the reservation handler

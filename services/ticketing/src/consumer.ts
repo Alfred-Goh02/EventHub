@@ -85,6 +85,46 @@ export function createProjectionConsumer(opts: {
   const consumer: Consumer = kafka.consumer({ groupId: GROUP });
   const producer = kafka.producer();
 
+  /**
+   * Park a message that can never be processed, and move on.
+   *
+   * Two things reach here, and only one of them used to. An UNDECODABLE
+   * message was dead-lettered; a message that decoded but carried no
+   * messageId, tenantId or eventId was logged and silently DROPPED, with the
+   * offset committed underneath it.
+   *
+   * Those two are the same situation. Both are permanently unprocessable,
+   * both would block the partition forever if retried, and neither is the
+   * consumer's fault. The difference was only in how visible the loss was:
+   * one left a record an operator could inspect and replay by hand, the other
+   * left an ERROR line in a log nobody greps and no artefact at all.
+   *
+   * A message with no tenantId is the sharper case, because it cannot be
+   * recorded in ProcessedMessage either -- every table in this database is
+   * FORCE RLS and tenant-scoped, so there is nowhere in Postgres to write
+   * down that it happened. The dead-letter topic is the only place it can go.
+   */
+  async function deadLetter(
+    { topic, partition, message }: EachMessagePayload,
+    reason: string,
+  ): Promise<void> {
+    await producer.send({
+      topic: DLQ,
+      messages: [
+        {
+          key: message.key,
+          value: message.value,
+          headers: {
+            ...message.headers,
+            'dlq-reason': reason,
+            'dlq-source-topic': topic,
+            'dlq-source-partition': String(partition),
+            'dlq-source-offset': message.offset,
+          },
+        },
+      ],
+    });
+  }
   async function handle({ topic, partition, message }: EachMessagePayload): Promise<void> {
     let decoded: Record<string, unknown>;
 
@@ -101,22 +141,10 @@ export function createProjectionConsumer(opts: {
         { topic, partition, offset: message.offset, err },
         'undecodable message sent to the dead-letter topic',
       );
-      await producer.send({
-        topic: DLQ,
-        messages: [
-          {
-            key: message.key,
-            value: message.value,
-            headers: {
-              ...message.headers,
-              'dlq-reason': err instanceof Error ? err.message : String(err),
-              'dlq-source-topic': topic,
-              'dlq-source-partition': String(partition),
-              'dlq-source-offset': message.offset,
-            },
-          },
-        ],
-      });
+      await deadLetter(
+        { topic, partition, message } as EachMessagePayload,
+        err instanceof Error ? err.message : String(err),
+      );
       return;
     }
 
@@ -126,7 +154,31 @@ export function createProjectionConsumer(opts: {
     const version = Number(decoded['version'] ?? 0);
 
     if (!messageId || !tenantId || !eventId) {
-      opts.logger.error({ topic, partition, offset: message.offset }, 'message missing required identity fields');
+      /**
+       * Decoded cleanly and is still unusable. It used to be dropped here with
+       * nothing but a log line, while the caller committed the offset -- so the
+       * message was gone, and the only evidence was an ERROR nobody greps.
+       *
+       * It cannot be recorded in ProcessedMessage: that table is tenant-scoped
+       * under FORCE RLS, and the whole problem is that this message has no
+       * tenant. The dead-letter topic is the only place it can be kept.
+       */
+      const missing = [
+        !messageId ? 'messageId' : null,
+        !tenantId ? 'tenantId' : null,
+        !eventId ? 'eventId' : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
+      opts.logger.error(
+        { topic, partition, offset: message.offset, missing },
+        'message missing required identity fields, sent to the dead-letter topic',
+      );
+      await deadLetter(
+        { topic, partition, message } as EachMessagePayload,
+        `missing required identity fields: ${missing}`,
+      );
       return;
     }
 
