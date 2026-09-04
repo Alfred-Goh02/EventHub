@@ -401,6 +401,29 @@ jobs:
           # read from.
           node scripts/verify-price-locked.mjs
 
+          # A request that did NOTHING must not spend its Idempotency-Key.
+          #
+          # The key is claimed in step 1, before anything contended, as a row
+          # written inside the transaction. So whether a guard RETURNS or
+          # THROWS decides whether that claim survives. The endpoint got this
+          # right for its inventory guards -- the comment there says why -- and
+          # wrong for its two projection guards.
+          #
+          # unknown-event is where it cost something. That branch answers 503
+          # with Retry-After: 2 when the projection consumer is not current,
+          # and the committed claim holds a SIXTY-second lease: the service
+          # asks for a retry in two seconds and then refuses it for fifty-eight
+          # with "a request with this Idempotency-Key is in progress", about a
+          # request that finished long ago. Measured before the fix: 404, then
+          # 409, then 409.
+          #
+          # Two positive controls, and the second is load-bearing: sold-out
+          # (a guard that already threw) must keep behaving, and a REAL hold
+          # must still mark its key completed and replay to the same
+          # reservation. Without that last one, an endpoint that simply stopped
+          # claiming keys would pass every other assertion here.
+          node scripts/verify-idempotency-rollback.mjs
+
           # Every outcome of the payment path, including the two that only
           # matter when something goes wrong.
           #
