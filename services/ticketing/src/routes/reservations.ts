@@ -175,9 +175,29 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
       select: { status: true, deleted: true },
     });
 
-    if (!projection) return { kind: 'unknown-event' as const };
+    /**
+     * THROWN, not returned, for exactly the reason the unknown-ticket-type
+     * guard further down this transaction already gives: returning COMMITS the
+     * idempotency-key claim made in step 1, and the retry of a request that
+     * did nothing is then told its key is already in flight.
+     *
+     * These two were the only guards in the endpoint still returning, and
+     * unknown-event is the one where it does real damage. That branch can
+     * answer 503 with Retry-After: 2 when the projection consumer is not
+     * current -- and the committed claim holds a 60-second lease, so the
+     * service spends the next 58 seconds refusing the retry it just asked
+     * for. Measured against the unfixed code: 404, then 409, then 409.
+     *
+     * not-on-sale is the milder half of the same mistake. The status code
+     * happens to stay 409 either way, so only the message changes -- but a
+     * client reading it is told a key is in flight when nothing is.
+     */
+    if (!projection) throw Object.assign(new Error('projection'), { kind: 'unknown-event' });
     if (projection.deleted || projection.status !== 'PUBLISHED') {
-      return { kind: 'not-on-sale' as const, status: projection.status };
+      throw Object.assign(new Error('projection'), {
+        kind: 'not-on-sale',
+        status: projection.status,
+      });
     }
 
     // -----------------------------------------------------------------------
@@ -342,11 +362,15 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
   try {
     outcome = await run();
   } catch (err) {
-    const e = err as { kind?: string; ticketTypeId?: string; remaining?: number };
+    const e = err as { kind?: string; ticketTypeId?: string; remaining?: number; status?: string };
     if (e.kind === 'sold-out') {
       outcome = { kind: 'sold-out', ticketTypeId: e.ticketTypeId!, remaining: e.remaining };
     } else if (e.kind === 'unknown-ticket-type') {
       outcome = { kind: 'unknown-ticket-type', ticketTypeId: e.ticketTypeId! };
+    } else if (e.kind === 'unknown-event') {
+      outcome = { kind: 'unknown-event' };
+    } else if (e.kind === 'not-on-sale') {
+      outcome = { kind: 'not-on-sale', status: e.status! };
     } else {
       throw err;
     }
