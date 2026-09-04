@@ -112,120 +112,171 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
   // -------------------------------------------------------------------------
   // PHASE 1 — commit the intent to charge, before touching the network.
   // -------------------------------------------------------------------------
-  const intent = await withTenantRetry(tenantId, async (tx): Promise<Intent> => {
-    /**
-     * The guarded transition. `status: 'HELD'` is the mutual exclusion.
-     *
-     * `userId` is in the WHERE clause and is NOT optional. Row-level security
-     * scopes this transaction to a TENANT, not to a user — every policy in this
-     * database reads app.tenant_id and nothing else. Without this filter any
-     * authenticated member of the tenant could pay for, and thereby confirm,
-     * somebody else's reservation. RLS would permit it, because as far as RLS is
-     * concerned the row belongs to the right tenant.
-     *
-     * Note what is NOT checked: expiry. A hold whose expiresAt has passed but
-     * which the sweeper has not reached yet is still HELD, its seats are still
-     * held, and nobody else can have them — so charging for it is correct. And
-     * it is race-free rather than merely tolerated: the sweeper's release is
-     * guarded by `AND status = 'HELD'` too, so exactly one of the two wins and
-     * the loser sees rowCount 0. Adding an expiry check would buy nothing and
-     * make the endpoint sensitive to clock skew.
-     */
-    const moved = await tx.reservation.updateMany({
-      where: { id: reservationId, userId, status: 'HELD' },
-      data: {
-        status: 'PENDING_PAYMENT',
-        paymentStartedAt: new Date(),
-        version: { increment: 1 },
-      },
-    });
-
-    if (moved.count === 0) {
-      // Disambiguate INSIDE the transaction, on tx. Using the bare client would
-      // escape tenant context and turn this into a cross-tenant existence
-      // oracle. The userId filter is repeated for the same reason as above:
-      // without it this read would confirm the existence of another user's
-      // reservation.
-      const current = await tx.reservation.findFirst({
-        where: { id: reservationId, userId },
-        select: { status: true },
+  let intent: Intent;
+  try {
+    intent = await withTenantRetry(tenantId, async (tx): Promise<Intent> => {
+      /**
+       * The guarded transition. `status: 'HELD'` is the mutual exclusion.
+       *
+       * `userId` is in the WHERE clause and is NOT optional. Row-level security
+       * scopes this transaction to a TENANT, not to a user — every policy in this
+       * database reads app.tenant_id and nothing else. Without this filter any
+       * authenticated member of the tenant could pay for, and thereby confirm,
+       * somebody else's reservation. RLS would permit it, because as far as RLS is
+       * concerned the row belongs to the right tenant.
+       *
+       * Note what is NOT checked: expiry. A hold whose expiresAt has passed but
+       * which the sweeper has not reached yet is still HELD, its seats are still
+       * held, and nobody else can have them — so charging for it is correct. And
+       * it is race-free rather than merely tolerated: the sweeper's release is
+       * guarded by `AND status = 'HELD'` too, so exactly one of the two wins and
+       * the loser sees rowCount 0. Adding an expiry check would buy nothing and
+       * make the endpoint sensitive to clock skew.
+       */
+      const moved = await tx.reservation.updateMany({
+        where: { id: reservationId, userId, status: 'HELD' },
+        data: {
+          status: 'PENDING_PAYMENT',
+          paymentStartedAt: new Date(),
+          version: { increment: 1 },
+        },
       });
 
-      if (!current) return { kind: 'not-found' };
-
-      if (current.status === 'CONFIRMED') {
-        // A retry of a request that already succeeded. Answer it with the
-        // original result instead of an error — the caller cannot distinguish a
-        // lost response from a failure, and telling them "conflict" would invite
-        // them to try to pay again for something already paid for.
-        const settled = await tx.payment.findFirst({
-          where: { reservationId, status: 'SUCCEEDED' },
-          select: { id: true, amountCents: true },
-          orderBy: { settledAt: 'desc' },
+      if (moved.count === 0) {
+        // Disambiguate INSIDE the transaction, on tx. Using the bare client would
+        // escape tenant context and turn this into a cross-tenant existence
+        // oracle. The userId filter is repeated for the same reason as above:
+        // without it this read would confirm the existence of another user's
+        // reservation.
+        const current = await tx.reservation.findFirst({
+          where: { id: reservationId, userId },
+          select: { status: true },
         });
-        return {
-          kind: 'already-confirmed',
-          paymentId: settled?.id ?? null,
-          amountCents: settled?.amountCents ?? 0,
-        };
+
+        if (!current) return { kind: 'not-found' };
+
+        if (current.status === 'CONFIRMED') {
+          // A retry of a request that already succeeded. Answer it with the
+          // original result instead of an error — the caller cannot distinguish a
+          // lost response from a failure, and telling them "conflict" would invite
+          // them to try to pay again for something already paid for.
+          const settled = await tx.payment.findFirst({
+            where: { reservationId, status: 'SUCCEEDED' },
+            select: { id: true, amountCents: true },
+            orderBy: { settledAt: 'desc' },
+          });
+          return {
+            kind: 'already-confirmed',
+            paymentId: settled?.id ?? null,
+            amountCents: settled?.amountCents ?? 0,
+          };
+        }
+
+        if (current.status === 'PENDING_PAYMENT') return { kind: 'in-progress' };
+        return { kind: 'not-payable', status: current.status };
       }
 
-      if (current.status === 'PENDING_PAYMENT') return { kind: 'in-progress' };
-      return { kind: 'not-payable', status: current.status };
+      const items = await tx.reservationItem.findMany({
+        where: { reservationId },
+        select: { ticketTypeId: true, quantity: true, unitPriceCents: true },
+        // Sorted for the same reason as everywhere else in this service: phase 3
+        // updates these rows, and every writer must take them in the same order or
+        // two concurrent settlements deadlock.
+        orderBy: { ticketTypeId: 'asc' },
+      });
+
+      if (items.length === 0) return { kind: 'empty' };
+
+      /**
+       * The amount comes from the RESERVATION, never from TicketType.
+       *
+       * unitPriceCents was captured when the hold was taken. Reading the live
+       * price here would charge whatever the organiser last set, which may have
+       * moved while the buyer was in checkout — they would be charged a number
+       * they never agreed to, and the receipt would look perfectly consistent.
+       */
+      const amountCents = items.reduce((sum, i) => sum + i.quantity * i.unitPriceCents, 0);
+
+      const reservation = await tx.reservation.findFirstOrThrow({
+        where: { id: reservationId },
+        select: { eventId: true },
+      });
+
+      /**
+       * Is the event still on sale?
+       *
+       * POST /reservations checks this before taking a hold. /pay checked it
+       * NOWHERE — a grep for eventProjection found it read in exactly one place
+       * outside the consumer. So an event cancelled AFTER a hold was taken was
+       * still chargeable: the organiser calls the event off, the cancellation
+       * propagates to the projection, and the buyer completes checkout and is
+       * charged for something that is not happening.
+       *
+       * Taking money is the one step where "is this still real?" has to be asked
+       * again, because it is the step that is expensive to undo. A hold costs
+       * nothing to abandon; a charge costs a refund and a conversation.
+       *
+       * THROWN, not returned, so the transaction rolls back and takes the
+       * HELD -> PENDING_PAYMENT transition with it. Returning would leave the
+       * reservation stuck mid-payment for an event nobody can attend, and the
+       * sweeper skips PENDING_PAYMENT by design — those seats would be held until
+       * a human noticed. Rolled back, it stays an ordinary hold that expires.
+       */
+      const projection = await tx.eventProjection.findFirst({
+        where: { id: reservation.eventId },
+        select: { status: true, deleted: true },
+      });
+
+      if (!projection || projection.deleted || projection.status !== 'PUBLISHED') {
+        throw Object.assign(new Error('not-on-sale'), {
+          kind: 'not-on-sale',
+          status: projection?.status ?? 'UNKNOWN',
+        });
+      }
+
+      /**
+       * The Payment row, written BEFORE the provider is called.
+       *
+       * This is the record that makes a crash recoverable. If the process dies
+       * during phase 2, this row is what says a charge was attempted, for how
+       * much, and under which idempotency key — without it the reservation would
+       * sit in PENDING_PAYMENT with nothing to reconcile against, and the only
+       * options would be to release seats that may have been paid for or to hold
+       * them forever.
+       *
+       * Its id is the provider idempotency key, which is why there is one row per
+       * ATTEMPT rather than one per reservation.
+       */
+      const payment = await tx.payment.create({
+        data: { tenantId, reservationId, userId, amountCents, currency: CURRENCY, status: 'PENDING' },
+        select: { id: true },
+      });
+
+      return {
+        kind: 'ready',
+        paymentId: payment.id,
+        eventId: reservation.eventId,
+        amountCents,
+        lines: items,
+      };
+    });
+  } catch (err) {
+    /**
+     * The on-sale gate signals by THROWING, so the whole phase-1 transaction
+     * rolls back and the reservation stays an ordinary HELD hold rather than
+     * being stranded in PENDING_PAYMENT for an event nobody can attend.
+     * Translating it back into a response happens here, outside the
+     * transaction -- the same shape POST /reservations uses for its inventory
+     * guard.
+     */
+    if ((err as { kind?: string }).kind === 'not-on-sale') {
+      return res.status(409).json({
+        error: `event is not on sale (status ${(err as { status?: string }).status}) and cannot be paid for`,
+        reservationId,
+      });
     }
-
-    const items = await tx.reservationItem.findMany({
-      where: { reservationId },
-      select: { ticketTypeId: true, quantity: true, unitPriceCents: true },
-      // Sorted for the same reason as everywhere else in this service: phase 3
-      // updates these rows, and every writer must take them in the same order or
-      // two concurrent settlements deadlock.
-      orderBy: { ticketTypeId: 'asc' },
-    });
-
-    if (items.length === 0) return { kind: 'empty' };
-
-    /**
-     * The amount comes from the RESERVATION, never from TicketType.
-     *
-     * unitPriceCents was captured when the hold was taken. Reading the live
-     * price here would charge whatever the organiser last set, which may have
-     * moved while the buyer was in checkout — they would be charged a number
-     * they never agreed to, and the receipt would look perfectly consistent.
-     */
-    const amountCents = items.reduce((sum, i) => sum + i.quantity * i.unitPriceCents, 0);
-
-    const reservation = await tx.reservation.findFirstOrThrow({
-      where: { id: reservationId },
-      select: { eventId: true },
-    });
-
-    /**
-     * The Payment row, written BEFORE the provider is called.
-     *
-     * This is the record that makes a crash recoverable. If the process dies
-     * during phase 2, this row is what says a charge was attempted, for how
-     * much, and under which idempotency key — without it the reservation would
-     * sit in PENDING_PAYMENT with nothing to reconcile against, and the only
-     * options would be to release seats that may have been paid for or to hold
-     * them forever.
-     *
-     * Its id is the provider idempotency key, which is why there is one row per
-     * ATTEMPT rather than one per reservation.
-     */
-    const payment = await tx.payment.create({
-      data: { tenantId, reservationId, userId, amountCents, currency: CURRENCY, status: 'PENDING' },
-      select: { id: true },
-    });
-
-    return {
-      kind: 'ready',
-      paymentId: payment.id,
-      eventId: reservation.eventId,
-      amountCents,
-      lines: items,
-    };
-  });
+    throw err;
+  }
 
   switch (intent.kind) {
     case 'not-found':
