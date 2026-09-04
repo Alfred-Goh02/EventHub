@@ -2,6 +2,7 @@ import pg from 'pg';
 import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { assertSweeperIsLeastPrivilege, sweepOnce } from './sweep.js';
+import { attachPoolErrorHandler } from '../pool.js';
 
 /**
  * The hold sweeper: a separate process with its own database credential.
@@ -33,12 +34,21 @@ const env = parsed.data;
 
 const logger = createLogger('hold-sweeper');
 
-const pool = new pg.Pool({
-  connectionString: env.SWEEPER_DATABASE_URL,
-  max: 2,
-  connectionTimeoutMillis: 10_000,
-  idleTimeoutMillis: 30_000,
-});
+const pool = attachPoolErrorHandler(
+  new pg.Pool({
+    connectionString: env.SWEEPER_DATABASE_URL,
+    // Named so pg_stat_activity says which pool a connection belongs to. An
+    // operator looking at a stuck backend should not have to guess, and the
+    // resilience verifier uses it to find exactly the connection it means to
+    // terminate rather than any connection on the same role.
+    application_name: 'hold-sweeper',
+    max: 2,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000,
+  }),
+  logger,
+  'hold-sweeper',
+);
 
 const runOnce = process.argv.includes('--once');
 let stopping = false;

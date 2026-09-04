@@ -8,7 +8,7 @@ import { drainOnce, readMetrics } from './drain.js';
 const env = loadRelayEnv();
 const logger = createLogger('outbox-relay');
 
-const pool = createPool(env.RELAY_DATABASE_URL);
+const pool = createPool(env.RELAY_DATABASE_URL, logger);
 const publisher = createPublisher({
   brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),
   registryUrl: env.SCHEMA_REGISTRY_URL,

@@ -473,6 +473,31 @@ jobs:
           # route ignores a tenantId in the body and resolves it from the
           # database instead, alongside the signature and replay checks.
           node scripts/verify-payment-webhook.mjs
+
+          # Run LAST in this block, because it kills database connections.
+          #
+          # pg.Pool is an EventEmitter, and an EventEmitter that emits 'error'
+          # with no listener THROWS -- in Node, an uncaught exception and an
+          # exit. Not one of the five raw pools here had a listener, so a
+          # Postgres restart, a managed failover, idle_session_timeout or a
+          # load balancer reaping an idle TCP connection killed the process.
+          #
+          # What makes it worth a test rather than a patch is WHICH pool does
+          # the damage. Prisma's adapter installs its own handler, so killing
+          # the APPLICATION connection is survived cleanly and the obvious
+          # experiment passes. The two raw pools in the webhook route are the
+          # unguarded ones, and either takes the WHOLE HTTP SERVICE down --
+          # reservations, payments, health -- over a pool that exists to
+          # resolve one column for one webhook.
+          #
+          # Two halves. The behavioural one terminates a real connection and
+          # asserts the service still serves AND that the pool replaced it.
+          # The static one requires every `new pg.Pool(` in the repository to
+          # be wrapped in attachPoolErrorHandler() -- that is the half that
+          # catches the SIXTH pool, in a file nobody thinks of as a database
+          # file, exactly as the webhook route was. Both were watched fail
+          # separately; neither subsumes the other.
+          node scripts/verify-pool-resilience.mjs
           pkill -f "node dist/index.js" || true
 
       # The cross-service assertion, and the one that would have caught the
