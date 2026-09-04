@@ -681,6 +681,17 @@ jobs:
         run: |
           # Needs the projection consumer actually running -- this assertion is
           # about what the consumer does with a message, not about the topic.
+          #
+          # Ticketing refuses to start without AUTH_PUBLIC_KEY_B64, and the first
+          # version of this step did not export it. The service never came up,
+          # and the verifier's positive control said so in the right words:
+          # "the undecodable message did NOT reach the dead-letter topic -- the
+          # consumer is not running ... so nothing below proves anything".
+          # Without that control the run would have reported only the real
+          # assertion failing and sent someone hunting in the consumer.
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
           (cd services/ticketing && \
             PORT=3003 \
             DATABASE_URL="$TICKETING_DATABASE_URL" \
