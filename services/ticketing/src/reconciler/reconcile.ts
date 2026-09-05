@@ -49,6 +49,17 @@ export interface ReconcileResult {
  * does nothing. A claim column would add a second thing that can be left stale
  * by a crash, to protect writes that are already guarded.
  */
+/**
+ * The first backoff, and the ceiling it doubles towards.
+ *
+ * A minute is long enough that a provider blip is not hammered and short
+ * enough that a transient failure resolves within one or two passes. An hour
+ * is where it stops growing: there is money on the other side of an unsettled
+ * payment, so this defers a row rather than ever abandoning it.
+ */
+const BACKOFF_BASE_MS = 60_000;
+const BACKOFF_CEILING_MS = 3_600_000;
+
 export async function reconcileOnce(
   pool: pg.Pool,
   provider: PaymentProvider,
@@ -78,12 +89,16 @@ export async function reconcileOnce(
     reservationId: string;
     amountCents: number;
     currency: string;
+    lookupAttempts: number;
   }>(
-    `SELECT id, "tenantId", "reservationId", "amountCents", currency
+    `SELECT id, "tenantId", "reservationId", "amountCents", currency, "lookupAttempts"
        FROM "Payment"
       WHERE "settledAt" IS NULL
         AND "startedAt" < now() - ($2::bigint * interval '1 millisecond')
-      ORDER BY "startedAt"
+        -- Skip attempts that are backing off. NULL means never asked about,
+        -- which must still be picked up, so it cannot be a plain comparison.
+        AND ("nextLookupAt" IS NULL OR "nextLookupAt" <= now())
+      ORDER BY "nextLookupAt" NULLS FIRST, "startedAt"
       LIMIT $1`,
     [opts.batchSize, opts.graceMs],
   );
@@ -123,9 +138,47 @@ export async function reconcileOnce(
       });
     } catch (err) {
       result.lookupFailed += 1;
+
+      /**
+       * Write down that we tried, and when to try again.
+       *
+       * Without this the row is selected FIRST on the next pass and every pass
+       * after it — the candidate query orders by startedAt and keeps no record
+       * of what has already failed. #43 stopped one throwing lookup abandoning
+       * the rest of the batch; this stops it occupying a slot forever, which at
+       * RECONCILE_BATCH_SIZE poison rows would stop the job examining anything.
+       *
+       * Exponential with a ceiling: roughly a minute, then two, four, and so on
+       * up to an hour. A provider that is briefly unreachable is retried soon; a
+       * reference that will never resolve stops crowding out payments that can.
+       * It is never abandoned — there is money on the other side of this row, so
+       * the backoff caps rather than gives up.
+       *
+       * On its OWN connection, deliberately outside any transaction the
+       * settlement would use: this must survive even when nothing else about
+       * the row can be written, because the whole point is to record a failure.
+       */
+      const attempts = payment.lookupAttempts + 1;
+      const delayMs = Math.min(BACKOFF_BASE_MS * 2 ** (attempts - 1), BACKOFF_CEILING_MS);
+
+      try {
+        await pool.query(
+          `UPDATE "Payment"
+              SET "lookupAttempts" = $2,
+                  "nextLookupAt" = now() + ($3::bigint * interval '1 millisecond')
+            WHERE id = $1`,
+          [payment.id, attempts, delayMs],
+        );
+      } catch (writeErr) {
+        // If even the backoff cannot be recorded the row will be retried
+        // immediately next pass, which is the old behaviour rather than a new
+        // failure — worth a line, not worth stopping for.
+        logger.error({ err: writeErr, paymentId: payment.id }, 'could not record the lookup backoff; this attempt will be retried immediately');
+      }
+
       logger.error(
-        { err, paymentId: payment.id },
-        'provider lookup threw; leaving this attempt unsettled and continuing the batch',
+        { err, paymentId: payment.id, attempts, retryInMs: delayMs },
+        'provider lookup threw; backing this attempt off and continuing the batch',
       );
       continue;
     }
