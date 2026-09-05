@@ -168,11 +168,20 @@ model ReservationItem {
 
 /// Makes a retried POST safe to replay.
 ///
-/// Two-phase: the row is claimed BEFORE the work starts and completed after, so
-/// a crash mid-flight is distinguishable from a duplicate. Writing it only after
-/// the work commits would let a retry duplicate the work; writing it in the same
-/// transaction cannot store a response status that is not known until the
-/// handler returns.
+/// The row is claimed before the work starts and completed after, in ONE
+/// transaction -- so a crash rolls both back and never leaves a claimed-but-
+/// unfinished key behind.
+///
+/// THIS COMMENT USED TO DESCRIBE A TWO-PHASE CLAIM with a 60-second lease, and
+/// there was a leaseExpiresAt column and a takeover clause to match. The intent
+/// was to stop a killed process wedging a key forever. But taking a key over
+/// means RUNNING THE WORK AGAIN, and for this endpoint that is a second hold --
+/// the exact thing the key exists to prevent. Reproduced: one key, two
+/// reservations. And because the claim and the work share a transaction, the
+/// wedged state it recovered from could not occur in the first place.
+///
+/// The lease is gone. A leftover in_progress row now makes that one key answer
+/// 409 until an operator deletes it, which is the recoverable direction.
 model IdempotencyKey {
   id       String @id @default(cuid())
   tenantId String
@@ -192,9 +201,6 @@ model IdempotencyKey {
   responseStatus Int?
   responseBody   Json?
 
-  /// What stops a killed process wedging a key forever. Without a lease, a crash
-  /// between claim and completion makes that key permanently unusable.
-  leaseExpiresAt DateTime
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -202,7 +208,7 @@ model IdempotencyKey {
   /// Scoped by tenant AND user. Keyed on `key` alone, tenant B replaying tenant
   /// A's key would receive A's cached response body verbatim.
   @@unique([tenantId, userId, endpoint, key])
-  @@index([tenantId, leaseExpiresAt])
+  @@index([tenantId, createdAt])
 }
 
 /// Consumer-side deduplication.

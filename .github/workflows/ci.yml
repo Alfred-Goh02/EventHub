@@ -573,6 +573,31 @@ jobs:
           # claiming keys would pass every other assertion here.
           node scripts/verify-idempotency-rollback.mjs
 
+          # An Idempotency-Key must never be TAKEN OVER and run a second time.
+          #
+          # The claim used ON CONFLICT ... DO UPDATE to take a key over once a
+          # 60-second lease expired, which means it ran the work again. For this
+          # endpoint that is a SECOND HOLD -- the exact thing the key exists to
+          # prevent. Reproduced by planting such a row: one key, two
+          # reservations, held 1 -> 2.
+          #
+          # The lease was there for a crash between claiming and completing, and
+          # that cannot happen: the claim and the work commit in ONE transaction.
+          # Measured -- 12 concurrent requests on one key gave 12 x 201, a single
+          # reservation id, zero in-flight 409s. pay.ts already made this
+          # argument for the payment route: "where a lease can expire, a status
+          # cannot".
+          #
+          # The row is PLANTED rather than provoked, because nothing produces one
+          # any more -- what is asserted is what happens IF one exists, from old
+          # code, a restored backup, or a refactor that splits the transaction.
+          #
+          # Three controls, and the last two are why the first is safe to want:
+          # a new key must still hold seats, and a completed key must still
+          # replay to the SAME reservation without taking more. An endpoint that
+          # refused everything would pass the takeover assertion on its own.
+          node scripts/verify-no-key-takeover.mjs
+
           # Every outcome of the payment path, including the two that only
           # matter when something goes wrong.
           #
