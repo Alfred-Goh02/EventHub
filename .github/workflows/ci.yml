@@ -424,6 +424,25 @@ jobs:
           # their own draft.
           node scripts/verify-draft-visibility.mjs
 
+          echo ""
+          echo "--- an event must not be patchable into ending before it starts ---"
+          # POST has always refused a backwards pair with a Zod .refine(). PATCH
+          # never checked, and there was no constraint underneath either. Both of
+          # these returned 200:
+          #
+          #   PATCH { startsAt: <later>, endsAt: <earlier> }
+          #   PATCH { startsAt: <past the stored endsAt> }
+          #
+          # The second is the one a refinement on the request body cannot catch:
+          # PATCH is partial, so half the comparison lives in the database.
+          #
+          # The script asserts the route's 400 and the CHECK constraint
+          # SEPARATELY, reaching the constraint by writing straight to the table.
+          # A test that only ever goes through the route cannot tell them apart
+          # and would keep passing if the constraint were dropped -- which is the
+          # layer that actually holds under two concurrent patches.
+          node scripts/verify-event-date-ordering.mjs
+
           pkill -f "node dist/index.js" || true
 
       # The assertion the whole reservation design exists for.
