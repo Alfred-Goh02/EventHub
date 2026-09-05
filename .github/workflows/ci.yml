@@ -383,6 +383,27 @@ jobs:
           test "$CODE" = "401" || { echo "expected 401, got $CODE"; exit 1; }
           echo "rejected ($CODE)"
 
+          echo ""
+          echo "--- an unannounced event must not be visible to a customer ---"
+          # ATTENDEE is the DEFAULT role and the schema calls it "buys tickets,
+          # joins the community", so attendees are customers in the same tenant
+          # as the organisers. Neither read route filtered on status, so any of
+          # them could fetch a DRAFT by id and list every draft in the tenant.
+          # Reproduced before the fix:
+          #
+          #   attendee GET /events/<id>         -> 200 "Secret Launch" (DRAFT)
+          #   attendee GET /events?status=DRAFT -> 1 draft(s) visible
+          #
+          # ONLY draft is hidden. CANCELLED and COMPLETED stay visible to
+          # everyone, deliberately: whoever holds a ticket for a cancelled event
+          # is the person who most needs to see it.
+          #
+          # Two positive controls in the script, because without them a route
+          # that returned NOTHING would satisfy every assertion: the attendee
+          # must still see a PUBLISHED event, and the organiser must still see
+          # their own draft.
+          node scripts/verify-draft-visibility.mjs
+
           pkill -f "node dist/index.js" || true
 
       # The assertion the whole reservation design exists for.
