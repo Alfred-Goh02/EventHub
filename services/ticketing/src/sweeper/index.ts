@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { assertSweeperIsLeastPrivilege, sweepOnce } from './sweep.js';
 import { attachPoolErrorHandler } from '../pool.js';
+import { pruneOnce } from './prune.js';
 
 /**
  * The hold sweeper: a separate process with its own database credential.
@@ -23,6 +24,38 @@ const schema = z.object({
   SWEEPER_DATABASE_URL: z.string().url(),
   SWEEPER_BATCH_SIZE: z.coerce.number().int().positive().max(1000).default(100),
   SWEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+
+  /**
+   * How long ProcessedMessage and IdempotencyKey rows are kept.
+   *
+   * Nothing pruned either table and no role could: both carry a
+   * tenant_isolation policy with no TO clause, so it binds even the owner
+   * under FORCE row security. A maintenance script written the obvious way
+   * deleted 0 of 29 rows and exited 0.
+   *
+   * A year is far beyond what either needs, and that is deliberate. For
+   * IdempotencyKey the window is a client retry horizon, not a size budget,
+   * and the asymmetry is stark: keeping a key too long costs one small row,
+   * deleting one too early costs a duplicate hold on scarce inventory.
+   */
+  SWEEPER_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
+
+  /** Rows per DELETE. Bounds what a single statement locks. */
+  SWEEPER_PRUNE_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
+
+  /**
+   * Batches per table per pass. Bounds the FIRST run, which on tables nobody
+   * has ever pruned may have years to work through -- without it the sweeper
+   * would stop expiring holds until it finished.
+   */
+  SWEEPER_PRUNE_MAX_BATCHES: z.coerce.number().int().positive().default(20),
+
+  /**
+   * How often to prune. Deliberately not once per sweep: the sweep loops
+   * immediately whenever it fills a batch, and retention on that cadence would
+   * spend the sweeper on housekeeping exactly when holds are expiring fastest.
+   */
+  SWEEPER_PRUNE_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -53,6 +86,13 @@ const pool = attachPoolErrorHandler(
 const runOnce = process.argv.includes('--once');
 let stopping = false;
 
+/**
+ * When retention last ran. Zero means "not yet", so the first pass happens
+ * shortly after start -- on tables nobody has ever pruned, waiting an hour to
+ * begin is the wrong default.
+ */
+let lastPruneAt = 0;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function loop(): Promise<void> {
@@ -60,6 +100,30 @@ async function loop(): Promise<void> {
     try {
       const result = await sweepOnce(pool, logger, { batchSize: env.SWEEPER_BATCH_SIZE });
       if (result.claimed > 0) logger.info(result, 'swept');
+
+      /**
+       * Retention runs on its OWN clock, between sweeps.
+       *
+       * A failure here is logged and swallowed. A sweeper that stops returning
+       * expired seats because it could not tidy up has turned a disk-space
+       * problem into unavailable inventory, which is the wrong direction --
+       * the same trade the catch below is making for the sweep itself.
+       */
+      if (Date.now() - lastPruneAt >= env.SWEEPER_PRUNE_INTERVAL_MS) {
+        lastPruneAt = Date.now();
+        try {
+          const pruned = await pruneOnce(pool, logger, {
+            olderThanDays: env.SWEEPER_RETENTION_DAYS,
+            batchSize: env.SWEEPER_PRUNE_BATCH_SIZE,
+            maxBatches: env.SWEEPER_PRUNE_MAX_BATCHES,
+          });
+          if (pruned.moreToDo) {
+            logger.info(pruned, 'retention hit its batch ceiling; more to prune next pass');
+          }
+        } catch (err) {
+          logger.error({ err }, 'retention pass failed; hold expiry is unaffected');
+        }
+      }
 
       // A full batch means there is probably more waiting, so go straight round
       // again rather than sleeping while holds sit expired. An empty sweep waits.

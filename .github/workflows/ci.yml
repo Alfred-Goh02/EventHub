@@ -992,6 +992,27 @@ jobs:
       # transaction. The test provokes BOTH failures: a missing grant, which
       # Postgres raises outright, and a policy narrowed to FOR SELECT, which is
       # silent and is the one the comparison exists to catch.
+      # The other two tables that grow forever -- and unlike the outbox, NO ROLE
+      # COULD prune these. Both carry a tenant_isolation policy with no TO
+      # clause, so it applies to PUBLIC and FORCE row security binds even the
+      # owner. Measured: as eventhub_ticketing_owner with no app.tenant_id,
+      # count(*) on ProcessedMessage returned 0 of 29 real rows and a DELETE
+      # removed 0, exit code 0.
+      #
+      # A retention sweep has no tenant, and there is no Tenant table here to
+      # loop over, so the sweeper gets a role-targeted policy the way its other
+      # cross-tenant work does. Its reach is bounded by GRANTS instead: DELETE
+      # table-wide, but SELECT on only the two columns the job reads. It cannot
+      # read IdempotencyKey.responseBody -- a cached customer response -- which
+      # is asserted here, because that column-level grant is the thing keeping
+      # the widening honest.
+      #
+      # Both failure modes are provoked: a missing grant, which Postgres raises
+      # outright, and a policy narrowed to FOR SELECT, which is silent and is
+      # what the SEEN-versus-DELETED comparison exists to catch.
+      - name: Assert the bookkeeping tables age out on a credential that cannot read them
+        run: node scripts/verify-bookkeeping-retention.mjs
+
       - name: Assert delivered outbox rows age out and a dead prune cannot lie
         run: node scripts/verify-outbox-retention.mjs
 

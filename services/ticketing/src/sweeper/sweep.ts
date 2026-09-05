@@ -260,6 +260,38 @@ export async function assertSweeperIsLeastPrivilege(pool: pg.Pool): Promise<void
           'be bounded by grants.',
       );
     }
+
+    /**
+     * It may now DELETE — but only from the two bookkeeping tables.
+     *
+     * Retention gave this credential DELETE on ProcessedMessage and
+     * IdempotencyKey, which is a real widening of a cross-tenant role. The
+     * boot check has to widen with it, or the next grant that goes slightly
+     * too far arrives unnoticed.
+     *
+     * Reservation is the probe because it is the row whose deletion would be
+     * worst and least visible: no constraint anywhere says a reservation must
+     * continue to exist, so removing one would silently orphan the inventory
+     * it accounts for and the invariant checker would report a mismatch with
+     * no cause to point at.
+     */
+    let couldDelete = false;
+    try {
+      await client.query('BEGIN');
+      await client.query(`DELETE FROM "Reservation" WHERE id = 'sweeper_delete_probe'`);
+      couldDelete = true;
+    } catch {
+      // Expected: permission denied for table Reservation.
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+
+    if (couldDelete) {
+      throw new Error(
+        'refusing to start: the sweeper credential can DELETE reservations. Retention gave it ' +
+          'DELETE on ProcessedMessage and IdempotencyKey only — nothing that holds inventory.',
+      );
+    }
   } finally {
     client.release();
   }
