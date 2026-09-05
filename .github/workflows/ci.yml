@@ -274,6 +274,27 @@ jobs:
           # replaced never noticed, because a URL does not care where you are.
           node "$GITHUB_WORKSPACE/scripts/verify-invite-tenant-binding.mjs"
 
+          echo ""
+          echo "--- what the repository declares, it must have ---"
+          # Two unrelated mechanisms, one shape: something is written down,
+          # nothing checks it, and the gap only shows when a person follows the
+          # declaration. The same shape has already produced a mechanism
+          # documented and never called, a schema comment describing a control
+          # that had moved, and an .env.example that could not boot its service.
+          #
+          # Here: every prisma.config.ts declared seed: "tsx prisma/seed.ts" and
+          # only Auth has that file, so `prisma db seed` in Event or Ticketing
+          # died on a missing module -- and CI only ever seeds Auth, so nothing
+          # noticed. The check is a ratchet: whatever a config declares, the
+          # file has to exist.
+          #
+          # And /me answered `200 null` for a valid token whose user row was
+          # gone. Reachable because access tokens are stateless and live 15
+          # minutes with no revocation -- a deliberate trade -- so a deleted
+          # user keeps a working credential for that long. A client reading
+          # .email off that response crashes.
+          node "$GITHUB_WORKSPACE/scripts/verify-declared-but-absent.mjs"
+
           kill $SERVER_PID
 
       # A refresh token must be spendable exactly ONCE, including under a race.
