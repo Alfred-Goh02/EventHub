@@ -294,6 +294,31 @@ jobs:
           # user keeps a working credential for that long. A client reading
           # .email off that response crashes.
           node "$GITHUB_WORKSPACE/scripts/verify-declared-but-absent.mjs"
+          echo ""
+          echo "--- refusing a login must cost the same either way ---"
+          # Returning early on a missing user skipped the argon2id verify, and
+          # argon2id is expensive ON PURPOSE -- 19 MB and two passes, which is
+          # the whole reason it was chosen over bcrypt. Measured, 8 runs each:
+          #
+          #   wrong password, account EXISTS : median 13 ms
+          #   wrong password, account MISSING: median  3 ms
+          #
+          # Same 401 body either way, so the response TIME was the answer: an
+          # attacker enumerates registered addresses one request each, without
+          # ever guessing a password.
+          #
+          # It also contradicted a decision made forty lines below it in the
+          # same file -- /forgot-password returns 202 unconditionally,
+          # explicitly so that a caller cannot learn whether an address exists.
+          #
+          # A miss now verifies against a dummy hash computed once at startup.
+          # The assertion is on the RATIO of medians with a loose 2x bound, not
+          # on any millisecond figure, so runner noise cannot trip it while a
+          # skipped 19 MB hash cannot hide in it. The control is that a correct
+          # login still costs about the same -- if argon2 were not running at
+          # all every median would collapse together and the ratio would pass
+          # for the wrong reason.
+          node "$GITHUB_WORKSPACE/scripts/verify-login-timing.mjs"
 
           kill $SERVER_PID
 
