@@ -19,8 +19,6 @@ const HOLD_TTL_MS = 10 * 60 * 1000;
 /** What to put in Retry-After. One consumer poll plus room to actually apply it. */
 const PROJECTION_RETRY_AFTER_S = 2;
 
-/** How long a claimed idempotency key is held before another attempt may take it. */
-const LEASE_TTL_MS = 60 * 1000;
 
 const createReservation = z.object({
   eventId: z.string().min(1),
@@ -119,17 +117,34 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     // A single INSERT ... ON CONFLICT does claim-or-detect in one round trip.
     // Reading first and inserting second would be the same read-then-write race
     // this endpoint exists to avoid.
+    //
+    // DO NOTHING, and there used to be a DO UPDATE here that TOOK THE KEY OVER
+    // once a 60-second lease expired -- meaning it ran the work again. For this
+    // endpoint "run the work again" is a SECOND HOLD, which is the exact thing
+    // an Idempotency-Key exists to prevent. Reproduced by planting such a row:
+    // one key, two reservations, held 1 -> 2.
+    //
+    // The lease was there for a crash between claiming and completing. That
+    // cannot happen: the claim and the work commit in ONE transaction, so a
+    // crash rolls both back and no claimed-but-unfinished row is left behind.
+    // Measured after that became true -- 12 concurrent requests on one key gave
+    // 12 x 201, a single reservation id, and zero in-flight 409s. So the only
+    // rows the takeover could ever fire on were ones that should not exist.
+    //
+    // pay.ts already made this argument for the payment route: "an expiring
+    // lease would authorise exactly the double charge it exists to prevent.
+    // Where a lease can expire, a status cannot." Same reasoning, other route.
+    //
+    // The failure direction flips, deliberately. A leftover in_progress row now
+    // makes that ONE key answer 409 until somebody deletes it -- recoverable by
+    // an operator. A duplicate hold on scarce inventory is not.
     // -----------------------------------------------------------------------
     const claimed = await tx.$queryRaw<Array<{ id: string; state: string; requestHash: string; responseStatus: number | null; responseBody: unknown }>>`
       INSERT INTO "IdempotencyKey"
-        ("id", "tenantId", "userId", "key", "endpoint", "requestHash", "state", "leaseExpiresAt", "updatedAt")
+        ("id", "tenantId", "userId", "key", "endpoint", "requestHash", "state", "updatedAt")
       VALUES (gen_random_uuid()::text, ${tenantId}, ${userId}, ${idempotencyKey}, 'POST /reservations',
-              ${requestHash}, 'in_progress', now() + ${`${LEASE_TTL_MS} milliseconds`}::interval, now())
-      ON CONFLICT ("tenantId", "userId", "endpoint", "key") DO UPDATE
-        SET "leaseExpiresAt" = now() + ${`${LEASE_TTL_MS} milliseconds`}::interval,
-            "updatedAt" = now()
-        WHERE "IdempotencyKey"."state" = 'in_progress'
-          AND "IdempotencyKey"."leaseExpiresAt" < now()
+              ${requestHash}, 'in_progress', now())
+      ON CONFLICT ("tenantId", "userId", "endpoint", "key") DO NOTHING
       RETURNING "id", "state", "requestHash", "responseStatus", "responseBody"
     `;
 
