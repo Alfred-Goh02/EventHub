@@ -511,6 +511,31 @@ jobs:
           # is driven, not a copy of its logic.
           node scripts/verify-reconciler-poison-row.mjs
 
+          # One attempt, two routes, exactly one settlement.
+          #
+          # The section titled "a second pass must not move anything twice" in
+          # verify-payment-reconciliation.mjs does not test that. It reruns the
+          # reconciler after everything is settled, and the candidate query is
+          # WHERE "settledAt" IS NULL -- so the second pass selects NOTHING.
+          # Measured with the log level raised:
+          #
+          #   pass 1: examined=8 confirmed=8 released=0 stillUnknown=0
+          #   pass 2: examined=0 confirmed=0 released=0 stillUnknown=0
+          #
+          # Nothing could move twice because nothing was looked at. It does
+          # prove settled attempts are excluded from the candidate set, which is
+          # worth proving -- but the idempotency guard it appears to be about is
+          # never reached.
+          #
+          # This drives settleAttempt() directly on two overlapping
+          # transactions. Two cases, because ONE IS NOT ENOUGH: there are two
+          # guards in series, and with the Payment guard deleted the same-answer
+          # case still passes -- the reservation guard catches it. Watched that
+          # happen. The discriminating case is when the two routes DISAGREE, and
+          # without the guard the payment is rewritten to FAILED for a seat that
+          # was sold.
+          node scripts/verify-settle-once.mjs
+
           # The webhook, whose interesting problem is not the signature.
           #
           # It arrives with no session, no token and no tenant, and every policy
