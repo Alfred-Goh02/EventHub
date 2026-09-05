@@ -315,6 +315,35 @@ events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (r
   const id = req.params.id;
 
   const outcome = await withTenant(tenantId, async (tx) => {
+    /**
+     * The dates have to be checked against the MERGED row, not the request.
+     *
+     * POST refuses a backwards pair with a Zod .refine(). PATCH is PARTIAL, so
+     * half the comparison lives in the database: moving startsAt past the
+     * stored endsAt is a backwards pair that no refinement on the body can
+     * see. Both variants were accepted with a 200 before this.
+     *
+     * This read is the error message, not the guarantee. Two concurrent
+     * patches could each merge to something valid and still land on something
+     * invalid, and an If-Match of * or none does not stop them. The CHECK
+     * constraint added in 20260905083200_event_ends_after_starts is what makes
+     * that impossible; this exists so the ordinary case gets a 400 that names
+     * the problem instead of a 500 from a constraint violation.
+     */
+    if (parsed.data.startsAt !== undefined || parsed.data.endsAt !== undefined) {
+      const current = await tx.event.findFirst({
+        where: { id, deletedAt: null },
+        select: { startsAt: true, endsAt: true },
+      });
+
+      if (current) {
+        const startsAt = parsed.data.startsAt ?? current.startsAt;
+        const endsAt = parsed.data.endsAt ?? current.endsAt;
+        if (endsAt <= startsAt) {
+          return { kind: 'bad-dates' as const, startsAt, endsAt };
+        }
+      }
+    }
     const { count } = await tx.event.updateMany({
       where: {
         id,
@@ -383,6 +412,16 @@ events.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (r
 
   if (outcome.kind === 'missing') {
     return res.status(404).json({ error: 'event not found' });
+  }
+
+  if (outcome.kind === 'bad-dates') {
+    // 400 rather than 409: this is a malformed request, not a conflict with
+    // another writer, and a 409 would invite a retry that cannot succeed.
+    return res.status(400).json({
+      error: 'endsAt must be after startsAt',
+      startsAt: outcome.startsAt,
+      endsAt: outcome.endsAt,
+    });
   }
 
   if (outcome.kind === 'capacity-locked') {
