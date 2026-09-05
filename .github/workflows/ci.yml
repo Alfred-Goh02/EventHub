@@ -678,6 +678,24 @@ jobs:
           # is driven, not a copy of its logic.
           node scripts/verify-reconciler-poison-row.mjs
 
+          # ...and it must stop occupying a SLOT on every pass.
+          #
+          # The previous fix stopped one throwing lookup abandoning the rest of
+          # the batch. It could not fix, without a migration, that the row is
+          # still selected FIRST next time: the candidate query is ORDER BY
+          # startedAt with no cursor and no record of what already failed. A
+          # handful of poison rows shrink the effective batch, and at
+          # RECONCILE_BATCH_SIZE of them the job examines nothing else at all --
+          # in the job that decides whether customers who may already have been
+          # charged get their seats or their money back.
+          #
+          # Three passes: asked and backed off, skipped, then asked again once
+          # the backoff is due. The third is the one that stops the fix being
+          # "ignore it forever" -- there is money on the other side of an
+          # unsettled payment, so it is deferred, never abandoned. And the delay
+          # must GROW, or a fixed interval would pass everything else.
+          node scripts/verify-reconciler-backoff.mjs
+
           # One attempt, two routes, exactly one settlement.
           #
           # The section titled "a second pass must not move anything twice" in

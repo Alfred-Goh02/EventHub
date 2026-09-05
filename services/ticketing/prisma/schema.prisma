@@ -351,6 +351,19 @@ model Payment {
   startedAt DateTime  @default(now())
   settledAt DateTime?
 
+  /// How many times the reconciler has ASKED the provider about this attempt
+  /// and been unable to get an answer at all -- a thrown lookup, not an
+  /// `unknown` outcome, which is a real answer meaning "still in flight".
+  lookupAttempts Int @default(0)
+
+  /// When this attempt may be asked about again.
+  ///
+  /// NULL means "never tried, ask now". The candidate query is ORDER BY
+  /// startedAt with no cursor, so without this a payment whose lookup fails
+  /// deterministically is selected FIRST on every pass forever, and enough of
+  /// them shrink the batch to nothing. Backing off puts the queue back.
+  nextLookupAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
