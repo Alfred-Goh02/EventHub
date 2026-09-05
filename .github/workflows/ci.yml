@@ -246,13 +246,28 @@ jobs:
           echo "upper-case address accepted ($CODE)"
 
           echo ""
-          echo "--- registering without an invite must FAIL ---"
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/register \
-            -H 'Content-Type: application/json' \
-            -H 'X-Tenant-ID: tenant_globex' \
-            -d '{"email":"attacker@evil.com","password":"hunter2222"}')
-          test "$CODE" = "400" || { echo "expected 400, got $CODE — the tenant hole is open"; kill $SERVER_PID; exit 1; }
-          echo "correctly rejected ($CODE)"
+          echo "--- the tenant a user joins comes from the invite, not the request ---"
+          # This used to be a curl asserting that
+          #
+          #   POST /register  X-Tenant-ID: tenant_globex
+          #   {"email":"attacker@evil.com","password":"hunter2222"}
+          #
+          # returns 400, under a comment saying "the tenant hole is open". The
+          # body has no `token` field and registerSchema requires one, so the
+          # 400 came from Zod before lookupInvite() was ever called. Measured:
+          #
+          #   {"error":{"formErrors":[],"fieldErrors":{"token":["Required"]}}}
+          #
+          # Delete invite verification entirely and it still passed. It asserted
+          # that a schema has a required field.
+          #
+          # The property it was reaching for was tested NOWHERE: /register takes
+          # no X-Tenant-ID at all, deliberately, because the tenant comes from an
+          # invite created by someone already inside that tenant. The verifier
+          # redeems a real tenant_acme invite while claiming tenant_globex and
+          # asserts membership THROUGH row-level security -- visible under the
+          # invite's tenant, invisible under the one the request asked for.
+          node scripts/verify-invite-tenant-binding.mjs
 
           kill $SERVER_PID
 
