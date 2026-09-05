@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
@@ -254,6 +255,21 @@ app.post('/register', ah(async (req, res) => {
   }
 }));
 
+/**
+ * A real argon2id hash, of a random value nobody holds.
+ *
+ * Verifying against this costs the same as verifying against a real user, so
+ * a login for an address that does not exist takes as long as one for an
+ * address that does. It is computed ONCE at startup rather than per request,
+ * because hashing on every miss would make a miss SLOWER than a hit and
+ * simply invert the oracle.
+ *
+ * Random rather than a fixed string so it is not a known-plaintext target,
+ * and discarded immediately -- nothing needs to verify successfully against
+ * it, ever.
+ */
+const DUMMY_PASSWORD_HASH = await hash(randomBytes(32).toString('hex'));
+
 const loginSchema = z.object({
   email: emailField,
   password: z.string(),
@@ -279,12 +295,34 @@ app.post('/login', ah(async (req, res) => {
     }),
   );
 
-  if (!user) {
-    return res.status(401).json({ error: 'invalid credentials' });
-  }
+  /**
+   * Both paths must cost the same, or the response time IS the answer.
+   *
+   * Returning early on a missing user skips the argon2id verify, and argon2id
+   * is expensive ON PURPOSE -- 19 MB and two passes, which is the whole reason
+   * it was chosen. Measured on this machine, over eight runs each:
+   *
+   *   wrong password, account EXISTS : median 13 ms
+   *   wrong password, account MISSING: median  3 ms
+   *
+   * A consistent four-fold difference, and the same 401 body either way. That
+   * is an account-existence oracle: an attacker learns which addresses are
+   * registered by timing, one request each, without ever guessing a password.
+   *
+   * It also contradicts a decision this file makes forty lines below.
+   * /forgot-password returns 202 unconditionally, with a comment explaining
+   * that telling a caller whether an address exists is exactly what must not
+   * happen. /login was giving that away for free.
+   *
+   * So a miss verifies against a DUMMY HASH instead of returning early. The
+   * comparison always fails -- nobody knows the password behind it -- and the
+   * cost lands in the same place as a real verify.
+   */
+  const valid = user
+    ? await verify(user.passwordHash, password)
+    : await verify(DUMMY_PASSWORD_HASH, password).catch(() => false);
 
-  const valid = await verify(user.passwordHash, password);
-  if (!valid) {
+  if (!user || !valid) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
 
