@@ -954,6 +954,30 @@ jobs:
       # Writes an outbox row as the SERVICE role with tenant context, drains
       # once, then asserts the row is marked published AND the message decodes
       # from Kafka by resolving the writer's schema from the wire format.
+      # Nothing pruned the outbox, in either database. The relay was granted
+      # DELETE precisely so that something could -- the migration comment says
+      # "DELETE is granted because nothing else can prune this table" -- and the
+      # code was never written. The grant existed; the job did not.
+      #
+      # Kept forever, deliberately: rows still awaiting delivery, and
+      # dead-lettered rows. The latter are the evidence of a payload that could
+      # never encode, nothing in this repo clears deadLetteredAt, and they are
+      # bounded by how many bad payloads exist rather than by traffic.
+      #
+      # THE ASSERTION THAT MATTERS is the last one. A prune that deletes nothing
+      # looks exactly like a prune with nothing to do, and row-level security
+      # makes that silent -- a policy that does not match the caller filters
+      # rather than raises. Measured before any pruning existed: as the table
+      # OWNER with no app.tenant_id, count(*) on ProcessedMessage returned 0 of
+      # 29 real rows and a DELETE removed 0, exit code 0.
+      #
+      # So pruneOnce compares what it can SEE against what it can DELETE, in one
+      # transaction. The test provokes BOTH failures: a missing grant, which
+      # Postgres raises outright, and a policy narrowed to FOR SELECT, which is
+      # silent and is the one the comparison exists to catch.
+      - name: Assert delivered outbox rows age out and a dead prune cannot lie
+        run: node scripts/verify-outbox-retention.mjs
+
       - name: Verify outbox to Kafka end to end
         env:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event

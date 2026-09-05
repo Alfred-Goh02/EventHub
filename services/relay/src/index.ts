@@ -4,6 +4,7 @@ import { loadRelayEnv } from './env.js';
 import { assertRelayIsLeastPrivilege, createPool } from './db.js';
 import { createPublisher } from './publisher.js';
 import { drainOnce, readMetrics } from './drain.js';
+import { pruneOnce } from './prune.js';
 
 const env = loadRelayEnv();
 const logger = createLogger('outbox-relay');
@@ -15,6 +16,13 @@ const publisher = createPublisher({
 });
 
 let stopping = false;
+
+/**
+ * When the retention sweep last ran. Zero means "not yet", so the first pass
+ * happens shortly after start rather than an hour in -- on a table nobody has
+ * ever pruned, waiting an hour to begin is the wrong default.
+ */
+let lastPruneAt = 0;
 
 /**
  * The drain currently in progress, if any.
@@ -55,6 +63,34 @@ async function loop(): Promise<void> {
 
       if (result.claimed > 0) {
         logger.info(result, 'drained');
+      }
+
+      /**
+       * Retention runs on its OWN clock, between drains rather than inside one.
+       *
+       * Not inside drainOnce, and not in its transaction: that transaction is
+       * the one whose commit follows messages already handed to Kafka, and a
+       * prune failure rolling it back would republish everything in the batch.
+       * Delivery and housekeeping do not belong in the same commit.
+       *
+       * A failure here is logged and swallowed. A relay that stops delivering
+       * because it could not tidy up has turned a disk-space problem into an
+       * outage, which is the wrong direction by a wide margin.
+       */
+      if (Date.now() - lastPruneAt >= env.RELAY_PRUNE_INTERVAL_MS) {
+        lastPruneAt = Date.now();
+        try {
+          const pruned = await pruneOnce(pool, logger, {
+            olderThanDays: env.RELAY_RETENTION_DAYS,
+            batchSize: env.RELAY_PRUNE_BATCH_SIZE,
+            maxBatches: env.RELAY_PRUNE_MAX_BATCHES,
+          });
+          if (pruned.moreToDo) {
+            logger.info(pruned, 'retention sweep hit its batch ceiling; more to prune next pass');
+          }
+        } catch (err) {
+          logger.error({ err }, 'retention sweep failed; delivery is unaffected');
+        }
       }
 
       if (result.claimed === 0) {

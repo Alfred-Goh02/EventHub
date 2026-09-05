@@ -17,6 +17,37 @@ const schema = z.object({
   /** The eventhub_event_relay credential. Owns nothing, reads by delivery state. */
   RELAY_DATABASE_URL: z.string().url(),
 
+  /**
+   * How long a DELIVERED outbox row is kept.
+   *
+   * Nothing pruned this table before, in either database, and the relay was
+   * granted DELETE precisely so that something could -- the migration comment
+   * says "DELETE is granted because nothing else can prune this table". The
+   * grant existed and the code never did.
+   *
+   * A year is far longer than anything needs a delivered row, and that is the
+   * point: one number, easy to remember, obviously safe. Dead-lettered rows
+   * are exempt entirely -- see prune.ts.
+   */
+  RELAY_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
+
+  /** Rows per DELETE. Bounded so no statement holds locks over a huge range. */
+  RELAY_PRUNE_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
+
+  /**
+   * Batches per pass. Bounds the FIRST run, which on a table nobody has ever
+   * pruned may have years of rows to get through -- without this the relay
+   * would stop draining until it finished.
+   */
+  RELAY_PRUNE_MAX_BATCHES: z.coerce.number().int().positive().default(20),
+
+  /**
+   * How often to prune. Deliberately not once per drain: the drain loops as
+   * fast as it can while there is a backlog, and a prune on that cadence would
+   * spend the relay on maintenance exactly when it is busiest.
+   */
+  RELAY_PRUNE_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
+
   KAFKA_BROKERS: z.string().default('localhost:9092'),
   SCHEMA_REGISTRY_URL: z.string().url().default('http://localhost:8081'),
 
