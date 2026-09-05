@@ -300,6 +300,28 @@ app.get('/me', requireAuth, ah(async (req, res) => {
       select: { id: true, email: true, tenantId: true, createdAt: true },
     }),
   );
+
+  /**
+   * A valid token whose subject no longer exists.
+   *
+   * This used to be a bare res.json(user), which sends 200 null when the
+   * lookup misses -- and a client that trusts the 200 and reads .email
+   * crashes on it. Measured: delete the User row, keep the token, and /me
+   * answers 200 "null".
+   *
+   * It is reachable because access tokens are stateless and live 15 minutes
+   * with no revocation, which is a deliberate trade recorded in ADR-004. A
+   * deleted user therefore keeps a working credential for up to a quarter of
+   * an hour, and this is that window.
+   *
+   * 401 rather than 404: the token is well-formed and correctly signed but no
+   * longer identifies anyone, and 401 is the answer that tells a client to
+   * stop using it. A 404 reads as "no such endpoint".
+   */
+  if (!user) {
+    return res.status(401).json({ error: 'this token no longer identifies a user' });
+  }
+
   return res.json(user);
 }));
 
