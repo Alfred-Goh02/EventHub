@@ -127,6 +127,39 @@ events.post('/', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, 
   }
 }));
 
+/**
+ * A DRAFT event is not visible to someone who cannot publish one.
+ *
+ * ATTENDEE is the DEFAULT role and the schema calls it "buys tickets, joins
+ * the community" — so attendees are customers living in the same tenant as the
+ * organisers. Neither read route filtered on status, so any of them could list
+ * every draft in the tenant and fetch one by id, title and description and all.
+ * Reproduced: an attendee reading an unpublished event got 200 and its title.
+ *
+ * That contradicts the meaning the rest of the system gives this field.
+ * Ticketing refuses to sell anything that is not PUBLISHED, and /publish exists
+ * precisely to mark the moment an event becomes public. An organiser drafting
+ * next quarter's programme should not be doing it in front of the customers.
+ *
+ * ONLY draft is hidden. CANCELLED and COMPLETED stay visible to everyone, and
+ * that is not an oversight: someone holding a ticket for a cancelled event is
+ * the person who most needs to see it.
+ */
+const canSeeDrafts = (role: string): boolean => role === 'ORGANIZER' || role === 'ADMIN';
+
+/**
+ * Added to every read for a caller who cannot publish.
+ *
+ * NOT rather than `status: { not: ... }`, because it has to COMPOSE with the
+ * caller's own ?status filter rather than replace it. My first attempt spread
+ * this alongside `...(status ? { status } : {})` and whichever came last won:
+ * one ordering let ?status=DRAFT walk straight past the filter, the other threw
+ * away a legitimate ?status=PUBLISHED. NOT is a separate key, so both
+ * constraints apply — ?status=DRAFT for an attendee is simply an empty result
+ * rather than a bypass or an error.
+ */
+const draftFilter = (role: string) =>
+  canSeeDrafts(role) ? {} : { NOT: { status: 'DRAFT' as const } };
 // ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
@@ -158,6 +191,9 @@ events.get('/', requireAuth, ah(async (req, res) => {
         // likely bug in this file.
         deletedAt: null,
         ...(status ? { status } : {}),
+        // A caller who cannot publish never sees a DRAFT, including when they
+        // ask for one by name -- ?status=DRAFT must not be a way around this.
+        ...draftFilter(req.auth!.role),
         ...(after
           ? {
               OR: [
@@ -197,7 +233,9 @@ events.get('/:id', requireAuth, ah(async (req, res) => {
       // findFirst, not findUnique: there is deliberately no @@unique on
       // (tenantId, slug), and the deletedAt predicate cannot be expressed in a
       // findUnique where-clause anyway.
-      where: { id: req.params.id, deletedAt: null },
+      // 404 rather than 403 for a draft, matching how this file already treats
+      // another tenant's row: refusing tells the caller the id is real.
+      where: { id: req.params.id, deletedAt: null, ...draftFilter(req.auth!.role) },
       select: {
         id: true, title: true, slug: true, description: true, status: true,
         capacity: true, startsAt: true, endsAt: true, version: true,
