@@ -36,7 +36,8 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes, createHash } from 'node:crypto';
 import pg from 'pg';
 
@@ -44,6 +45,16 @@ const AUTH_OWNER_URL =
   process.env['DATABASE_URL'] ??
   'postgresql://eventhub_auth_owner:eventhub_auth_owner@localhost:5432/eventhub_auth';
 const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
+
+/**
+ * The repository root, resolved from THIS FILE rather than from cwd.
+ *
+ * The CI step that runs this has working-directory: services/auth, so
+ * readdirSync('services') looked for services/auth/services and died with
+ * ENOENT. A verifier that scans the tree has to know where the tree is; it
+ * cannot borrow that from whoever invoked it.
+ */
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const TENANT = 'tenant_acme';
 const run = `dba_${Date.now()}`;
@@ -60,7 +71,7 @@ const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 function seedDeclarations() {
   console.log('  every declared seed script must exist');
 
-  const services = readdirSync('services', { withFileTypes: true })
+  const services = readdirSync(join(REPO_ROOT, 'services'), { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
 
@@ -68,7 +79,7 @@ function seedDeclarations() {
   const missing = [];
 
   for (const svc of services) {
-    const config = join('services', svc, 'prisma.config.ts');
+    const config = join(REPO_ROOT, 'services', svc, 'prisma.config.ts');
     if (!existsSync(config)) continue;
 
     const text = readFileSync(config, 'utf8');
@@ -79,7 +90,7 @@ function seedDeclarations() {
 
     declared += 1;
     const target = match[1].trim().split(/\s+/).pop();
-    const resolved = join('services', svc, target);
+    const resolved = join(REPO_ROOT, 'services', svc, target);
     if (!existsSync(resolved)) missing.push(`${config} -> ${resolved}`);
   }
 
