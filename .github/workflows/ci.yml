@@ -267,7 +267,12 @@ jobs:
           # redeems a real tenant_acme invite while claiming tenant_globex and
           # asserts membership THROUGH row-level security -- visible under the
           # invite's tenant, invisible under the one the request asked for.
-          node scripts/verify-invite-tenant-binding.mjs
+          #
+          # $GITHUB_WORKSPACE, not a relative path: this step runs with
+          # working-directory: services/auth, so `node scripts/...` looked for
+          # services/auth/scripts and died with MODULE_NOT_FOUND. The curl it
+          # replaced never noticed, because a URL does not care where you are.
+          node "$GITHUB_WORKSPACE/scripts/verify-invite-tenant-binding.mjs"
 
           kill $SERVER_PID
 
