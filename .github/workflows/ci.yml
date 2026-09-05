@@ -471,6 +471,23 @@ jobs:
           node scripts/verify-draft-visibility.mjs
 
           echo ""
+          echo "--- cancelling an event needs more than a job title ---"
+          # Every write route required ORGANIZER or ADMIN and that was the whole
+          # check, so any organiser could cancel or delete any other organiser's
+          # event. organiserId was set from the token at creation and carried
+          # into the Kafka snapshot, and no route ever read it back.
+          #
+          # Cancel and delete now need the creator or an ADMIN. Patch and
+          # publish stay OPEN, deliberately -- editing a colleague's event is
+          # what a team account is for. The open half is asserted too, so a
+          # later reader can tell it is a choice rather than the same oversight.
+          #
+          # 403 not 404: the caller can already GET the event, so hiding it
+          # would deny something they can plainly observe. Another tenant's row
+          # still 404s, because there confirming existence IS the leak.
+          node scripts/verify-destructive-ownership.mjs
+
+          echo ""
           echo "--- an event must not be patchable into ending before it starts ---"
           # POST has always refused a backwards pair with a Zod .refine(). PATCH
           # never checked, and there was no constraint underneath either. Both of
