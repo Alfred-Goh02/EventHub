@@ -181,6 +181,63 @@ events.post('/', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (req, 
 const canSeeDrafts = (role: string): boolean => role === 'ORGANIZER' || role === 'ADMIN';
 
 /**
+ * Who may CANCEL or DELETE an event, as opposed to edit one.
+ *
+ * Every write route already requires ORGANIZER or ADMIN, and until now that was
+ * the whole check -- so any organiser could cancel any other organiser's event.
+ * organiserId was set from the token at creation and carried into the Kafka
+ * snapshot, and no route ever read it back.
+ *
+ * That was not a decision anybody made. The security boundary in this system is
+ * the TENANT -- every RLS policy reads app.tenant_id and nothing else -- so once
+ * tenant scoping was right the routes felt finished. Ticketing later drew the
+ * line differently: /pay filters on userId, with a comment saying RLS scopes to
+ * a tenant and not to a user. The Event service never did.
+ *
+ * EDITING STAYS OPEN, deliberately. Patching a title or publishing an event is
+ * collaborative work inside one organisation, and locking it to the creator
+ * makes a team account worse for no safety gained.
+ *
+ * Cancel and delete are different in kind. Both propagate to Ticketing and stop
+ * sales for people who already hold tickets, and neither has an undo. A larger
+ * blast radius earns a higher bar.
+ *
+ * ADMIN keeps the override, and that is not politeness -- pure ownership means
+ * an organiser who leaves takes their events with them.
+ */
+const ownerScope = (auth: { role: string; userId: string }) =>
+  auth.role === 'ADMIN' ? {} : { organiserId: auth.userId };
+
+/**
+ * Turn a zero-row destructive write into the right answer.
+ *
+ * 403, not 404, when the row exists and the caller is not its organiser. The
+ * caller can already GET this event -- same tenant, and not a draft they cannot
+ * see -- so hiding it would deny something they can plainly observe. That is the
+ * opposite case to another tenant's row, which 404s precisely because
+ * confirming it exists is itself the leak.
+ */
+type OwnershipMiss =
+  | { kind: 'missing' }
+  | { kind: 'not-owner' }
+  | { kind: 'owned'; status: string };
+
+async function classifyMiss(
+  tx: Prisma.TransactionClient,
+  id: string,
+  auth: { role: string; userId: string },
+): Promise<OwnershipMiss> {
+  const exists = await tx.event.findFirst({
+    where: { id, deletedAt: null },
+    select: { status: true, organiserId: true },
+  });
+
+  if (!exists) return { kind: 'missing' };
+  if (auth.role !== 'ADMIN' && exists.organiserId !== auth.userId) return { kind: 'not-owner' };
+  return { kind: 'owned', status: exists.status };
+}
+
+/**
  * Added to every read for a caller who cannot publish.
  *
  * NOT rather than `status: { not: ... }`, because it has to COMPOSE with the
@@ -539,11 +596,16 @@ events.delete('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (
     // pointing at it do not become dangling. It also frees the slug, because the
     // unique index covers only rows where deletedAt IS NULL.
     const { count } = await tx.event.updateMany({
-      where: { id, deletedAt: null },
+      where: { id, deletedAt: null, ...ownerScope(req.auth!) },
       data: { deletedAt: new Date(), version: { increment: 1 } },
     });
 
-    if (count === 0) return { kind: 'missing' as const };
+    if (count === 0) {
+      const miss = await classifyMiss(tx, id, req.auth!);
+      // 'owned' here means already deleted, not a state clash: delete has no
+      // source-state predicate that could have failed.
+      return miss.kind === 'not-owner' ? miss : { kind: 'missing' as const };
+    }
 
     const deleted = await tx.event.findFirst({ where: { id }, select: SNAPSHOT_SELECT });
 
@@ -556,6 +618,11 @@ events.delete('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (
   });
 
   if (outcome.kind === 'missing') return res.status(404).json({ error: 'event not found' });
+  if (outcome.kind === 'not-owner') {
+    return res.status(403).json({
+      error: 'only the organiser who created this event, or an admin, can delete it',
+    });
+  }
 
   return res.status(204).send();
 }));
@@ -577,18 +644,23 @@ events.post('/:id/cancel', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(as
     // The allowed source states live in the WHERE clause, so two concurrent
     // cancels cannot both match and emit.
     const { count } = await tx.event.updateMany({
-      where: { id, deletedAt: null, status: { in: ['DRAFT', 'PUBLISHED'] } },
+      where: {
+        id,
+        deletedAt: null,
+        status: { in: ['DRAFT', 'PUBLISHED'] },
+        // In the WHERE clause rather than a read-then-check, so it stays atomic
+        // for the same reason the status predicate is.
+        ...ownerScope(req.auth!),
+      },
       data: { status: 'CANCELLED', version: { increment: 1 } },
     });
 
     if (count === 0) {
-      const exists = await tx.event.findFirst({
-        where: { id, deletedAt: null },
-        select: { status: true },
-      });
-      return exists
-        ? { kind: 'wrong-state' as const, status: exists.status }
-        : { kind: 'missing' as const };
+      const miss = await classifyMiss(tx, id, req.auth!);
+      if (miss.kind === 'owned') {
+        return { kind: 'wrong-state' as const, status: miss.status };
+      }
+      return miss;
     }
 
     const cancelled = await tx.event.findFirst({ where: { id }, select: SNAPSHOT_SELECT });
@@ -599,6 +671,11 @@ events.post('/:id/cancel', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(as
 
   if (outcome.kind === 'missing') {
     return res.status(404).json({ error: 'event not found' });
+  }
+  if (outcome.kind === 'not-owner') {
+    return res.status(403).json({
+      error: 'only the organiser who created this event, or an admin, can cancel it',
+    });
   }
   if (outcome.kind === 'wrong-state') {
     return res.status(409).json({ error: `cannot cancel an event in state ${outcome.status}` });
