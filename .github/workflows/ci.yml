@@ -443,6 +443,25 @@ jobs:
           # layer that actually holds under two concurrent patches.
           node scripts/verify-event-date-ordering.mjs
 
+          echo ""
+          echo "--- a tenant must hold more than one non-Latin title ---"
+          # slugify() kept only [a-z0-9], so a title in any non-Latin script
+          # produced the EMPTY STRING -- Chinese, Cyrillic, Arabic, Greek and
+          # emoji all collapse to "". With a partial unique index on
+          # (tenantId, slug) WHERE deletedAt IS NULL, the first such title took
+          # the empty slug and every one after it was refused. Measured:
+          #
+          #   CJK title      -> 201  slug ""
+          #   Cyrillic title -> 409  "an event with that title already exists"
+          #
+          # Two titles that share nothing, and a message that is untrue.
+          #
+          # The control matters as much as the fix: a genuinely duplicate LATIN
+          # title must STILL conflict. A change that gave every slug a random
+          # suffix would satisfy everything else here while quietly dropping a
+          # uniqueness rule somebody chose on purpose.
+          node scripts/verify-slug-non-latin.mjs
+
           pkill -f "node dist/index.js" || true
 
       # The assertion the whole reservation design exists for.

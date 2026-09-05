@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { withTenant } from '../db.js';
 import { Prisma } from '../generated/prisma/client.js';
@@ -16,12 +17,44 @@ export const events: Router = Router();
 const MAX_PAGE = 100;
 const DEFAULT_PAGE = 20;
 
-const slugify = (title: string) =>
-  title
+/**
+ * A URL-safe slug, which for a title in any non-Latin script is EMPTY.
+ *
+ * The transform keeps [a-z0-9] and throws everything else away, so:
+ *
+ *   'Summer Party'    -> 'summer-party'
+ *   '活动预告'          -> ''
+ *   'Летний концерт'  -> ''
+ *   'مهرجان'          -> ''
+ *
+ * There is a partial unique index on (tenantId, slug) WHERE deletedAt IS
+ * NULL, so the FIRST non-Latin title in a tenant took the empty slug and every
+ * one after it was refused — with "an event with that title already exists",
+ * about two titles that share nothing at all. Measured: a CJK title created
+ * fine, a Cyrillic one came back 409.
+ *
+ * So a tenant could hold exactly one event whose title was not mostly ASCII,
+ * and the message told them the wrong reason.
+ *
+ * The empty case falls back to a random suffix rather than transliterating.
+ * Transliteration needs a table per script and gets opinionated fast, and
+ * nothing in this service looks an event up BY slug — reads go by id. The slug
+ * is a human-readable convenience under a uniqueness constraint, so the thing
+ * that matters is that it exists and does not collide.
+ *
+ * A duplicate LATIN title still collides, and that is left alone: two events
+ * genuinely called 'Summer Party' in one tenant is a real conflict, and the
+ * message is true in that case.
+ */
+const slugify = (title: string): string => {
+  const base = title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80);
+
+  return base === '' ? `event-${randomBytes(5).toString('hex')}` : base;
+};
 
 const createEvent = z
   .object({
