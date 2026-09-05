@@ -488,6 +488,29 @@ jobs:
           # sold when nobody paid.
           node scripts/verify-payment-reconciliation.mjs
 
+          # One payment the provider cannot be ASKED about must not stop the
+          # reconciler examining the rest.
+          #
+          # The loop already had a catch, and its comment already said "One bad
+          # row must not stop the batch" -- but it covered only the database
+          # settlement. provider.lookup(), three lines above it, was outside.
+          # A timeout was never the hazard, because withTimeout() RESOLVES to
+          # unknown; a rejection is, and it escaped the loop entirely.
+          #
+          # It does not merely lose one pass. The candidate query is ORDER BY
+          # startedAt LIMIT n with no cursor and no per-row failure marking, so
+          # the same row is selected first next time. A payment whose lookup
+          # fails deterministically sits at the head of every pass forever and
+          # everything behind it is never examined -- in the job that decides
+          # whether customers who may already have been charged get their seats
+          # or their money back.
+          #
+          # The test imports reconcileOnce() and hands it a provider that throws
+          # for one attempt. reconcile.ts imports nothing but types and
+          # settleAttempt, so it loads with no environment -- the real function
+          # is driven, not a copy of its logic.
+          node scripts/verify-reconciler-poison-row.mjs
+
           # The webhook, whose interesting problem is not the signature.
           #
           # It arrives with no session, no token and no tenant, and every policy

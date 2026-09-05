@@ -8,6 +8,15 @@ export interface ReconcileResult {
   confirmed: number;
   released: number;
   stillUnknown: number;
+  /**
+   * Rows whose provider lookup THREW.
+   *
+   * Counted rather than only logged, so a payment the reconciler cannot ask
+   * about is visible in the same place as the ones it resolved. A job that
+   * reports examined=50 confirmed=0 while quietly failing on all fifty looks
+   * identical to a quiet night.
+   */
+  lookupFailed: number;
 }
 
 /**
@@ -46,7 +55,7 @@ export async function reconcileOnce(
   logger: Logger,
   opts: { batchSize: number; graceMs: number },
 ): Promise<ReconcileResult> {
-  const result: ReconcileResult = { examined: 0, confirmed: 0, released: 0, stillUnknown: 0 };
+  const result: ReconcileResult = { examined: 0, confirmed: 0, released: 0, stillUnknown: 0, lookupFailed: 0 };
 
   /**
    * PHASE 1 — find unsettled attempts, oldest first.
@@ -83,11 +92,43 @@ export async function reconcileOnce(
 
   for (const payment of stuck) {
     // PHASE 2 — ask. No transaction is open here.
-    const outcome = await provider.lookup({
-      idempotencyKey: payment.id,
-      amountCents: payment.amountCents,
-      currency: payment.currency,
-    });
+    /**
+     * The lookup is inside the try, and it did not used to be.
+     *
+     * A timeout is not the hazard -- withTimeout() RESOLVES to `unknown`, so a
+     * slow provider is already handled. The hazard is a lookup that REJECTS: a
+     * DNS failure, a connection reset, a 500 the client surfaces as a throw.
+     * That escaped the loop entirely and abandoned the rest of the batch, which
+     * is precisely what the comment on the catch below already promised it
+     * would not do.
+     *
+     * And it does not merely lose one pass. The query is ORDER BY startedAt
+     * LIMIT n with no cursor and no per-row failure marking, so the SAME row is
+     * selected first next time. A payment whose lookup fails deterministically
+     * -- a malformed provider reference, a provider that 500s for one id --
+     * sits at the head of every pass forever, and every payment behind it is
+     * never examined at all. In the job that decides whether customers who may
+     * already have been charged get their seats or their money back.
+     *
+     * Now one bad row costs one row per pass. It still occupies its slot, which
+     * an attempt counter and a backoff column would fix properly; this change
+     * buys the important half without a migration.
+     */
+    let outcome: Awaited<ReturnType<typeof provider.lookup>>;
+    try {
+      outcome = await provider.lookup({
+        idempotencyKey: payment.id,
+        amountCents: payment.amountCents,
+        currency: payment.currency,
+      });
+    } catch (err) {
+      result.lookupFailed += 1;
+      logger.error(
+        { err, paymentId: payment.id },
+        'provider lookup threw; leaving this attempt unsettled and continuing the batch',
+      );
+      continue;
+    }
 
     if (outcome.status === 'unknown') {
       // Still no answer. Leave everything exactly as it is and ask again next
