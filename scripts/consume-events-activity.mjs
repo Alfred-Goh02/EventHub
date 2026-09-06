@@ -54,13 +54,39 @@ async function main() {
   await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
 
   const seen = [];
+  const undecodable = [];
   await consumer.run({
     eachMessage: async ({ partition, message }) => {
       // The first byte is 0x00 and the next four are the schema id. decode()
       // reads that id, fetches the WRITER's schema, and resolves it against the
       // reader's — which is why a plain avsc encode without the prefix would be
       // undecodable here.
-      const value = await registry.decode(message.value);
+      /**
+       * Undecodable messages are EXPECTED on this topic.
+       *
+       * scripts/verify-dlq-malformed.mjs publishes a payload that is not a
+       * Confluent frame at all, on purpose, to prove the projection consumer
+       * dead-letters it rather than dropping it. That message stays on the topic
+       * -- and without this catch, decode() throws inside eachMessage, kafkajs
+       * retries it with backoff, and this script spends its whole window on one
+       * message it was never going to read.
+       *
+       * Counted and reported, not failed. Being unable to decode a message that
+       * was published specifically to be undecodable is the system working.
+       */
+      let value;
+      try {
+        value = await registry.decode(message.value);
+      } catch (err) {
+        undecodable.push({
+          partition,
+          offset: Number(message.offset),
+          key: message.key?.toString(),
+          reason: err instanceof Error ? err.message.split('\n')[0] : String(err),
+        });
+        return;
+      }
+
       seen.push({
         partition,
         // The offset is what makes the ordering check below mean anything:
@@ -131,9 +157,23 @@ async function main() {
   const outOfOrder = [];
   for (const [key, messages] of byKey) {
     for (let i = 1; i < messages.length; i += 1) {
-      if (messages[i].value.version < messages[i - 1].value.version) {
+      const before = messages[i - 1];
+      const after = messages[i];
+      if (after.value.version < before.value.version) {
+        /**
+         * Named in full, with offsets and provenance.
+         *
+         * "went backwards at cmtp8mmc: v3 then v1" is not enough to act on. The
+         * question is always which producer wrote the second one -- the relay
+         * publishes a message-id header on everything it sends, and the verifier
+         * scripts that publish to this topic directly do not, so the header is
+         * what separates "the relay has a bug" from "a test put that there".
+         */
         outOfOrder.push(
-          `${key.slice(0, 8)}: v${messages[i - 1].value.version} then v${messages[i].value.version}`,
+          `key ${key}: v${before.value.version} at p${before.partition}/${before.offset} ` +
+            `(${before.headerId ? 'relay' : 'direct publish'}) then ` +
+            `v${after.value.version} at p${after.partition}/${after.offset} ` +
+            `(${after.headerId ? 'relay' : 'direct publish'})`,
         );
       }
     }
@@ -216,6 +256,13 @@ async function main() {
     console.log('');
     console.log(`  (${headerless} of ${seen.length} carry no message-id header -- not a failure;`);
     console.log('   the header is an optimisation and the e2e replay omits it on purpose)');
+  }
+
+  if (undecodable.length > 0) {
+    console.log('');
+    console.log(`  (${undecodable.length} message(s) could not be decoded -- not a failure;`);
+    console.log('   verify-dlq-malformed.mjs publishes one that is not a Confluent frame on purpose)');
+    for (const u of undecodable) console.log(`     p${u.partition}/${u.offset} key=${u.key}: ${u.reason}`);
   }
 
   const failed = properties.filter((prop) => !prop.ok);
