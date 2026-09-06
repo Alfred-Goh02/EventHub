@@ -1,5 +1,5 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
-import type { Role } from '@eventhub/types';
+import { isRole, type Role } from '@eventhub/types';
 import { importSPKI, jwtVerify, type CryptoKey } from 'jose';
 
 /**
@@ -47,10 +47,18 @@ export interface AuthContext {
   role: Role;
 }
 
-const ROLES: readonly Role[] = ['ADMIN', 'ORGANIZER', 'ATTENDEE'];
-
-const isRole = (v: unknown): v is Role =>
-  typeof v === 'string' && (ROLES as readonly string[]).includes(v);
+/**
+ * isRole comes from @eventhub/types now, and does not live here.
+ *
+ * This file used to keep its own literal list alongside the imported Role
+ * union. Nothing tied the two together, so adding a role to the union and
+ * forgetting the list would have compiled cleanly and then rejected every
+ * request carrying the new role -- a 401, in every service at once, from a
+ * middleware that looks correct.
+ *
+ * In @eventhub/types the array IS the definition and the union is derived from
+ * it, so the two cannot disagree.
+ */
 
 /**
  * Decodes a base64 SPKI PEM into a verifying key.
