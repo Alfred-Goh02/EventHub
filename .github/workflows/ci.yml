@@ -213,15 +213,52 @@ jobs:
 
       # Generated types are committed, so editing a .avsc without regenerating
       # would ship types that quietly disagree with the wire format. Regenerating
-      # here and diffing turns that into a red build.
+      # here and comparing turns that into a red build.
       #
       # Generated from the COMMITTED .avsc, never from the live registry — a
       # build that needs port 8081 is not a reproducible build.
-      - name: Avro types are up to date
+      #
+      # TWO CHECKS, because no single git command does both reliably.
+      #
+      # This was `git diff --exit-code` alone, which compares TRACKED files. A
+      # brand-new .avsc produces a brand-new .ts, which is UNTRACKED, and git
+      # diff ignores it entirely:
+      #
+      #   $ echo x > contracts/generated/never-committed.ts
+      #   $ git diff --exit-code -- contracts/generated; echo $?
+      #   0
+      #
+      # So the one case where a generated file is MISSING rather than merely
+      # stale was the one case the gate could not see — it surfaced on someone
+      # else's clone, as an unresolved import in a package that built fine for
+      # its author. `git ls-files --others` is the check for that.
+      #
+      # And `git status --porcelain` is NOT the check for the other half, even
+      # though it reports both. On a checkout with core.autocrlf=true it reports
+      # content-identical files as modified, so a contributor running this
+      # locally on Windows would get a failure this repository had not earned.
+      # git diff is content-based and gets that case right.
+      - name: Avro types are up to date and every generated file is committed
         run: |
           node scripts/generate-avro-types.mjs
-          git diff --exit-code -- contracts/generated \
-            || { echo "contracts/generated is stale — run: node scripts/generate-avro-types.mjs"; exit 1; }
+
+          UNTRACKED=$(git ls-files --others --exclude-standard -- contracts/generated)
+          if [ -n "$UNTRACKED" ]; then
+            echo "a generated file was never committed:"
+            echo "$UNTRACKED"
+            echo ""
+            echo "  git add the file above. Until then it exists only here and on"
+            echo "  the machine that generated it, and every other clone fails to"
+            echo "  resolve the import."
+            exit 1
+          fi
+
+          git diff --exit-code -- contracts/generated || {
+            echo ""
+            echo "contracts/generated is stale — a schema changed without regenerating."
+            echo "Run: node scripts/generate-avro-types.mjs"
+            exit 1
+          }
 
       # Up to date is not the same as correct.
       #

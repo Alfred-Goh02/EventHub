@@ -9,9 +9,17 @@
  * in the repository. The .avsc is the source of truth; the registry is a cache
  * of it that happens to also enforce compatibility.
  *
- * The output is committed, and CI regenerates and runs `git diff --exit-code`,
- * so editing a schema without regenerating fails the build rather than shipping
- * types that quietly disagree with the wire format.
+ * The output is committed, and CI regenerates and compares, so editing a schema
+ * without regenerating fails the build rather than shipping types that quietly
+ * disagree with the wire format.
+ *
+ * That comparison used to be `git diff --exit-code` alone, which compares
+ * TRACKED files. A brand-new .avsc produces a brand-new .ts, which is
+ * untracked, and git diff ignores it -- so the one case where the generated
+ * file is MISSING rather than merely stale was the one case the gate could not
+ * see. CI runs `git ls-files --others` for that half, and keeps git diff for
+ * the other: git status --porcelain reports both but calls content-identical
+ * files modified when core.autocrlf is true, which is most Windows checkouts.
  *
  * Run: node scripts/generate-avro-types.mjs
  */
@@ -38,6 +46,42 @@ const pascal = (s) => s.replace(/(^|[^A-Za-z0-9])([a-z])/g, (_, __, c) => c.toUp
  * documentation that merely looked like code. Hence contracts/tsconfig.json and
  * the CI step that type-checks this output.
  */
+/**
+ * Records that a named type belongs to this short name, and refuses if two
+ * different Avro types want the same one.
+ *
+ * Avro names are FULLY QUALIFIED -- eventhub.events.EventSnapshot -- and this
+ * generator threw the namespace away and emitted the short name. Two records
+ * called EventSnapshot in different namespaces are different types, and both
+ * would have become `export interface EventSnapshot`.
+ *
+ * Within one file that is worse than a name clash, because the record branch
+ * below skips a name it has already claimed: the second record is silently
+ * DROPPED and every field referencing it is typed as the first one. Across two
+ * files it is two same-named exports from one package describing different
+ * shapes, and an import of the wrong one type-checks.
+ *
+ * Neither produces an error today. This makes both a build failure. The
+ * registry spans the whole run, not one file, because everything in
+ * contracts/generated is imported from the same place.
+ */
+function claim(ctx, kind, t) {
+  const namespace = t.namespace ?? ctx.namespace;
+  const full = namespace ? `${namespace}.${t.name}` : t.name;
+  const held = ctx.registry.get(t.name);
+
+  if (held && held.full !== full) {
+    throw new Error(
+      `two ${kind}s want the TypeScript name ${t.name}: ${held.full} (${held.file}) and ` +
+        `${full} (${ctx.file}). Avro names are fully qualified and TypeScript names are ` +
+        `not, so one of these would silently replace the other. Rename one, or teach this ` +
+        `generator to qualify its output.`,
+    );
+  }
+
+  if (!held) ctx.registry.set(t.name, { full, file: ctx.file });
+}
+
 function tsType(t, ctx) {
   if (typeof t === 'string') {
     switch (t) {
@@ -55,12 +99,14 @@ function tsType(t, ctx) {
   }
 
   if (t.type === 'enum') {
+    claim(ctx, 'enum', t);
     ctx.enums.set(t.name, t.symbols);
     return t.name;
   }
   if (t.type === 'array') return `Array<${tsType(t.items, ctx)}>`;
   if (t.type === 'map') return `Record<string, ${tsType(t.values, ctx)}>`;
   if (t.type === 'record') {
+    claim(ctx, 'record', t);
     if (!ctx.records.has(t.name)) {
       // Claim the name BEFORE recursing into the fields. Avro permits a record
       // to reference itself, and without this the recursion would not terminate.
@@ -93,13 +139,26 @@ function wrap(text, indent = ' * ') {
   return ['/**', ...lines.map((l) => `${indent}${l}`), ' */'];
 }
 
-function generate(schema, sourceFile) {
-  const ctx = { enums: new Map(), records: new Map() };
+function generate(schema, sourceFile, registry) {
+  const ctx = {
+    enums: new Map(),
+    records: new Map(),
+    // Inherited by any nested type that does not declare its own, which is how
+    // Avro name resolution works.
+    namespace: schema.namespace,
+    file: sourceFile,
+    registry,
+  };
+  claim(ctx, 'record', schema);
   const fields = schema.fields.map((f) => ({
     name: f.name,
     type: tsType(f.type, ctx),
     doc: f.doc,
-    optional: Array.isArray(f.type) && f.type.includes('null') && 'default' in f,
+    // `optional` was computed here and never read. Deleting it rather than
+    // wiring it up, because emitting `field?: T` would be WRONG: a decoded Avro
+    // record always carries every field. A default is what the READER supplies
+    // when resolving an older writer schema, so the field is present either way,
+    // and `?` would tell consumers to handle an undefined that cannot occur.
   }));
   const { enums } = ctx;
 
@@ -144,10 +203,19 @@ function generate(schema, sourceFile) {
 mkdirSync(OUT, { recursive: true });
 
 const files = readdirSync(IN).filter((f) => f.endsWith('.avsc'));
+
+/**
+ * Shared across every file, so a name claimed by one schema is claimed for all
+ * of them. contracts/generated is one package as far as an importer is
+ * concerned, so two files exporting the same name is the same problem as one
+ * file trying to.
+ */
+const registry = new Map();
+
 for (const file of files) {
   const schema = JSON.parse(readFileSync(join(IN, file), 'utf8'));
   // events.activity-value.avsc -> events-activity.ts
   const outName = file.replace(/-value\.avsc$/, '').replace(/\./g, '-') + '.ts';
-  writeFileSync(join(OUT, outName), generate(schema, file));
+  writeFileSync(join(OUT, outName), generate(schema, file, registry));
   console.log(`${file}  ->  contracts/generated/${outName}  (${schema.name})`);
 }
