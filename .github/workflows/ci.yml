@@ -88,6 +88,29 @@ jobs:
       - name: Build
         run: pnpm build
 
+
+      # The shared vocabulary must match the things it claims to describe.
+      #
+      # packages/types opens by saying "a shared type that disagrees with
+      # reality is worse than no type, because consumers trust it". Two of its
+      # three types disagreed: ReservationStatus declared PENDING, which is not
+      # a state this system has, and omitted HELD and PENDING_PAYMENT -- the two
+      # the whole seat and payment design turns on. TicketReservedEvent had no
+      # tenantId, no state, and flattened the items ARRAY to one line.
+      #
+      # Neither was imported anywhere, which is the only reason nothing broke.
+      # They would have been wrong for the first consumer to trust them, and the
+      # failure would have looked like a bug in that consumer.
+      #
+      # Compared against the SOURCES -- the Prisma enums, and the list of Avro
+      # records that already have a generator -- because a check comparing two
+      # hand-maintained lists just adds a third thing to keep in step. The
+      # second half is a ratchet: nothing in the shared package may re-declare a
+      # record contracts/generated already emits, since a hand copy can only
+      # drift and this one had.
+      - name: Assert the shared types match their schemas and contracts
+        run: node scripts/verify-shared-types.mjs
+
       # The EXACT stack a developer runs, from the same file, with the same
       # config. --wait blocks until every healthcheck passes, so nothing below
       # races a half-started broker.
