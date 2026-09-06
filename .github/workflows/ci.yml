@@ -1187,6 +1187,24 @@ jobs:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
         run: node scripts/verify-relay-e2e.mjs
 
+      # Reads back everything on events.activity and asserts, on the WIRE, the
+      # four properties the projection's safety rests on. This was a hand-run
+      # demo script; nothing invoked it, and one of its checks could not fail.
+      #
+      # It printed "versions arrived in order: yes" for two chapters. The line
+      # above it sorted the array IN PLACE to make the log readable, and the
+      # check then asked whether a list sorted by version was in version order.
+      # Handed 3, 1, 2 it still said yes.
+      #
+      # Its other two checks were scoped to the topic rather than to a KEY,
+      # which is the only scope Kafka's ordering guarantee has. They were true
+      # only because the topic held one event's updates when it was written, and
+      # go red on any topic with several -- correct traffic reported as broken.
+      #
+      # Placed after the relay e2e so there is real relayed traffic to read.
+      - name: Assert the wire holds the properties the projection depends on
+        run: node scripts/consume-events-activity.mjs
+
       # Proves the relay credential is least-privilege. It reads across EVERY
       # tenant (its policy is USING(true)), so it must not also be able to read
       # tenant data — and that failure is silent: an over-privileged relay works
