@@ -170,5 +170,14 @@ model OutboxMessage {
   /// index created as raw SQL in the migration, which Prisma cannot express. It
   /// also self-empties as rows are published, so it stays a few pages forever
   /// instead of tracking table size.
+  ///
+  /// A SECOND partial index lives in the migrations for the same reason:
+  /// OutboxMessage_backoff_idx, on (tenantId, aggregateId, topic, seq) where the
+  /// row is unpublished, not dead-lettered, and HAS a nextAttemptAt. The relay
+  /// refuses to publish a row while an older row for the same aggregate is
+  /// waiting out a retry backoff, and without an index for that predicate the
+  /// check rescans every undelivered row per candidate — worst during the broker
+  /// outage that put the rows there. This one holds only rows that are backing
+  /// off, so it is empty whenever nothing is wrong.
   @@index([tenantId])
 }
