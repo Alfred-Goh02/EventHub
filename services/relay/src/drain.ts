@@ -42,6 +42,32 @@ export interface DrainResult {
  * cursor. Sequence values are allocated BEFORE commit, so a row with seq=5 can
  * commit after seq=6 — and a cursor-based relay would skip it permanently. A
  * silently lost message is the precise failure an outbox exists to prevent.
+ *
+ * PER-AGGREGATE ORDER SURVIVES A FAILED PUBLISH, which it did not.
+ *
+ * A transient failure sets nextAttemptAt to a backoff and leaves the row
+ * unpublished. The claim then skipped it — `nextAttemptAt <= now()` — and
+ * nothing stopped the SAME aggregate’s later rows going out ahead of it. CI
+ * caught the result on a fresh broker: v3 at offset 0, then v1 at offset 8,
+ * for one event. Inside a single drain the same thing happened one level down,
+ * because the publish loop caught the failure on seq 5 and carried on to 6.
+ *
+ * On a COMPACTED topic that is worse than untidy. Compaction keeps the last
+ * message per key, so a stale version arriving last becomes the surviving one,
+ * and events.activity exists precisely so a consumer can rebuild by replaying
+ * from the beginning. The live projection stays correct — its monotonic
+ * version guard discards the late arrival — so nothing looks wrong until a
+ * rebuild produces a projection made of stale snapshots.
+ *
+ * Two guards, because there are two ways to overtake: NOT EXISTS in the claim
+ * stops a later DRAIN passing a row that is backing off, and `blocked` below
+ * stops the loop passing one inside the batch it already holds.
+ *
+ * Neither closes the two-relay case in the paragraph above. SKIP LOCKED means
+ * another relay can be holding seq 5 invisibly while this one takes seq 6, and
+ * no single query can see a lock it is skipping. Running one relay is still
+ * the requirement; this makes the SUPPORTED configuration correct, and the
+ * unsupported one no worse.
  */
 export async function drainOnce(
   pool: pg.Pool,
@@ -56,13 +82,38 @@ export async function drainOnce(
     await client.query('BEGIN');
 
     const { rows } = await client.query<OutboxRow>(
-      `SELECT id, seq::text AS "seq", "tenantId", topic, "eventType", "schemaVersion",
-              "aggregateId", payload, attempts, "createdAt"
-         FROM "OutboxMessage"
-        WHERE "publishedAt" IS NULL
-          AND "deadLetteredAt" IS NULL
-          AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= now())
-        ORDER BY seq
+      `SELECT o.id, o.seq::text AS "seq", o."tenantId", o.topic, o."eventType", o."schemaVersion",
+              o."aggregateId", o.payload, o.attempts, o."createdAt"
+         FROM "OutboxMessage" o
+        WHERE o."publishedAt" IS NULL
+          AND o."deadLetteredAt" IS NULL
+          AND (o."nextAttemptAt" IS NULL OR o."nextAttemptAt" <= now())
+          -- Nothing for an aggregate may go while something older for that
+          -- same aggregate is STUCK BEHIND A BACKOFF.
+          --
+          -- Note what does NOT block: an older row that is claimable right
+          -- now. ORDER BY seq puts it earlier in this very batch and the loop
+          -- publishes in that order, so excluding it would drain one message
+          -- per aggregate per pass and turn a three-version event into three
+          -- round trips.
+          AND NOT EXISTS (
+            SELECT 1
+              FROM "OutboxMessage" older
+             WHERE older."tenantId" = o."tenantId"
+               AND older."aggregateId" = o."aggregateId"
+               AND older.topic = o.topic
+               AND older.seq < o.seq
+               AND older."publishedAt" IS NULL
+               -- A dead-lettered row is never going to publish, so it must
+               -- not block its aggregate for ever. That leaves a real gap in
+               -- ordering; the alternative is a queue that stops on one
+               -- poison row, and the operator already has an error log
+               -- naming the dead letter.
+               AND older."deadLetteredAt" IS NULL
+               AND older."nextAttemptAt" IS NOT NULL
+               AND older."nextAttemptAt" > now()
+          )
+        ORDER BY o.seq
         LIMIT $1
           FOR UPDATE SKIP LOCKED`,
       [opts.batchSize],
@@ -77,11 +128,36 @@ export async function drainOnce(
 
     const succeeded: string[] = [];
 
+    /**
+     * Aggregates that have already failed IN THIS BATCH.
+     *
+     * The claim above stops a later drain overtaking a row that is backing
+     * off. This stops it happening inside a single drain, where the query has
+     * already handed us seq 5, 6 and 7 for one aggregate and 5 then fails.
+     * Without it the loop carries straight on and publishes 6 and 7, and the
+     * aggregate's stream is reordered before the next drain gets a say.
+     */
+    const blocked = new Set<string>();
+
     for (const row of rows) {
+      const stream = `${row.tenantId}:${row.topic}:${row.aggregateId}`;
+
+      if (blocked.has(stream)) {
+        // Left unclaimed rather than failed: no attempt was made, so nothing
+        // about this row has gone wrong and its attempts count must not move.
+        // The next drain picks it up once the older row has published.
+        logger.debug(
+          { messageId: row.id, seq: row.seq, aggregateId: row.aggregateId },
+          'held back: an older message for this aggregate has not published yet',
+        );
+        continue;
+      }
+
       try {
         await publisher.publish(row);
         succeeded.push(row.id);
       } catch (err) {
+        blocked.add(stream);
         const attempts = row.attempts + 1;
         const message = err instanceof Error ? err.message : String(err);
 

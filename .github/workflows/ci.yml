@@ -1118,6 +1118,33 @@ jobs:
       - name: Assert delivered outbox rows age out and a dead prune cannot lie
         run: node scripts/verify-outbox-retention.mjs
 
+      # One aggregate's messages must reach Kafka in the order they were written,
+      # even when a publish fails. They did not, and this workflow is what caught
+      # it: on a fresh broker the relay published v3 at p1/0 then v1 at p1/8 for
+      # one event.
+      #
+      # A transient failure sets nextAttemptAt to a backoff and leaves the row
+      # unpublished; the claim skipped it and nothing stopped the SAME
+      # aggregate's later rows going out ahead. Inside a single drain the publish
+      # loop did the same thing one level down.
+      #
+      # events.activity is COMPACTED, so the last message per key is the one that
+      # survives — a stale version arriving last becomes the event's permanent
+      # value for anyone rebuilding from the beginning, which is the whole reason
+      # the topic is compacted. The live projection stays correct because its
+      # monotonic guard discards the late arrival, so nothing looks wrong until a
+      # rebuild produces a projection made of stale snapshots.
+      #
+      # Drives the SHIPPED drain with a stub publisher, so a transient failure on
+      # exactly one row is deterministic rather than something to provoke against
+      # a real broker. Includes a clean positive control: without it, every
+      # assertion here is satisfied by a relay that publishes nothing.
+      - name: Assert one aggregate keeps its order across a failed publish
+        env:
+          EVENT_APP_DATABASE_URL: ${{ env.EVENT_APP_DATABASE_URL }}
+          RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
+        run: node scripts/verify-relay-ordering.mjs
+
       - name: Verify outbox to Kafka end to end
         env:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
