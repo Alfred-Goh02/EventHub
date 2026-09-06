@@ -95,10 +95,12 @@ export async function reconcileOnce(
        FROM "Payment"
       WHERE "settledAt" IS NULL
         AND "startedAt" < now() - ($2::bigint * interval '1 millisecond')
-        -- Skip attempts that are backing off. NULL means never asked about,
-        -- which must still be picked up, so it cannot be a plain comparison.
-        AND ("nextLookupAt" IS NULL OR "nextLookupAt" <= now())
-      ORDER BY "nextLookupAt" NULLS FIRST, "startedAt"
+        -- Skip attempts that are backing off. NOT NULL with a default of
+        -- now(), so a never-tried payment is due immediately and this stays a
+        -- plain range -- an OR here would force a bitmap scan and a Sort over
+        -- every unsettled payment before the LIMIT could take a page of it.
+        AND "nextLookupAt" <= now()
+      ORDER BY "nextLookupAt", "startedAt"
       LIMIT $1`,
     [opts.batchSize, opts.graceMs],
   );
