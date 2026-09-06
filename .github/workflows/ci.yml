@@ -1060,6 +1060,26 @@ jobs:
           node scripts/verify-dlq-malformed.mjs
           pkill -f "node dist/index.js" || true
 
+      # Four places in this repository claim a consumer can rebuild its whole
+      # projection by replaying events.activity from the beginning. Nothing
+      # checked it, and that claim is the entire justification for
+      # cleanup.policy=compact, for the payload being a full SNAPSHOT rather
+      # than a delta, and for Ticketing having no bootstrap endpoint at all.
+      #
+      # The assertion that matters: for every key, the LAST message must also be
+      # the HIGHEST-versioned one. Compaction keeps the last message per key and
+      # deletes the rest, so a stale snapshot arriving last means the compactor
+      # deletes the newer one — and a rebuild then reads the stale state, with
+      # no version guard able to help because the newer message is gone.
+      #
+      # This is the direct check on what #61 fixed. The live projection stayed
+      # correct throughout that bug, because its monotonic guard discarded the
+      # late arrival; only a rebuild was wrong, and only after the compactor ran.
+      #
+      # Placed late: it needs both a populated topic and a populated projection.
+      - name: Assert the topic can still rebuild the projection
+        run: node scripts/verify-projection-rebuild.mjs
+
       # Drains TICKETING's outbox with the same relay binary.
       #
       # Added because the payment-path review found that the reservation handler
