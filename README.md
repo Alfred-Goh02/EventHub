@@ -112,15 +112,47 @@ owns the tables and runs migrations, `APP_DATABASE_URL` owns nothing and is what
 the service connects as at runtime. That separation is what makes row-level
 security work at all.
 
-Then migrate each service and seed:
+Then migrate each service. All three have their own migrations, and each reads
+the `DATABASE_URL` from its own `.env` — which is why the copy above has to
+happen first:
 
 ```bash
 pnpm --filter @eventhub/auth exec prisma migrate deploy
 ```
 
 ```bash
+pnpm --filter @eventhub/event exec prisma migrate deploy
+```
+
+```bash
+pnpm --filter @eventhub/ticketing exec prisma migrate deploy
+```
+
+Only Auth has a seed. Running this against Event or Ticketing fails with a
+missing seed script rather than doing nothing:
+
+```bash
 pnpm --filter @eventhub/auth exec prisma db seed
 ```
+
+Create the Kafka topics. The broker runs with
+`KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` deliberately, so this is not optional
+and nothing will create them for you:
+
+```bash
+node scripts/create-topics.mjs
+```
+
+Register the Avro schemas, which the relay resolves by subject at publish time:
+
+```bash
+node scripts/register-schemas.mjs
+```
+
+Skipping either of those last two leaves a system that starts cleanly and then
+fails at the first publish, with an error that names neither the missing piece
+nor the script that creates it — the broker says `This server does not host this
+topic-partition`, and the registry 404s on a subject nobody registered.
 
 Finally, a throwaway signing keypair:
 
@@ -134,6 +166,13 @@ environment is readable by anything else running there.
 **`.github/workflows/ci.yml` is the authoritative setup.** It runs the same
 `docker-compose.yml` a laptop does, from the same file with the same config, so
 the two cannot drift. If anything above disagrees with it, believe the workflow.
+
+That sentence was doing more work than it should have. The instructions above
+used to migrate one service of three and never mention topics or schemas at all,
+and "believe the workflow" was the only thing standing between a reader and a
+broken setup. `scripts/verify-readme-setup.mjs` now asserts that everything CI
+runs to make the system usable appears here, so a new setup step is a red build
+until it is either documented or recorded as one a human does not need.
 
 ## On the verification scripts
 

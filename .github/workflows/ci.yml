@@ -88,6 +88,22 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Following the README's setup to the letter left Kafka unusable: it
+      # migrated one service of three, and never mentioned create-topics.mjs or
+      # register-schemas.mjs at all. The broker runs with auto-creation disabled
+      # on purpose, so nothing filled the gap -- the system started cleanly and
+      # died at the first publish with "This server does not host this
+      # topic-partition", which names neither the missing topic nor the script.
+      #
+      # The README already said this workflow was authoritative, which is an
+      # honest admission that a second copy of a procedure drifts. This is what
+      # stops the drift being silent. The ratchet runs the right way round: a NEW
+      # setup step is red until it is documented or recorded as one a human does
+      # not need, so the default for an undocumented step is failure.
+      #
+      # Reads files only; no infrastructure, so it runs before anything is up.
+      - name: Assert the documented setup builds the system this workflow builds
+        run: node scripts/verify-readme-setup.mjs
 
       # The shared vocabulary must match the things it claims to describe.
       #
