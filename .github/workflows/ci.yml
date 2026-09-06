@@ -130,6 +130,29 @@ jobs:
       - name: Create Kafka topics
         run: node scripts/create-topics.mjs
 
+
+      # The topics on the BROKER must match the decisions written down about
+      # them -- asserted against the cluster, not by reading the script back.
+      #
+      # events.activity.dlq had no retention of its own and inherited the broker
+      # default, log.retention.hours=168. The topic whose stated purpose is
+      # "keep every failure for a human to look at" was deleting them after
+      # seven days, and #42 had just finished routing more things into it.
+      #
+      # It went unnoticed because create-topics.mjs only ever created MISSING
+      # topics: on a cluster where they already existed it printed "all topics
+      # already exist" and exited 0. Every configEntry in that file described
+      # what the topics were made with once, not what they are -- so adding
+      # retention.ms would have changed nothing, successfully. The script now
+      # reconciles config and prints what it changed.
+      #
+      # Config only, never partitions: raising the partition count of a
+      # compacted keyed topic rehashes which partition a key lands on, which
+      # breaks the one-aggregate-one-partition ordering events.activity rests
+      # on. That is a planned migration, not a setup script noticing a number.
+      - name: Assert the topics match the decisions recorded about them
+        run: node scripts/verify-topic-configs.mjs
+
       # Round-trips real messages and asserts the property the whole partition-key
       # design rests on: messages sharing a key land on one partition, so ordering
       # holds per key while different keys spread out for parallelism.
