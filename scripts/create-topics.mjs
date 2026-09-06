@@ -11,6 +11,17 @@
  */
 
 import { Kafka } from 'kafkajs';
+import kafkajs from 'kafkajs';
+
+/**
+ * The enum for a topic config resource.
+ *
+ * Reached through the DEFAULT import rather than a named one: kafkajs is
+ * CommonJS, and under ESM only some of its exports survive as named bindings.
+ * `Kafka` does; `ConfigResourceTypes` does not, and importing it that way fails
+ * at load with "Named export not found" rather than at the point of use.
+ */
+const TOPIC_RESOURCE = kafkajs.ConfigResourceTypes.TOPIC;
 
 const BROKER = process.env['KAFKA_BROKERS'] ?? 'localhost:9092';
 
@@ -87,6 +98,19 @@ const TOPICS = [
     //
     // Deliberately NOT compacted: the whole point is to keep every failure for
     // a human to look at, and compaction would discard all but the last per key.
+    //
+    // And NOT deleted either, which it was. With no retention.ms of its own the
+    // topic inherited the broker default -- log.retention.hours=168 -- so the
+    // only surviving record of a message that could never be processed was
+    // thrown away after seven days. A dead letter nobody looked at inside a week
+    // was simply gone, and the topic whose stated purpose is "keep every failure"
+    // kept none of them.
+    //
+    // -1 is infinite. That is safe here in a way it would not be on a traffic
+    // topic: this one only receives messages that CANNOT be processed, so its
+    // size is bounded by how many genuinely broken payloads exist rather than by
+    // throughput. If it ever grows, that is the alarm, not the problem.
+    configEntries: [{ name: 'retention.ms', value: '-1' }],
     note: 'Dead letters from the events.activity consumer. Inspect, never auto-retry.',
   },
   {
@@ -124,6 +148,70 @@ async function main() {
       waitForLeaders: true,
     });
     for (const t of missing) console.log(`created ${t.topic}`);
+  }
+
+  /**
+   * Reconcile the CONFIG of topics that already exist.
+   *
+   * Without this the script only ever applied configEntries at creation, and
+   * then printed "all topics already exist" and exited 0. So every config in
+   * this file was a description of what the topics were made with once, not of
+   * what they are -- change a value here and nothing happens, successfully.
+   *
+   * That is how events.activity.dlq ended up on the broker default retention:
+   * the entry had no retention.ms, and adding one later would have changed
+   * nothing on any cluster where the topic was already there.
+   *
+   * CONFIG ONLY, never partitions. Raising the partition count of a COMPACTED,
+   * keyed topic silently rehashes which partition a key lands on, so the
+   * ordering guarantee that events.activity rests on -- one aggregate, one
+   * partition -- would break for every event that already exists. That is a
+   * migration somebody has to plan, not something a setup script should do
+   * because a number in a file changed.
+   */
+  const configured = TOPICS.filter((t) => t.configEntries?.length);
+
+  if (configured.length > 0) {
+    const current = await admin.describeConfigs({
+      includeSynonyms: false,
+      resources: configured.map((t) => ({ type: TOPIC_RESOURCE, name: t.topic })),
+    });
+
+    const drifted = [];
+
+    for (const t of configured) {
+      const live = current.resources.find((r) => r.resourceName === t.topic);
+      for (const want of t.configEntries) {
+        const have = live?.configEntries.find((c) => c.configName === want.name);
+        if (have?.configValue !== String(want.value)) {
+          drifted.push({
+            topic: t.topic,
+            name: want.name,
+            from: have?.configValue ?? '(unset)',
+            to: String(want.value),
+          });
+        }
+      }
+    }
+
+    if (drifted.length === 0) {
+      console.log('topic configs already match this file');
+    } else {
+      await admin.alterConfigs({
+        validateOnly: false,
+        resources: configured.map((t) => ({
+          type: TOPIC_RESOURCE,
+          name: t.topic,
+          configEntries: t.configEntries.map((c) => ({
+            name: c.name,
+            value: String(c.value),
+          })),
+        })),
+      });
+      for (const d of drifted) {
+        console.log(`reconciled ${d.topic}: ${d.name} ${d.from} -> ${d.to}`);
+      }
+    }
   }
 
   const meta = await admin.fetchTopicMetadata({

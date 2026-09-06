@@ -1,0 +1,123 @@
+/**
+ * Asserts that the dead-letter topic keeps its dead letters, and that the setup
+ * script can still say so on a cluster where the topics already exist.
+ *
+ * events.activity.dlq had no retention of its own, so it inherited the broker
+ * default — log.retention.hours=168. The topic whose stated purpose is "keep
+ * every failure for a human to look at" was deleting them after seven days. A
+ * dead letter nobody happened to look at inside a week was simply gone, and
+ * #42 had just finished routing MORE things into it.
+ *
+ * THE SECOND HALF IS WHY THE FIRST WENT UNNOTICED. create-topics.mjs only ever
+ * created topics that were MISSING. On any cluster where they already existed
+ * it printed "all topics already exist" and exited 0 — so every configEntry in
+ * that file described what the topics were made with once, not what they are.
+ * Adding retention.ms to the entry would have changed nothing, successfully.
+ *
+ * So this asserts the effective config on the BROKER, not the contents of the
+ * script. A script that says the right thing and applies none of it is exactly
+ * the failure being fixed, and reading the script back would reproduce it.
+ *
+ * Run: node scripts/verify-topic-configs.mjs
+ */
+
+import { Kafka } from 'kafkajs';
+import kafkajs from 'kafkajs';
+
+const TOPIC_RESOURCE = kafkajs.ConfigResourceTypes.TOPIC;
+const BROKERS = (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',').map((b) => b.trim());
+
+let failures = 0;
+function check(ok, msg) {
+  console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
+  if (!ok) failures += 1;
+}
+
+/**
+ * What each topic's shape has to be, and why it is not the default.
+ *
+ * Only the settings a deliberate decision was made about. Everything else is
+ * the broker's business.
+ */
+const EXPECTED = [
+  {
+    topic: 'events.activity.dlq',
+    name: 'retention.ms',
+    value: '-1',
+    why: 'a dead letter must outlive the week nobody looked at it',
+  },
+  {
+    topic: 'events.activity',
+    name: 'cleanup.policy',
+    value: 'compact',
+    why: 'the projection is rebuilt by replaying this topic from the beginning',
+  },
+];
+
+async function main() {
+  const kafka = new Kafka({ clientId: 'verify-topic-configs', brokers: BROKERS });
+  const admin = kafka.admin();
+  await admin.connect();
+
+  const topics = [...new Set(EXPECTED.map((e) => e.topic))];
+
+  const described = await admin.describeConfigs({
+    includeSynonyms: false,
+    resources: topics.map((name) => ({ type: TOPIC_RESOURCE, name })),
+  });
+
+  /**
+   * The scan has to be looking at something. describeConfigs on a topic that
+   * does not exist returns an empty resource rather than throwing, so without
+   * this every assertion below would read `undefined !== expected` and fail for
+   * the wrong reason — or worse, an empty EXPECTED would pass silently.
+   */
+  check(
+    described.resources.length === topics.length,
+    `described ${described.resources.length} of ${topics.length} topic(s)`,
+  );
+
+  for (const e of EXPECTED) {
+    const resource = described.resources.find((r) => r.resourceName === e.topic);
+    const entry = resource?.configEntries.find((c) => c.configName === e.name);
+
+    check(
+      entry?.configValue === e.value,
+      entry?.configValue === e.value
+        ? `${e.topic} ${e.name}=${e.value} — ${e.why}`
+        : `${e.topic} ${e.name} is ${entry?.configValue ?? '(absent)'}, expected ${e.value}. ` +
+          `${e.why}. Note the setup script reports success without applying config to ` +
+          'topics that already exist, so "I ran create-topics" does not settle this.',
+    );
+  }
+
+  /**
+   * The DLQ's retention specifically must not be the broker default, and saying
+   * "not the default" is a different assertion from "equals -1": it is the one
+   * that would still catch the bug if somebody set retention.ms to a week
+   * explicitly.
+   */
+  const dlq = described.resources.find((r) => r.resourceName === 'events.activity.dlq');
+  const retention = dlq?.configEntries.find((c) => c.configName === 'retention.ms');
+  check(
+    retention?.configValue !== '604800000',
+    retention?.configValue === '604800000'
+      ? 'the DLQ is on the seven-day broker default — this is the original bug, exactly'
+      : 'and it is not the seven-day default it used to inherit',
+  );
+
+  await admin.disconnect();
+
+  console.log('');
+  if (failures > 0) {
+    console.error(`FAIL: ${failures} assertion(s) failed`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log('the topics on the broker match the decisions written down about them');
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
