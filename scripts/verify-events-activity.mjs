@@ -19,7 +19,14 @@
  * one partition" is a property of a topic holding one event, not of a correct
  * system: it goes red on any topic carrying several. Both are per key now.
  *
- * Run: node scripts/consume-events-activity.mjs
+ * RENAMED from consume-events-activity.mjs, because what it does changed. It
+ * was a thing you ran to look at the topic; it is now a thing CI runs to
+ * assert. scripts/verify-readme-setup.mjs is what noticed -- it treats any
+ * non-verify script CI runs as setup a reader must be told about, so the old
+ * name made it demand a README entry for an assertion. The ratchet was right
+ * and the name was wrong.
+ *
+ * Run: node scripts/verify-events-activity.mjs
  *
  * ACTIVITY_TOPIC overrides the topic, which is how the checks get watched fail:
  * events.activity is compacted and kept forever, so a deliberately broken

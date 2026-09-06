@@ -1203,7 +1203,7 @@ jobs:
       #
       # Placed after the relay e2e so there is real relayed traffic to read.
       - name: Assert the wire holds the properties the projection depends on
-        run: node scripts/consume-events-activity.mjs
+        run: node scripts/verify-events-activity.mjs
 
       # Proves the relay credential is least-privilege. It reads across EVERY
       # tenant (its policy is USING(true)), so it must not also be able to read
