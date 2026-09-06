@@ -696,6 +696,28 @@ jobs:
           # must GROW, or a fixed interval would pass everything else.
           node scripts/verify-reconciler-backoff.mjs
 
+          # The two retention-critical queries must use their index to ORDER,
+          # not merely to filter.
+          #
+          # An index that is "used" is not an index that helps. Both queries end
+          # in ORDER BY ... LIMIT n, and a Bitmap Scan + Sort still names the
+          # index in the plan while collecting every matching row and sorting all
+          # of them before taking n. Work bounded by the TABLE, not the page --
+          # under statement_timeout=15s that eventually stops completing, in the
+          # direction where the table keeps growing.
+          #
+          # Asserted as a CAPABILITY, with seqscan and bitmapscan disabled: on a
+          # small CI table a bitmap and a sort really is cheaper and the planner
+          # is right to pick it. The question is whether the index CAN serve an
+          # ordered scan, which does not move with table size.
+          #
+          # Explained as the role that RUNS each query, which is not a detail --
+          # under FORCE RLS a role with no policy gets a constant-false qual and
+          # a different plan entirely. The control is a temp table with a
+          # nullable column, because the fix itself (NOT NULL) makes the old OR
+          # form fold away on the real table.
+          node scripts/verify-query-plans.mjs
+
           # One attempt, two routes, exactly one settlement.
           #
           # The section titled "a second pass must not move anything twice" in

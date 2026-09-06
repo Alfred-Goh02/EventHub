@@ -358,11 +358,18 @@ model Payment {
 
   /// When this attempt may be asked about again.
   ///
-  /// NULL means "never tried, ask now". The candidate query is ORDER BY
-  /// startedAt with no cursor, so without this a payment whose lookup fails
-  /// deterministically is selected FIRST on every pass forever, and enough of
-  /// them shrink the batch to nothing. Backing off puts the queue back.
-  nextLookupAt DateTime?
+  /// The candidate query is ORDER BY startedAt with no cursor, so without
+  /// this a payment whose lookup fails deterministically is selected FIRST on
+  /// every pass forever, and enough of them shrink the batch to nothing.
+  ///
+  /// NOT NULL, defaulting to now(): a payment that has never been looked up
+  /// is due NOW, which is a fact about the row rather than an absence of one.
+  /// It was nullable first, and the resulting
+  /// `nextLookupAt IS NULL OR nextLookupAt <= now()` forced a bitmap scan and
+  /// a Sort over every unsettled payment before the LIMIT could take a page.
+  /// Without the OR the index serves the ORDER BY too and the LIMIT stops the
+  /// scan.
+  nextLookupAt DateTime @default(now())
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
