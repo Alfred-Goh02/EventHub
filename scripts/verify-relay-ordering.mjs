@@ -73,13 +73,23 @@ const logger = {
 function stubPublisher(failVersions = new Set()) {
   const sent = [];
   return {
+    /**
+     * Only what this run put there.
+     *
+     * The drain takes whatever is pending, and a developer outbox holds rows
+     * from earlier runs and from other verifiers. Asserting on everything the
+     * drain published made these checks depend on how clean the database
+     * happened to be -- which surfaced as one run of this file failing its own
+     * positive control on rows a previous run had left behind.
+     */
+    of: (aggregateId) => sent.filter((m) => m.aggregateId === aggregateId).map((m) => m.version),
     sent,
     publisher: {
       async publish(row) {
         if (failVersions.has(row.payload.version)) {
           throw new Error('broker unreachable (simulated transient failure)');
         }
-        sent.push(row.payload.version);
+        sent.push({ aggregateId: row.aggregateId, version: row.payload.version });
       },
     },
   };
@@ -140,8 +150,8 @@ async function main() {
     const okRun = stubPublisher();
     await drainOnce(pool, okRun.publisher, logger, opts);
     check(
-      JSON.stringify(okRun.sent) === JSON.stringify([1, 2, 3]),
-      `published ${JSON.stringify(okRun.sent)} — expected [1,2,3]`,
+      JSON.stringify(okRun.of(clean)) === JSON.stringify([1, 2, 3]),
+      `published ${JSON.stringify(okRun.of(clean))} — expected [1,2,3]`,
     );
     await cleanup(app, clean);
 
@@ -158,12 +168,12 @@ async function main() {
     await drainOnce(pool, batchRun.publisher, logger, opts);
 
     check(
-      !batchRun.sent.includes(2) && !batchRun.sent.includes(3),
-      `v1 failed, so v2 and v3 must not have gone ahead of it — sent ${JSON.stringify(batchRun.sent)}`,
+      !batchRun.of(inBatch).includes(2) && !batchRun.of(inBatch).includes(3),
+      `v1 failed, so v2 and v3 must not have gone ahead of it — sent ${JSON.stringify(batchRun.of(inBatch))}`,
     );
     check(
-      JSON.stringify(batchRun.sent) === JSON.stringify([4, 5]),
-      `the UNRELATED aggregate still published: ${JSON.stringify(batchRun.sent)} — expected [4,5]. ` +
+      JSON.stringify(batchRun.of(other)) === JSON.stringify([4, 5]),
+      `the UNRELATED aggregate still published: ${JSON.stringify(batchRun.of(other))} — expected [4,5]. ` +
         'A drain that stops entirely would be a different bug: one failing aggregate ' +
         'must not hold up the queue.',
     );
@@ -185,10 +195,10 @@ async function main() {
     const held = stubPublisher();
     await drainOnce(pool, held.publisher, logger, opts);
     check(
-      held.sent.length === 0,
-      held.sent.length === 0
+      held.of(backoff).length === 0,
+      held.of(backoff).length === 0
         ? 'v1 is backing off, so nothing for that aggregate published'
-        : `published ${JSON.stringify(held.sent)} while v1 was still waiting — this is the bug`,
+        : `published ${JSON.stringify(held.of(backoff))} while v1 was still waiting — this is the bug`,
     );
 
     await setRow(app, `${backoff}_v1`, `"nextAttemptAt" = NULL`);
@@ -196,8 +206,8 @@ async function main() {
     const after = stubPublisher();
     await drainOnce(pool, after.publisher, logger, opts);
     check(
-      JSON.stringify(after.sent) === JSON.stringify([1, 2, 3]),
-      `once the backoff expired: ${JSON.stringify(after.sent)} — expected [1,2,3]`,
+      JSON.stringify(after.of(backoff)) === JSON.stringify([1, 2, 3]),
+      `once the backoff expired: ${JSON.stringify(after.of(backoff))} — expected [1,2,3]`,
     );
     await cleanup(app, backoff);
 
@@ -218,10 +228,134 @@ async function main() {
     const past = stubPublisher();
     await drainOnce(pool, past.publisher, logger, opts);
     check(
-      JSON.stringify(past.sent) === JSON.stringify([2, 3]),
-      `published ${JSON.stringify(past.sent)} — expected [2,3], past the dead letter`,
+      JSON.stringify(past.of(dead)) === JSON.stringify([2, 3]),
+      `published ${JSON.stringify(past.of(dead))} — expected [2,3], past the dead letter`,
     );
     await cleanup(app, dead);
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  and a second relay cannot slip past one that is mid-publish');
+    // -----------------------------------------------------------------------
+    /**
+     * The case SKIP LOCKED creates rather than solves.
+     *
+     * SKIP LOCKED hides a row another relay is holding, which is the point --
+     * but it hides it from the ORDER BY too. Relay A claims seq 1 and stalls
+     * inside the Kafka round-trip that drainOnce deliberately holds its
+     * transaction across. Seq 2 and 3 commit meanwhile. Relay B drains, cannot
+     * see seq 1, and publishes 2 and 3 ahead of it.
+     *
+     * Measured against this schema before the fix: [2,3,1].
+     *
+     * The drain used to call this out and accept it -- "running one relay is
+     * still the requirement". But the thing that causes it is the forgotten
+     * `tsx watch` its own comment names, and the consequence on a compacted
+     * topic is a projection that rebuilds to stale state. A configuration
+     * mistake should not silently corrupt data.
+     *
+     * NO TIMERS. A gate the test resolves by hand, so the race is arranged
+     * rather than hoped for -- a sleep long enough to be reliable in CI is a
+     * sleep, and a sleep short enough to be quick is a flake.
+     */
+    const race = `${run}_race`;
+    await seed(app, race, [1]);
+
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let entered;
+    const insidePublish = new Promise((r) => { entered = r; });
+
+    const relayA = [];
+    const slow = {
+      async publish(row) {
+        if (row.aggregateId === race) {
+          entered();
+          await gate;
+        }
+        relayA.push({ aggregateId: row.aggregateId, version: row.payload.version });
+      },
+    };
+
+    // Separate pools, so the two drains are separate SESSIONS. Advisory locks
+    // are held per session, and one session re-taking its own lock succeeds --
+    // which would make this test pass against the broken code.
+    const poolA = new pg.Pool({ connectionString: RELAY_URL, max: 2 });
+    const poolB = new pg.Pool({ connectionString: RELAY_URL, max: 2 });
+
+    try {
+      const aDrain = drainOnce(poolA, slow, logger, opts);
+      await insidePublish;
+
+      // Now the later versions land, while A still holds seq 1.
+      await seed(app, race, [2, 3]);
+
+      // And an unrelated aggregate, so "B published nothing of ours" can be
+      // told apart from "B published nothing at all".
+      const bystander = `${run}_bystander`;
+      await seed(app, bystander, [1, 2]);
+
+      const relayB = [];
+      const fast = {
+        async publish(row) {
+          relayB.push({ aggregateId: row.aggregateId, version: row.payload.version });
+        },
+      };
+      await drainOnce(poolB, fast, logger, opts);
+
+      const bTookOurs = relayB.filter((m) => m.aggregateId === race).map((m) => m.version);
+      check(
+        bTookOurs.length === 0,
+        bTookOurs.length === 0
+          ? 'the second relay published nothing for an aggregate the first was holding'
+          : `the second relay published ${JSON.stringify(bTookOurs)} while the first still had ` +
+            'v1 in flight — those arrive on the topic before v1 does',
+      );
+
+      /**
+       * And it did not simply stop.
+       *
+       * Blocking one aggregate must not block the queue, or the fix trades a
+       * silent corruption for a stalled relay -- the same trade the dead-letter
+       * case above refuses.
+       *
+       * This needs a SEPARATE aggregate to be meaningful. The first version
+       * asserted `relayB.length >= 0 && bTookOurs.length === 0`, which is the
+       * assertion above with a tautology bolted on: it printed
+       * "0 message(s) from other aggregates" and called that a pass.
+       */
+      const bystanderSent = relayB.filter((m) => m.aggregateId === bystander).map((m) => m.version);
+      check(
+        JSON.stringify(bystanderSent) === JSON.stringify([1, 2]),
+        `an unrelated aggregate still drained in the same pass: ${JSON.stringify(bystanderSent)} ` +
+          '— expected [1,2]. One aggregate being held must not stop the queue.',
+      );
+
+      release();
+      await aDrain;
+
+      // Everything held back goes out now, behind what preceded it.
+      const after = [];
+      await drainOnce(poolB, {
+        async publish(row) {
+          after.push({ aggregateId: row.aggregateId, version: row.payload.version });
+        },
+      }, logger, opts);
+
+      const order = [
+        ...relayA.filter((m) => m.aggregateId === race).map((m) => m.version),
+        ...after.filter((m) => m.aggregateId === race).map((m) => m.version),
+      ];
+      check(
+        JSON.stringify(order) === JSON.stringify([1, 2, 3]),
+        `the aggregate reached Kafka as ${JSON.stringify(order)} — expected [1,2,3]`,
+      );
+    } finally {
+      await poolA.end();
+      await poolB.end();
+    }
+    await cleanup(app, race);
+    await cleanup(app, `${run}_bystander`);
+
   } finally {
     await cleanup(app, run).catch(() => {});
     await app.end();
