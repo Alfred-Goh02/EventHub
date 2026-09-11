@@ -35,18 +35,6 @@ const OUT = join(ROOT, 'contracts', 'generated');
 const pascal = (s) => s.replace(/(^|[^A-Za-z0-9])([a-z])/g, (_, __, c) => c.toUpperCase());
 
 /**
- * Renders an Avro type as a TypeScript type, collecting the named types it meets
- * along the way into `ctx` so the caller can emit declarations for them.
- *
- * Both enums AND records have to be collected. An earlier version collected only
- * enums and returned `t.name` for a record, which produced output referencing an
- * interface that was never declared — `items: Array<ReservationLine>` with no
- * ReservationLine anywhere in the file. It went unnoticed because nothing
- * imported the generated types and no tsconfig covered them, so the files were
- * documentation that merely looked like code. Hence contracts/tsconfig.json and
- * the CI step that type-checks this output.
- */
-/**
  * Records that a named type belongs to this short name, and refuses if two
  * different Avro types want the same one.
  *
@@ -61,12 +49,19 @@ const pascal = (s) => s.replace(/(^|[^A-Za-z0-9])([a-z])/g, (_, __, c) => c.toUp
  * files it is two same-named exports from one package describing different
  * shapes, and an import of the wrong one type-checks.
  *
- * Neither produces an error today. This makes both a build failure. The
- * registry spans the whole run, not one file, because everything in
+ * `ns` is the namespace INHERITED from the most tightly enclosing named type,
+ * which is how Avro resolves a name that does not declare its own. The first
+ * version of this check used the TOP-LEVEL schema's namespace for every nested
+ * type instead, so two records both called Inner, one nested under b.OuterB
+ * and one under c.OuterC, both resolved to ns.Inner, looked identical, and the
+ * second was dropped without a word -- the exact failure this function exists
+ * to stop, one level further down.
+ *
+ * The registry spans the whole run, not one file, because everything in
  * contracts/generated is imported from the same place.
  */
-function claim(ctx, kind, t) {
-  const namespace = t.namespace ?? ctx.namespace;
+function claim(ctx, kind, t, ns) {
+  const namespace = t.namespace ?? ns;
   const full = namespace ? `${namespace}.${t.name}` : t.name;
   const held = ctx.registry.get(t.name);
 
@@ -82,7 +77,22 @@ function claim(ctx, kind, t) {
   if (!held) ctx.registry.set(t.name, { full, file: ctx.file });
 }
 
-function tsType(t, ctx) {
+/**
+ * Renders an Avro type as a TypeScript type, collecting the named types it meets
+ * along the way into `ctx` so the caller can emit declarations for them.
+ *
+ * Both enums AND records have to be collected. An earlier version collected only
+ * enums and returned `t.name` for a record, which produced output referencing an
+ * interface that was never declared — `items: Array<ReservationLine>` with no
+ * ReservationLine anywhere in the file. It went unnoticed because nothing
+ * imported the generated types and no tsconfig covered them, so the files were
+ * documentation that merely looked like code. Hence contracts/tsconfig.json and
+ * the CI step that type-checks this output.
+ *
+ * `ns` is the enclosing namespace, threaded down so a nested type without a
+ * namespace of its own inherits its PARENT's, not the top-level schema's.
+ */
+function tsType(t, ctx, ns) {
   if (typeof t === 'string') {
     switch (t) {
       case 'string': case 'bytes': return 'string';
@@ -95,18 +105,20 @@ function tsType(t, ctx) {
 
   if (Array.isArray(t)) {
     // A union. ["null", "string"] is the idiomatic nullable field.
-    return [...new Set(t.map((m) => tsType(m, ctx)))].join(' | ');
+    return [...new Set(t.map((m) => tsType(m, ctx, ns)))].join(' | ');
   }
 
   if (t.type === 'enum') {
-    claim(ctx, 'enum', t);
+    claim(ctx, 'enum', t, ns);
     ctx.enums.set(t.name, t.symbols);
     return t.name;
   }
-  if (t.type === 'array') return `Array<${tsType(t.items, ctx)}>`;
-  if (t.type === 'map') return `Record<string, ${tsType(t.values, ctx)}>`;
+  if (t.type === 'array') return `Array<${tsType(t.items, ctx, ns)}>`;
+  if (t.type === 'map') return `Record<string, ${tsType(t.values, ctx, ns)}>`;
   if (t.type === 'record') {
-    claim(ctx, 'record', t);
+    claim(ctx, 'record', t, ns);
+    // This record's own namespace is what ITS fields inherit.
+    const inner = t.namespace ?? ns;
     if (!ctx.records.has(t.name)) {
       // Claim the name BEFORE recursing into the fields. Avro permits a record
       // to reference itself, and without this the recursion would not terminate.
@@ -115,7 +127,7 @@ function tsType(t, ctx) {
         doc: t.doc,
         fields: (t.fields ?? []).map((f) => ({
           name: f.name,
-          type: tsType(f.type, ctx),
+          type: tsType(f.type, ctx, inner),
           doc: f.doc,
         })),
       });
@@ -123,7 +135,7 @@ function tsType(t, ctx) {
     return t.name;
   }
 
-  return tsType(t.type, ctx);
+  return tsType(t.type, ctx, ns);
 }
 
 function wrap(text, indent = ' * ') {
@@ -143,16 +155,14 @@ function generate(schema, sourceFile, registry) {
   const ctx = {
     enums: new Map(),
     records: new Map(),
-    // Inherited by any nested type that does not declare its own, which is how
-    // Avro name resolution works.
-    namespace: schema.namespace,
     file: sourceFile,
     registry,
   };
-  claim(ctx, 'record', schema);
+  claim(ctx, 'record', schema, undefined);
   const fields = schema.fields.map((f) => ({
     name: f.name,
-    type: tsType(f.type, ctx),
+    // The top-level fields inherit the schema's own namespace.
+    type: tsType(f.type, ctx, schema.namespace),
     doc: f.doc,
     // `optional` was computed here and never read. Deleting it rather than
     // wiring it up, because emitting `field?: T` would be WRONG: a decoded Avro
