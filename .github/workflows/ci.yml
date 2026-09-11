@@ -494,6 +494,18 @@ jobs:
           node scripts/verify-password-reset.mjs
           pkill -f "node dist/index.js" || true
 
+      # /login had no rate limit: 25 wrong passwords gave 25 x 401 and never a
+      # 429 -- unbounded guessing, with every guess costing the server an
+      # argon2id verify. Now per ACCOUNT (failures only, checked before the
+      # verify, cleared on success) and per ADDRESS (every attempt).
+      #
+      # The verifier starts its OWN auth instances on ports 3097 and 3096 with
+      # tiny limits, because the limiter is per-process memory: exhausting the
+      # budget on the shared :3001 instance would lock every later step that
+      # logs in from localhost -- the lockout #30 already fixed once.
+      - name: Assert /login stops a guesser without revealing which accounts exist
+        run: node scripts/verify-login-rate-limit.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

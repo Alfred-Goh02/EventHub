@@ -275,6 +275,62 @@ const loginSchema = z.object({
   password: z.string(),
 });
 
+/**
+ * A positive integer from the environment, or the fallback when unset.
+ *
+ * A typo here must not quietly become "no limit" -- Number('1o') is NaN, and a
+ * NaN limit compares false against every count -- so anything present but
+ * invalid refuses to start, the same way TRUST_PROXY does above.
+ */
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+/**
+ * Rate limits for /login.
+ *
+ * Unlimited, /login was unbounded online guessing against any account: 25 wrong
+ * passwords gave 25 × 401 and never a 429, and every guess made the SERVER pay
+ * for an argon2id verify.
+ *
+ * Per ACCOUNT, only FAILED attempts count, and the check comes BEFORE the
+ * password is looked at. Counting every attempt would lock out anything that
+ * logs in successfully and often -- every CI run does, from one address. And a
+ * check made after the verify would still tell a guesser when they had hit the
+ * right password; the refusal has to come first.
+ *
+ * The key is (tenant, submitted email) whether or not that account exists, so a
+ * 429 says nothing about which addresses are registered.
+ *
+ * See rate-limit.ts for what this deliberately is not.
+ */
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const loginFailuresPerAccount = createRateLimiter({
+  limit: positiveIntEnv('LOGIN_MAX_FAILURES_PER_ACCOUNT', 10),
+  windowMs: LOGIN_WINDOW_MS,
+});
+
+/**
+ * And per ADDRESS, every attempt counts. The per-account limit cannot see one
+ * client trying one password against a long list of accounts -- no single
+ * account ever reaches its budget -- and this also bounds how many argon2
+ * verifies one client can make the server run.
+ *
+ * Only as good as req.ip: see TRUST_PROXY at the top of this file. Behind an
+ * unconfigured proxy every caller shares one address and this throttles the
+ * whole deployment, which is why the default is generous.
+ */
+const loginAttemptsPerIp = createRateLimiter({
+  limit: positiveIntEnv('LOGIN_MAX_ATTEMPTS_PER_IP', 100),
+  windowMs: LOGIN_WINDOW_MS,
+});
+
 app.post('/login', ah(async (req, res) => {
   const tenantId = req.header('X-Tenant-ID');
   if (!tenantId) {
@@ -287,6 +343,25 @@ app.post('/login', ah(async (req, res) => {
   }
 
   const { email, password } = parsed.data;
+
+  const ip = req.ip ?? 'unknown';
+  if (!loginAttemptsPerIp.hit(ip)) {
+    logger.warn({ tenantId, ip }, 'login refused: too many attempts from one address');
+    // The same body as the per-account refusal below, so a caller cannot tell
+    // which of the two limits it hit.
+    res.set('Retry-After', String(Math.ceil(loginAttemptsPerIp.blockedFor(ip) / 1000)));
+    return res.status(429).json({ error: 'too many login attempts, try again later' });
+  }
+
+  const accountKey = `${tenantId}:${email}`;
+  const accountWait = loginFailuresPerAccount.blockedFor(accountKey);
+  if (accountWait > 0) {
+    // tenantId only: the email is personal data, and the key already says
+    // everything an operator needs -- one account is being hammered.
+    logger.warn({ tenantId }, 'login refused: too many failed attempts for one account');
+    res.set('Retry-After', String(Math.ceil(accountWait / 1000)));
+    return res.status(429).json({ error: 'too many login attempts, try again later' });
+  }
 
   const user = await withTenant(tenantId, (tx) =>
     tx.user.findUnique({
@@ -323,8 +398,13 @@ app.post('/login', ah(async (req, res) => {
     : await verify(DUMMY_PASSWORD_HASH, password).catch(() => false);
 
   if (!user || !valid) {
+    // Counted whether or not the account exists, so the budget runs out on the
+    // same attempt for a real address and an invented one.
+    loginFailuresPerAccount.hit(accountKey);
     return res.status(401).json({ error: 'invalid credentials' });
   }
+
+  loginFailuresPerAccount.reset(accountKey);
 
   const accessToken = await signAccessToken(user.id, tenantId, user.role);
   const refreshToken = await issueRefreshToken(user.id, tenantId);
