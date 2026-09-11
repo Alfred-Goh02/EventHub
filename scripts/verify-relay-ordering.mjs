@@ -136,6 +136,38 @@ async function main() {
   const pool = new pg.Pool({ connectionString: RELAY_URL, max: 2 });
   const opts = { batchSize: 100, maxAttempts: 5 };
 
+  /**
+   * REFUSE TO RUN ON A NON-EMPTY OUTBOX.
+   *
+   * Every drain in this file claims whatever is pending -- not just this run's
+   * rows -- and hands it to a stub publisher that records it and reports
+   * success. drainOnce then marks it published. So a real pending message,
+   * left by the Event service or an earlier CI step, would be marked
+   * delivered without ever reaching Kafka: silently lost, by a test.
+   *
+   * The stub cannot simply decline foreign rows: a thrown error is a failed
+   * publish, which increments attempts, sets a backoff, and -- since #61 --
+   * holds that aggregate back. Not running is the only harmless option.
+   *
+   * The relay role sees every tenant, so this count is the whole outbox.
+   */
+  const {
+    rows: [pending],
+  } = await pool.query(
+    `SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "publishedAt" IS NULL AND "deadLetteredAt" IS NULL`,
+  );
+  if (pending.n > 0) {
+    console.error(
+      `REFUSING TO RUN: ${pending.n} undelivered outbox row(s) already pending. This file ` +
+        'drains with a stub publisher, so it would mark them published without sending them. ' +
+        'Run the real relay (node services/relay/dist/index.js --once) first, then re-run this.',
+    );
+    await app.end();
+    await pool.end();
+    process.exitCode = 1;
+    return;
+  }
+
   try {
     // -----------------------------------------------------------------------
     console.log('  a clean run publishes every version, in order (positive control)');
