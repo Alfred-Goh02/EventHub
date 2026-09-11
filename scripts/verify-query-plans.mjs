@@ -110,6 +110,53 @@ const PLANS = [
            ORDER BY "publishedAt"
            LIMIT 1000`,
   },
+  {
+    label: 'the relay claiming a batch to publish',
+    url: RELAY,
+    role: 'eventhub_event_relay',
+    index: 'OutboxMessage_undelivered_idx',
+    /**
+     * The claim is the relay's hot path, and the query most at risk from the
+     * ordering guards built around it: a NOT EXISTS for rows stuck behind a
+     * backoff, and a per-aggregate advisory lock.
+     *
+     * The advisory lock is VOLATILE, and putting it in the inner WHERE cost
+     * exactly what this file exists to catch. The planner stopped using the
+     * partial index to supply the ordering and produced a bitmap scan with a
+     * Sort on top -- the shape OutboxMessage_undelivered_idx was created to
+     * avoid. It also meant the lock was evaluated for every pending row
+     * BEFORE the LIMIT, so one drain would hold an advisory lock per
+     * aggregate in the entire backlog, and max_locks_per_transaction is
+     * finite. Both are why the claim is a CTE.
+     */
+    outerSort: 'the CTE bounds it to batchSize rows before the advisory-lock filter sees them',
+    sql: `WITH claimable AS (
+             SELECT o.id, o.seq, o."tenantId", o.topic, o."aggregateId"
+               FROM "OutboxMessage" o
+              WHERE o."publishedAt" IS NULL
+                AND o."deadLetteredAt" IS NULL
+                AND (o."nextAttemptAt" IS NULL OR o."nextAttemptAt" <= now())
+                AND NOT EXISTS (
+                  SELECT 1 FROM "OutboxMessage" older
+                   WHERE older."tenantId" = o."tenantId"
+                     AND older."aggregateId" = o."aggregateId"
+                     AND older.topic = o.topic
+                     AND older.seq < o.seq
+                     AND older."publishedAt" IS NULL
+                     AND older."deadLetteredAt" IS NULL
+                     AND older."nextAttemptAt" IS NOT NULL
+                     AND older."nextAttemptAt" > now()
+                )
+              ORDER BY o.seq
+              LIMIT 100
+                FOR UPDATE SKIP LOCKED
+           )
+           SELECT id FROM claimable c
+            WHERE pg_try_advisory_xact_lock(
+                    hashtext(c."tenantId" || chr(31) || c.topic || chr(31) || c."aggregateId")::bigint
+                  )
+            ORDER BY c.seq`,
+  },
 ];
 
 async function main() {
@@ -153,17 +200,31 @@ async function main() {
           text.split('\n').map((l) => `          ${l}`).join('\n'),
     );
 
+    /**
+     * A Sort is the failure this file is named for: the index filters but
+     * does not order, so every matching row is collected and sorted before
+     * the LIMIT takes a page, and the query degrades as the backlog grows.
+     *
+     * A case may declare `outerSort` when a sort is over a set something else
+     * has already bounded. That TIGHTENS the rule rather than relaxing it:
+     * the sort must be OUTSIDE the scan that reads the table, so the scan is
+     * still ordered by the index. A Sort under the CTE still fails.
+     */
+    const scan = plan.outerSort ? text.slice(text.indexOf('CTE ')) : text;
+
     check(
-      !/\bSort\b/.test(text),
-      /\bSort\b/.test(text)
+      !/\bSort\b/.test(scan),
+      /\bSort\b/.test(scan)
         ? 'the plan contains a Sort — the index filters but does not order, so every ' +
           'matching row is collected and sorted before the LIMIT takes a page'
-        : 'no Sort: the index orders as well as filters, so the LIMIT bounds the scan',
+        : plan.outerSort
+          ? `no Sort in the scan itself; the one above it is fine because ${plan.outerSort}`
+          : 'no Sort: the index orders as well as filters, so the LIMIT bounds the scan',
     );
 
     check(
-      /Index Scan/.test(text) && !/Bitmap/.test(text),
-      /Bitmap/.test(text)
+      /Index Scan/.test(scan) && !/Bitmap/.test(scan),
+      /Bitmap/.test(scan)
         ? 'it is a Bitmap scan, which is unordered by construction'
         : 'and it is a plain ordered Index Scan',
     );
