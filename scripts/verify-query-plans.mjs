@@ -155,7 +155,7 @@ const PLANS = [
             WHERE pg_try_advisory_xact_lock(
                     hashtext(c."tenantId" || chr(31) || c.topic || chr(31) || c."aggregateId")::bigint
                   )
-            ORDER BY seq`,
+            ORDER BY c.seq`,
   },
 ];
 

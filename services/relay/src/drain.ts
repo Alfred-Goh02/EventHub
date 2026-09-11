@@ -166,7 +166,12 @@ export async function drainOnce(
         WHERE pg_try_advisory_xact_lock(
                 hashtext(c."tenantId" || chr(31) || c.topic || chr(31) || c."aggregateId")::bigint
               )
-        ORDER BY seq`,
+        -- c.seq, NOT a bare seq. A bare name in ORDER BY resolves to the
+        -- OUTPUT column first, and the output column named "seq" is
+        -- seq::text -- so a bare ORDER BY seq sorted text, and '10' comes
+        -- before '9'. Any batch straddling a power of ten went out of
+        -- order: CI caught v3 published before v2 for one event.
+        ORDER BY c.seq`,
       [opts.batchSize],
     );
 

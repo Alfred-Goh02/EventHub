@@ -354,6 +354,69 @@ async function main() {
       await poolB.end();
     }
     await cleanup(app, race);
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  and a batch goes out in NUMERIC seq order, even across a power of ten');
+    // -----------------------------------------------------------------------
+    /**
+     * The claim returns seq as text (seq::text AS "seq", since a bigint does
+     * not fit a JS number safely), and the CTE's outer query ended in a bare
+     * ORDER BY seq. Postgres resolves a bare name in ORDER BY to the OUTPUT
+     * column first -- so that sorted the text, and '10' comes before '9'.
+     *
+     * CI caught it through verify-projection-rebuild.mjs on a fresh broker:
+     *   compaction keeps v2 (p0/7) and deletes v3 (p0/1)
+     * Every other assertion here missed it. On a warm database the seq values
+     * one test seeds are consecutive and almost never straddle a digit
+     * boundary, so text order and numeric order agree by luck.
+     *
+     * EXPLICIT seq values, not a moved sequence. The first version of this case
+     * pushed the outbox sequence up to just below the next power of ten. That
+     * works once and is a landmine after: every run multiplies seq by ten, so
+     * about sixteen local runs would exhaust the bigint and break every outbox
+     * insert. Nothing is unique on seq and the claim only reads unpublished
+     * rows, so rows at 9, 10 and 11 sort ahead of anything real, always land
+     * inside the batch, and leave the sequence alone.
+     */
+    const straddle = `${run}_straddle`;
+    await app.query('BEGIN');
+    await app.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+    for (const [version, seq] of [[1, 9], [2, 10], [3, 11]]) {
+      await app.query(
+        `INSERT INTO "OutboxMessage"
+           (id, "tenantId", topic, "eventType", "schemaVersion", "aggregateId", payload, seq)
+         VALUES ($1, $2, $3, 'event.snapshot', 1, $4, $5::jsonb, $6)`,
+        [`${straddle}_v${version}`, tenantId, TOPIC, straddle, JSON.stringify({ eventId: straddle, version }), seq],
+      );
+    }
+    const { rows: seeded } = await app.query(
+      `SELECT seq::text AS s FROM "OutboxMessage" WHERE "aggregateId" = $1`,
+      [straddle],
+    );
+    await app.query('COMMIT');
+
+    /**
+     * The positive control: the rows really sit on seqs of different lengths.
+     * If the explicit values were ignored -- a column default that won, an
+     * identity column someone introduces later -- the three would be
+     * consecutive same-length numbers, text and numeric order would agree, and
+     * the assertion below would pass for exactly the reason it exists to catch.
+     */
+    const lengths = new Set(seeded.map((r) => r.s.length));
+    check(
+      seeded.length === 3 && lengths.size > 1,
+      `the three versions sit on seq ${seeded.map((r) => r.s).sort((a, b) => Number(a) - Number(b)).join(', ')}` +
+        (lengths.size > 1 ? ', across a power of ten' : ' -- NOT across a power of ten, so this proves nothing'),
+    );
+
+    const numeric = stubPublisher();
+    await drainOnce(pool, numeric.publisher, logger, opts);
+    check(
+      JSON.stringify(numeric.of(straddle)) === JSON.stringify([1, 2, 3]),
+      `published ${JSON.stringify(numeric.of(straddle))} — expected [1,2,3]; sorting seq as text gives [2,3,1]`,
+    );
+    await cleanup(app, straddle);
     await cleanup(app, `${run}_bystander`);
 
   } finally {
