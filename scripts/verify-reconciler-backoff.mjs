@@ -118,15 +118,21 @@ async function seed() {
  * a 60-second backoff look like it was eight hours in the past.
  *
  * The production code never has that problem, because its comparison
- * (nextLookupAt IS NULL OR nextLookupAt <= now()) happens entirely inside SQL.
- * The test should assert in the same frame the code decides in.
+ * (`"nextLookupAt" <= now()`) happens entirely inside SQL. The test should
+ * assert in the same frame the code decides in.
+ *
+ * That predicate used to read `nextLookupAt IS NULL OR nextLookupAt <= now()`,
+ * and this comment still quoted the old form. The column became NOT NULL with
+ * DEFAULT now() precisely to remove the OR, because a leading nullable column
+ * cannot supply ORDER BY and the reconciler's candidate query was a bitmap scan
+ * with a Sort on top as a result -- the shape verify-query-plans.mjs exists to
+ * catch.
  */
 const paymentRow = (label) =>
   tx(async () => {
     const { rows } = await app.query(
       `SELECT status,
               "lookupAttempts",
-              "nextLookupAt" IS NULL                                   AS "neverScheduled",
               "nextLookupAt" > now()                                   AS "inFuture",
               extract(epoch from ("nextLookupAt" - now()))::int         AS "secondsAway"
          FROM "Payment" WHERE id = $1`,
@@ -183,9 +189,32 @@ async function main() {
     afterFirst.lookupAttempts === 1,
     `lookupAttempts is ${afterFirst.lookupAttempts}, expected 1`,
   );
+  /**
+   * `inFuture` alone. There used to be a `!neverScheduled &&` in front of it,
+   * and that conjunct could not be false: "Payment"."nextLookupAt" is NOT NULL
+   * with DEFAULT now(), so `nextLookupAt IS NULL` is a condition the schema
+   * forbids. Demonstrated rather than reasoned about -- forcing the column to
+   * NULL to exercise that branch is refused by the database:
+   *
+   *   null value in column "nextLookupAt" of relation "Payment"
+   *   violates not-null constraint
+   *
+   * It is a leftover from when the column WAS nullable, which is the same change
+   * that let the reconciler's candidate query stop being a bitmap scan (see the
+   * header of verify-query-plans.mjs). The guard outlived the state it guarded.
+   *
+   * The message distinguishes the one failure that CAN happen. A time in the
+   * past means the row was rescheduled and the interval was not applied: a
+   * backoff of zero wearing the right shape, which reads as "scheduled" in every
+   * column but hammers the provider exactly as hard as no backoff at all.
+   */
   check(
-    !afterFirst.neverScheduled && afterFirst.inFuture,
-    `nextLookupAt is ${afterFirst.secondsAway}s in the future`,
+    afterFirst.inFuture,
+    afterFirst.inFuture
+      ? `nextLookupAt is ${afterFirst.secondsAway}s in the future`
+      : `nextLookupAt is ${Math.abs(afterFirst.secondsAway ?? 0)}s in the PAST — the row was ` +
+        'rescheduled to a moment that has already gone, so the interval was never applied and ' +
+        'the next sweep asks the provider again immediately',
   );
   check(afterFirst.status === 'UNKNOWN', `and it is still unsettled (${afterFirst.status})`);
 
