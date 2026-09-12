@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
+import { SWEEP_CLAIM_SQL } from './claim-sql.js';
 
 export interface SweepResult {
   claimed: number;
@@ -34,20 +35,9 @@ export async function sweepOnce(
     await client.query('BEGIN');
 
     /**
-     * `status = 'HELD'` is written as a LITERAL, deliberately.
-     *
-     * Reservation_sweep_idx is a partial index predicated on status = 'HELD'.
-     * Postgres can only use a partial index when it can PROVE the query implies
-     * the predicate — and with the value bound as a parameter it arrives as
-     * ('HELD'::cstring)::"ReservationStatus", which is not a constant it can
-     * fold. Measured on this database:
-     *
-     *   literal 'HELD'   -> Bitmap Index Scan on Reservation_sweep_idx
-     *   bind parameter   -> Seq Scan
-     *
-     * So the index added specifically for this query would never be used by it.
-     * The literal is safe here because it is a constant in this file, not input.
-     * The batch size stays a parameter, since it carries no predicate.
+     * The text lives in ./claim-sql.ts, because the plan checker asserts this
+     * query's shape and a hand copy of it there would assert the copy. The
+     * reason `status = 'HELD'` has to be a literal is documented with it.
      */
     const { rows: claimed } = await client.query<{
       id: string;
@@ -55,13 +45,7 @@ export async function sweepOnce(
       eventId: string;
       userId: string;
     }>(
-      `SELECT id, "tenantId", "eventId", "userId"
-         FROM "Reservation"
-        WHERE status = 'HELD'
-          AND "expiresAt" <= now()
-        ORDER BY "expiresAt"
-        LIMIT $1
-          FOR UPDATE SKIP LOCKED`,
+      SWEEP_CLAIM_SQL,
       [opts.batchSize],
     );
 

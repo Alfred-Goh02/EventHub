@@ -1,7 +1,7 @@
 /**
  * Asserts that each plan-critical query uses its index to ORDER, not merely to
- * filter -- the relay's claim, the relay's prune, and the reconciler's candidate
- * scan.
+ * filter -- the relay's claim, the relay's prune, the reconciler's candidate scan,
+ * and the hold sweeper's claim.
  *
  * An index that is "used" is not the same as an index that helps. Each of these
  * queries ends in `ORDER BY ... LIMIT n`, and there are two shapes the planner
@@ -46,6 +46,7 @@
 
 import pg from 'pg';
 import { CLAIM_SQL } from '../services/relay/dist/claim-sql.js';
+import { SWEEP_CLAIM_SQL } from '../services/ticketing/dist/sweeper/claim-sql.js';
 
 /**
  * THE ROLE MATTERS, and it is not a detail — it changes the plan.
@@ -160,6 +161,37 @@ const PLANS = [
      * describe the OUTER scan.
      */
     alsoUses: ['OutboxMessage_backoff_idx'],
+  },
+  {
+    label: 'the sweeper claiming expired seat holds',
+    url: SWEEPER,
+    role: 'eventhub_ticketing_sweeper',
+    index: 'Reservation_sweep_idx',
+    /**
+     * The fourth query with this shape, and the one nothing was checking.
+     *
+     * Reservation_sweep_idx is partial -- ON "Reservation" ("expiresAt") WHERE
+     * status = 'HELD' -- and it has to supply the ordering for the LIMIT to bound
+     * the work. Dropping the index, or ordering by anything it cannot supply,
+     * turns the sweeper into a scan-and-sort of every reservation ever made,
+     * which is the table that grows fastest here.
+     *
+     * WHAT THIS DOES NOT COVER, stated because the obvious assumption is wrong.
+     * sweep.ts writes `status = 'HELD'` as a literal rather than binding it,
+     * because a partial index is only usable when the planner can prove the query
+     * implies its predicate, and as a parameter the value arrives as
+     * ('HELD'::cstring)::"ReservationStatus", which it could not fold -- measured,
+     * at the time, as a Seq Scan. It is tempting to assume this entry guards that.
+     * It does not, and cannot: the header explains that seqscan and bitmapscan are
+     * both disabled so the question becomes a capability rather than a preference,
+     * and with them off there is no Seq Scan left to fall back TO. Checked rather
+     * than assumed -- binding the status changes nothing about this plan.
+     *
+     * So the literal is still load-bearing and still unguarded. It is guarded by
+     * the comment on it in claim-sql.ts and by nothing else.
+     */
+    sql: SWEEP_CLAIM_SQL,
+    params: [100],
   },
 ];
 
