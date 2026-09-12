@@ -48,9 +48,18 @@ const app = express();
  * `true` because `true` trusts the whole chain, and the left-hand entries of
  * X-Forwarded-For are supplied by the client.
  *
- * The per-ACCOUNT limit does not depend on any of this: it keys on
- * (tenantId, email), so a victim is protected from mail-bombing even when the IP
- * is useless. The per-IP limit is the one that stops an attacker walking a list.
+ * /forgot-password's per-ACCOUNT limit does not depend on any of this: it keys
+ * on (tenantId, email), so a victim is protected from mail-bombing even when the
+ * IP is useless. The per-IP limit is the one that stops an attacker walking a
+ * list.
+ *
+ * /login IS NOW IN THE SAME BOAT, and more sharply. The budget that refuses a
+ * password guesser is keyed on (tenantId, email, address) precisely so that
+ * spending it locks out only the address that spent it -- see the comment on
+ * loginFailuresPerAccountIp. Behind a proxy with this unset, every caller is one
+ * address, that key collapses back to (tenantId, email), and the lockout the
+ * third key exists to prevent comes straight back. Getting this setting wrong
+ * does not merely weaken a limit here; it reopens a denial of service.
  */
 const trustProxy = process.env['TRUST_PROXY'];
 if (trustProxy) {
@@ -305,14 +314,52 @@ function positiveIntEnv(name: string, fallback: number): number {
  * check made after the verify would still tell a guesser when they had hit the
  * right password; the refusal has to come first.
  *
- * The key is (tenant, submitted email) whether or not that account exists, so a
+ * The key includes the submitted email whether or not that account exists, so a
  * 429 says nothing about which addresses are registered.
  *
  * See rate-limit.ts for what this deliberately is not.
  */
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * The budget that actually refuses: per (tenant, email, ADDRESS).
+ *
+ * Keyed on the address as well as the account, because a budget keyed on the
+ * account ALONE is an attack. Anyone who knew an address could spend that
+ * account's whole budget from their own machine, and the real owner was refused
+ * for the rest of the window -- ten wrong passwords, repeated every fifteen
+ * minutes, denying service to any account whose email could be guessed. Email
+ * addresses are not secret. The limit meant to protect the account was the
+ * denial of service.
+ *
+ * With the address in the key, spending the budget only locks out the address
+ * that spent it.
+ */
+const loginFailuresPerAccountIp = createRateLimiter({
+  limit: positiveIntEnv('LOGIN_MAX_FAILURES_PER_ACCOUNT_IP', 10),
+  windowMs: LOGIN_WINDOW_MS,
+});
+
+/**
+ * And a global per-account backstop, far higher, for one password tried against
+ * one account from MANY machines -- which the per-address budget cannot see,
+ * because no single address ever reaches its own limit.
+ *
+ * It is set well above the per-address budget on purpose, and it interacts with
+ * it in the way that matters: a request the per-address budget refuses returns
+ * BEFORE anything is counted, so one attacker contributes at most their own
+ * budget's worth to this counter and then stops contributing. Exhausting this
+ * now takes LOGIN_MAX_FAILURES_PER_ACCOUNT / LOGIN_MAX_FAILURES_PER_ACCOUNT_IP
+ * distinct addresses rather than one.
+ *
+ * WHICH MEANS THE LOCKOUT IS PRICED, NOT GONE. A determined attacker with
+ * enough addresses can still deny service to one account. Raising this number
+ * raises their price and weakens the backstop against distributed guessing;
+ * lowering it does the reverse. There is no setting that does both, and
+ * pretending otherwise is how the original hole got written.
+ */
 const loginFailuresPerAccount = createRateLimiter({
-  limit: positiveIntEnv('LOGIN_MAX_FAILURES_PER_ACCOUNT', 10),
+  limit: positiveIntEnv('LOGIN_MAX_FAILURES_PER_ACCOUNT', 50),
   windowMs: LOGIN_WINDOW_MS,
 });
 
@@ -354,7 +401,18 @@ app.post('/login', ah(async (req, res) => {
   }
 
   const accountKey = `${tenantId}:${email}`;
-  const accountWait = loginFailuresPerAccount.blockedFor(accountKey);
+  const accountIpKey = `${accountKey}:${ip}`;
+  /**
+   * Whichever budget is spent, refuse -- and refuse BEFORE counting anything.
+   * That early return is what stops one address driving the global counter past
+   * its own share of it, so it is the reason a stranger can no longer lock an
+   * account out. The longer of the two waits, because coming back earlier than
+   * that would just be refused again.
+   */
+  const accountWait = Math.max(
+    loginFailuresPerAccountIp.blockedFor(accountIpKey),
+    loginFailuresPerAccount.blockedFor(accountKey),
+  );
   if (accountWait > 0) {
     // tenantId only: the email is personal data, and the key already says
     // everything an operator needs -- one account is being hammered.
@@ -399,11 +457,19 @@ app.post('/login', ah(async (req, res) => {
 
   if (!user || !valid) {
     // Counted whether or not the account exists, so the budget runs out on the
-    // same attempt for a real address and an invented one.
+    // same attempt for a real address and an invented one. Both budgets, since
+    // either one alone leaves the other unbounded.
+    loginFailuresPerAccountIp.hit(accountIpKey);
     loginFailuresPerAccount.hit(accountKey);
     return res.status(401).json({ error: 'invalid credentials' });
   }
 
+  /**
+   * Only THIS address's failures are forgiven, plus the account's global count.
+   * An attacker's own spent budget stays spent: they are a different key, and
+   * the owner signing in is no reason to hand them a fresh allowance.
+   */
+  loginFailuresPerAccountIp.reset(accountIpKey);
   loginFailuresPerAccount.reset(accountKey);
 
   const accessToken = await signAccessToken(user.id, tenantId, user.role);

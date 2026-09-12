@@ -496,14 +496,25 @@ jobs:
 
       # /login had no rate limit: 25 wrong passwords gave 25 x 401 and never a
       # 429 -- unbounded guessing, with every guess costing the server an
-      # argon2id verify. Now per ACCOUNT (failures only, checked before the
-      # verify, cleared on success) and per ADDRESS (every attempt).
+      # argon2id verify.
       #
-      # The verifier starts its OWN auth instances on ports 3097 and 3096 with
-      # tiny limits, because the limiter is per-process memory: exhausting the
-      # budget on the shared :3001 instance would lock every later step that
-      # logs in from localhost -- the lockout #30 already fixed once.
-      - name: Assert /login stops a guesser without revealing which accounts exist
+      # Three budgets now, and the first one is the one that refuses: failures
+      # for one account FROM ONE ADDRESS. Keying the refusing budget on the
+      # account alone was itself an attack -- anyone who knew an address could
+      # spend that account's budget from their own machine and the owner was
+      # locked out, which is a denial of service against any address an attacker
+      # can guess. The per-account budget survives as a far higher backstop
+      # against one password tried from many machines, and the per-address
+      # budget bounds total argon2 work. Failures only, checked before the
+      # password is verified, both cleared on a successful sign-in.
+      #
+      # The verifier starts its OWN auth instances on ports 3097, 3096 and 3095
+      # with tiny limits, because the limiter is per-process memory: exhausting
+      # the budget on the shared :3001 instance would lock every later step that
+      # logs in from localhost -- the lockout #30 already fixed once. The third
+      # runs with TRUST_PROXY=1, which is the only way a test can present itself
+      # as two different clients.
+      - name: Assert /login stops a guesser without locking out the account's owner
         run: node scripts/verify-login-rate-limit.mjs
 
       # The dev token sink writes live invite and password-reset credentials to
