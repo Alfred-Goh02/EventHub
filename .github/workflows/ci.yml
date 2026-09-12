@@ -546,23 +546,30 @@ jobs:
       # works AND that the handler is not also writing locally, which would give
       # everyone on the posting pod two copies of everything.
       - name: Assert a question crosses between Live pods, and only within its tenant
-        env:
-          APP_DATABASE_URL: ${{ env.LIVE_APP_DATABASE_URL }}
-          REDIS_URL: redis://127.0.0.1:6379
-          # Live produces live.interactions. Its env schema requires this even
-          # though this test never asserts on the topic -- fail-fast at startup
-          # is the point, and the first run without it said exactly that:
-          # "Invalid live-service environment: KAFKA_BROKERS: Required".
-          KAFKA_BROKERS: localhost:9092
-          ALLOWED_ORIGIN_SUFFIX: .eventhub.local
         run: |
           (cd services/auth && node dist/index.js &)
           for i in $(seq 1 25); do
             if curl -sf http://localhost:3001/health >/dev/null; then break; fi
             sleep 1
           done
-          export AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
-          node scripts/verify-live-fanout.mjs
+
+          # LIVE'S ENV GOES ON THE VERIFIER, NOT ON THE STEP.
+          #
+          # A step-level `env:` block applies to everything the step runs --
+          # including the Auth service started above. Putting
+          # APP_DATABASE_URL=<live> there pointed Auth at eventhub_live, and it
+          # answered /login with
+          #
+          #   The table `public.User` does not exist in the current database.
+          #
+          # Scoped to this one command, the pods the verifier spawns inherit it
+          # and Auth keeps the job's own.
+          #
+          # KAFKA_BROKERS is required by Live's env schema even though this test
+          # asserts nothing about the topic: fail-fast at startup is the point,
+          # and the run without it said exactly "KAFKA_BROKERS: Required".
+          APP_DATABASE_URL="${{ env.LIVE_APP_DATABASE_URL }}"           REDIS_URL="redis://127.0.0.1:6379"           KAFKA_BROKERS="localhost:9092"           ALLOWED_ORIGIN_SUFFIX=".eventhub.local"           AUTH_PUBLIC_KEY_B64="$(base64 -w0 services/auth/keys/public.pem)"             node scripts/verify-live-fanout.mjs
+
           pkill -f "node dist/index.js" || true
 
       # The password reset flow, including the failure that returns success.
