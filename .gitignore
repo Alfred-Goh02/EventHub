@@ -12,9 +12,20 @@ build/
 **/src/generated/
 
 # Environment files — these hold database credentials
+#
+# The negation has to cover the same family the rule above it does. `.env.*`
+# ignores `.env.ticketing.example` as readily as `.env.ticketing`, and
+# `!.env.example` only rescues the exact name — so an example file for any
+# variant is silently untracked, and the person who wrote it has no reason to
+# look. Nothing depends on that today; the trap is that `git add` would appear
+# to work and commit nothing.
+#
+# Same shape as the .dockerignore bug this PR fixes, which is why both are here:
+# a rule matching one exact name where the repository has a family.
 .env
 .env.*
 !.env.example
+!.env.*.example
 
 # JWT signing keys — NEVER commit these
 **/keys/
