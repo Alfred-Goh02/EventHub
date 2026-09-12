@@ -88,6 +88,69 @@ all six directions that no service can even open a connection to another's.
 
 ## Running it
 
+Two ways. The first needs nothing installed but Docker and is how to see the
+system work; the second is how to develop on it.
+
+### Everything in containers, one command
+
+```bash
+docker compose up -d --wait
+```
+
+That builds one image, shared by all four services, and then:
+
+1. waits for Postgres, Kafka and the Schema Registry to pass their healthchecks
+2. runs a `setup` container that migrates all three databases, seeds Auth,
+   creates the Kafka topics, registers the Avro schemas, and generates a signing
+   keypair into a volume
+3. and only then starts Auth, Event, Ticketing and the outbox relay
+
+`--wait` returns when every container is **healthy**, so a zero exit status means
+the system is up rather than merely that the containers were created.
+
+| Service   | URL                     |
+| --------- | ----------------------- |
+| Auth      | `http://localhost:3001` |
+| Event     | `http://localhost:3002` |
+| Ticketing | `http://localhost:3003` |
+| Relay     | `http://localhost:3010/metrics` |
+
+Proof that it is working end to end, rather than just listening — sign in as the
+seeded admin, create an event through one service, and read it back out of
+another service's Kafka-fed projection:
+
+```bash
+TOKEN=$(curl -sf -X POST http://localhost:3001/login \
+  -H 'Content-Type: application/json' -H 'X-Tenant-ID: tenant_acme' \
+  -d '{"email":"alice@acme.com","password":"hunter2222"}' \
+  | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+
+curl -sf -X POST http://localhost:3002/events \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: tenant_acme' \
+  -d '{"title":"Smoke","capacity":42,"startsAt":"2027-11-01T10:00:00Z","endsAt":"2027-11-01T18:00:00Z"}'
+
+docker exec eventhub-postgres psql -U eventhub -d eventhub_ticketing \
+  -c 'SELECT title, status, capacity FROM "EventProjection"'
+```
+
+The last command reading back a row is the interesting part: it means Event wrote
+an outbox row, the relay claimed it and resolved its Avro schema, Kafka carried
+it, and Ticketing's consumer projected it. Four containers and a broker, not one
+request.
+
+`setup` runs to completion and exits, and every service waits on
+`service_completed_successfully`, so a failed migration stops the start rather
+than leaving four containers that are up and broken. Re-running is safe: an
+existing keypair is kept rather than rotated — rotating it would invalidate every
+token already issued — and the migrations, topic creation and schema
+registrations are each idempotent.
+
+`docker compose down` stops it. Add `-v` to discard the databases and the
+keypair too.
+
+### Developing on it, with the services on your host
+
 Node is pinned in `.nvmrc` and CI reads the version from that same file, so there
 is one place to change it. `pnpm` is pinned via `packageManager`.
 
@@ -95,11 +158,13 @@ is one place to change it. `pnpm` is pinned via `packageManager`.
 pnpm install && pnpm build
 ```
 
-Bring up Postgres, Kafka and Schema Registry. `--wait` blocks until every
-healthcheck passes, so nothing below races a half-started broker:
+Bring up only the infrastructure, naming the three containers so the application
+services stay down and the ports stay free for the ones you run yourself.
+`--wait` blocks until every healthcheck passes, so nothing below races a
+half-started broker:
 
 ```bash
-docker compose up -d --wait
+docker compose up -d --wait postgres kafka schema-registry
 ```
 
 The Postgres container creates all three databases and their roles on first boot
@@ -163,9 +228,18 @@ node services/auth/scripts/generate-keys.mjs
 Keys are gitignored. Never reuse a real signing key here — anything in a build
 environment is readable by anything else running there.
 
-**`.github/workflows/ci.yml` is the authoritative setup.** It runs the same
-`docker-compose.yml` a laptop does, from the same file with the same config, so
-the two cannot drift. If anything above disagrees with it, believe the workflow.
+**`.github/workflows/ci.yml` is the authoritative setup for this second path.**
+It brings up the same `docker-compose.yml` a laptop does — naming the same three
+infrastructure services, with the same healthchecks and the same config — and
+then runs the application services from the working tree exactly as the steps
+above do. So the two cannot drift. If anything in this section disagrees with the
+workflow, believe the workflow.
+
+CI deliberately does **not** exercise the container path. It builds from the
+working tree, so running an image built from that same tree would add a build and
+verify the same code twice; and a bare `docker compose up -d --wait` would start
+the application containers on 3001–3003, which is where CI starts its own. The
+container path is a way to run the system, not a second thing to test.
 
 That sentence was doing more work than it should have. The instructions above
 used to migrate one service of three and never mention topics or schemas at all,

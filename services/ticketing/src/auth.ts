@@ -10,20 +10,26 @@
 import type { RequestHandler } from 'express';
 import {
   createRequireAuth,
-  publicKeyFromBase64,
+  publicKeyFromEnv,
   requireRole,
 } from '@eventhub/auth-middleware';
 
-const publicKeyB64 = process.env['AUTH_PUBLIC_KEY_B64'];
 const issuer = process.env['JWT_ISSUER'];
 const audience = process.env['JWT_AUDIENCE'];
 
-if (!publicKeyB64 || !issuer || !audience) {
-  throw new Error('AUTH_PUBLIC_KEY_B64, JWT_ISSUER and JWT_AUDIENCE are required');
+if (!issuer || !audience) {
+  throw new Error('JWT_ISSUER and JWT_AUDIENCE are required');
 }
 
+/**
+ * publicKeyFromEnv rather than reading AUTH_PUBLIC_KEY_B64 here, because there
+ * are now two ways the key arrives and only one of them is an environment value.
+ * Under docker compose the keypair does not exist until a setup step generates
+ * it into a shared volume, so this service is given a PATH instead -- see that
+ * function for why both exist and why setting both is refused.
+ */
 export const requireAuth: RequestHandler = createRequireAuth({
-  publicKey: await publicKeyFromBase64(publicKeyB64),
+  publicKey: await publicKeyFromEnv(),
   issuer,
   audience,
 });

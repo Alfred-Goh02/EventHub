@@ -1,3 +1,28 @@
+# What every application container shares.
+#
+# Defined here rather than repeated five times, and defined ABOVE services
+# because a YAML anchor has to exist before it is referenced.
+#
+# ONE IMAGE, FIVE COMMANDS. All of them name the same `image:` and the same
+# `build:`, so compose builds it once and the other four reuse it. Give them
+# different image names and you get four builds of the same lockfile.
+x-app: &app
+  image: eventhub/app:local
+  build:
+    context: .
+  restart: unless-stopped
+  environment: &app-env
+    NODE_ENV: development
+    LOG_LEVEL: info
+    # Inside the network the broker is kafka:29092, not localhost:9092. See the
+    # long note on KAFKA_ADVERTISED_LISTENERS below: the host port exists for
+    # tools running on Windows, and a container that used it would fetch metadata
+    # and then fail to resolve a name that means nothing here.
+    KAFKA_BROKERS: kafka:29092
+    SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    JWT_ISSUER: https://auth.eventhub.local
+    JWT_AUDIENCE: eventhub-api
+
 services:
   postgres:
     image: postgres:16
@@ -115,6 +140,206 @@ services:
       retries: 12
       start_period: 20s
 
+  # ---------------------------------------------------------------------------
+  # Everything that has to happen once before any service can serve a request.
+  #
+  # This exists because "docker compose up" was previously only half of a start.
+  # The infrastructure came up and then a reader had to run seven commands by
+  # hand -- three migrations, a seed, the topics, the schemas, and a keypair --
+  # none of which fail loudly when skipped. A missing topic surfaces as
+  # "This server does not host this topic-partition" from the relay's first
+  # publish, which names neither the topic nor the thing that would create it.
+  #
+  # IT RUNS TO COMPLETION AND EXITS, and the services below wait on
+  # service_completed_successfully. So a failed migration stops the start instead
+  # of producing four containers that are up and broken. `restart: "no"` because
+  # a setup step that restarts forever on a bad migration is a hang, not a retry.
+  # ---------------------------------------------------------------------------
+  setup:
+    <<: *app
+    container_name: eventhub-setup
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      # One per service, because `prisma migrate deploy` reads DATABASE_URL and
+      # each service owns a different database. They are passed under distinct
+      # names and assigned per command below, rather than hoping three migrations
+      # can share one variable.
+      AUTH_DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
+      EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
+      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
+    volumes:
+      - jwt-keys:/app/services/auth/keys
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+
+        # ONLY IF ABSENT. Regenerating on every `up` would invalidate every
+        # token already issued, so a running demo would start answering 401 for
+        # no visible reason.
+        if [ -f /app/services/auth/keys/private.pem ]; then
+          echo "setup: signing keypair already present, keeping it"
+        else
+          echo "setup: generating the JWT signing keypair"
+          cd /app/services/auth && node scripts/generate-keys.mjs && cd /app
+        fi
+
+        echo "setup: migrating auth"
+        DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma migrate deploy
+        echo "setup: migrating event"
+        DATABASE_URL="$$EVENT_DATABASE_URL" pnpm --filter @eventhub/event exec prisma migrate deploy
+        echo "setup: migrating ticketing"
+        DATABASE_URL="$$TICKETING_DATABASE_URL" pnpm --filter @eventhub/ticketing exec prisma migrate deploy
+
+        # Auth only. Every service's prisma.config.ts declares the same seed
+        # command and only Auth has the file, so running this against the others
+        # dies on a missing module.
+        echo "setup: seeding auth"
+        DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma db seed
+
+        # Not optional: the broker runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+        # on purpose, so nothing will create these on first publish.
+        echo "setup: creating topics"
+        node scripts/create-topics.mjs
+        echo "setup: registering Avro schemas"
+        node scripts/register-schemas.mjs
+
+        echo "setup: done"
+
+  auth:
+    <<: *app
+    container_name: eventhub-auth
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3001:3001"
+    environment:
+      <<: *app-env
+      PORT: 3001
+      DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
+      APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@postgres:5432/eventhub_auth
+    volumes:
+      # The only container that gets the PRIVATE key, because it is the only one
+      # that signs. jwt.ts resolves keys/ relative to its own file, so the mount
+      # point is fixed by dist/ sitting one level below it.
+      - jwt-keys:/app/services/auth/keys:ro
+    working_dir: /app/services/auth
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  event:
+    <<: *app
+    container_name: eventhub-event
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3002:3002"
+    environment:
+      <<: *app-env
+      PORT: 3002
+      DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
+      APP_DATABASE_URL: postgresql://eventhub_event_app:eventhub_event_app@postgres:5432/eventhub_event
+      # The PUBLIC key, as a path rather than a value. The keypair does not exist
+      # until setup has run, and compose cannot put a value one container
+      # produced into another container's environment -- a shared volume is the
+      # only thing both can see. publicKeyFromEnv takes either form.
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+    volumes:
+      - jwt-keys:/run/eventhub/keys:ro
+    working_dir: /app/services/event
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3002/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  ticketing:
+    <<: *app
+    container_name: eventhub-ticketing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3003:3003"
+    environment:
+      <<: *app-env
+      PORT: 3003
+      DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
+      APP_DATABASE_URL: postgresql://eventhub_ticketing_app:eventhub_ticketing_app@postgres:5432/eventhub_ticketing
+      # A third role, with its own narrow grants: the sweeper and reconciler run
+      # inside this process and must not inherit the API's permissions.
+      SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
+      SWEEPER_BATCH_SIZE: 100
+      SWEEPER_INTERVAL_MS: 5000
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      # Local only, and the same value the .env.example carries. A real secret
+      # would come from the environment, never from a committed file.
+      PAYMENT_WEBHOOK_SECRET: dev_webhook_secret
+    volumes:
+      - jwt-keys:/run/eventhub/keys:ro
+    working_dir: /app/services/ticketing
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3003/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # The outbox relay. No HTTP API and no public key: it reads committed rows and
+  # publishes them, so it needs neither to verify a caller nor to sign anything.
+  #
+  # Its own database role, which can read the outbox and mark rows published and
+  # cannot touch the Event tables. That is the point of a separate credential.
+  # ---------------------------------------------------------------------------
+  relay:
+    <<: *app
+    container_name: eventhub-relay
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3010:3010"
+    environment:
+      <<: *app-env
+      RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@postgres:5432/eventhub_event
+      RELAY_METRICS_PORT: 3010
+      RELAY_BATCH_SIZE: 100
+      RELAY_POLL_INTERVAL_MS: 1000
+      RELAY_MAX_ATTEMPTS: 5
+    working_dir: /app/services/relay
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      # /metrics is the only route it serves, and answering it means the process
+      # is up AND its database connection works -- the endpoint runs a query.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3010/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
 volumes:
   postgres-data:
   kafka-data:
+  # The JWT keypair, generated once by setup. A volume rather than a bind mount
+  # so it never lands in the working tree, and never in an image layer.
+  jwt-keys:

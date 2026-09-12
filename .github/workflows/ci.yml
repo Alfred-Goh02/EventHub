@@ -134,8 +134,19 @@ jobs:
       # The Postgres bootstrap runs itself here, through the image's
       # /docker-entrypoint-initdb.d hook — the same path as a fresh laptop.
       # Its volume is empty on a runner, so it always fires.
+      # NAMED SERVICES, not the whole file. docker-compose.yml also defines the
+      # four application services and a setup container now, and a bare
+      # `docker compose up -d --wait` would start those too -- then bind 3001,
+      # 3002 and 3003, which is exactly where this job starts its own processes
+      # from `node dist/index.js`. The second binder loses, and the error names a
+      # port rather than the cause.
+      #
+      # This job wants the infrastructure and its own natively-run services: it
+      # builds from the working tree, so testing a container image built from the
+      # same tree would add a build and verify the same code twice. The compose
+      # application path is a way to RUN the system, not a second thing to test.
       - name: Start infrastructure
-        run: docker compose up -d --wait
+        run: docker compose up -d --wait postgres kafka schema-registry
 
       - name: Show what came up
         run: docker compose ps
@@ -1434,3 +1445,102 @@ jobs:
           psql "$TICKETING_APP_DATABASE_URL" -tAc 'SELECT 1' >/dev/null \
             || { echo "TICKETING_APP_DATABASE_URL does not reach its own database"; exit 1; }
           echo "  connected via TICKETING_APP_DATABASE_URL"
+
+  # ===========================================================================
+  # The README's headline claim, asserted.
+  # ===========================================================================
+  #
+  # "docker compose up -d --wait and the whole system is running" is the first
+  # thing the README promises and was the one claim nothing checked. The `build`
+  # job above deliberately does not: it runs the services natively from the
+  # working tree, so it never builds the image and never starts the application
+  # containers.
+  #
+  # Which means the Dockerfile, the setup container and the compose wiring could
+  # all break without a single red build, and the failure would land on whoever
+  # cloned the repository to look at it. A separate job, in parallel, so it costs
+  # wall-clock time rather than blocking anything.
+  compose:
+    name: the one-command start actually starts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole file this time, not a named subset. --wait returns only when
+      # every container is HEALTHY, so this step passing is already the claim:
+      # a non-zero exit means the one-command start does not work.
+      - name: docker compose up -d --wait
+        run: docker compose up -d --wait --wait-timeout 600
+
+      - name: Show what came up
+        if: always()
+        run: docker compose ps
+
+      # Healthy is not the same as working. Every assertion below crosses a
+      # container boundary that a healthcheck cannot see.
+      - name: Prove it works end to end
+        run: |
+          set -euo pipefail
+
+          # Auth signs with the private key the setup container generated into a
+          # volume. If that volume wiring were wrong, auth would not have started.
+          TOKEN=$(curl -sf -X POST http://localhost:3001/login \
+            -H 'Content-Type: application/json' -H 'X-Tenant-ID: tenant_acme' \
+            -d '{"email":"alice@acme.com","password":"hunter2222"}' \
+            | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+          test -n "$TOKEN" || { echo "no token: the seed or the signing key did not survive setup"; exit 1; }
+          echo "  signed in as the seeded admin"
+
+          # THE CROSS-SERVICE ASSERTION. Event holds no private key; it verifies
+          # this token with the PUBLIC half, read from the shared volume via
+          # AUTH_PUBLIC_KEY_FILE. A 201 here is the only proof that path works,
+          # and it is a path the native CI job never takes -- it passes the key as
+          # a base64 environment value instead.
+          CREATED=$(curl -sf -X POST http://localhost:3002/events \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -H 'X-Tenant-ID: tenant_acme' \
+            -d '{"title":"Compose CI","capacity":42,"startsAt":"2027-11-01T10:00:00Z","endsAt":"2027-11-01T18:00:00Z"}')
+          echo "  Event accepted a token it can verify but cannot mint"
+
+          # AND THE ASYNCHRONOUS PATH. Event wrote an outbox row; the relay has to
+          # claim it, resolve its Avro schema from the registry, and publish to
+          # Kafka; Ticketing's consumer has to project it. Polled, because none of
+          # that is synchronous with the request above.
+          for i in $(seq 1 30); do
+            FOUND=$(docker exec eventhub-postgres psql -U eventhub -d eventhub_ticketing -tAc \
+              "SELECT count(*) FROM \"EventProjection\" WHERE title = 'Compose CI'")
+            if [ "$FOUND" = "1" ]; then
+              echo "  Ticketing projected it after ${i}s — outbox, relay, Avro, Kafka and consumer all worked"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "the event never reached Ticketing's projection."
+          echo "Event wrote it, so the break is in the relay, the registry or the consumer:"
+          docker compose logs relay ticketing --tail 60
+          exit 1
+
+      # Re-running must be safe, because a reader will do it. The keypair
+      # specifically: regenerating it would invalidate every token already
+      # issued, and the symptom is a 401 with no explanation.
+      - name: And running it again changes nothing
+        run: |
+          set -euo pipefail
+          BEFORE=$(docker compose exec -T auth sha256sum keys/public.pem | cut -d' ' -f1)
+          docker compose up -d --wait --wait-timeout 600
+          AFTER=$(docker compose exec -T auth sha256sum keys/public.pem | cut -d' ' -f1)
+          test "$BEFORE" = "$AFTER" \
+            || { echo "the signing keypair was rotated by a second up; every issued token just died"; exit 1; }
+          echo "  the keypair survived a second up ($BEFORE)"
+
+          curl -sf http://localhost:3001/health >/dev/null
+          curl -sf http://localhost:3002/health >/dev/null
+          curl -sf http://localhost:3003/health >/dev/null
+          curl -sf http://localhost:3010/metrics >/dev/null
+          echo "  all four services still answering"
+
+      - name: Logs
+        if: failure()
+        run: docker compose logs --tail 120

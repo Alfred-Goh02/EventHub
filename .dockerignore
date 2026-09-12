@@ -1,0 +1,29 @@
+# Everything here either does not belong in an image or would actively break it.
+
+# Installed inside the image for the image's own platform. Copying the host's
+# would ship Windows binaries to a Linux container -- @node-rs/argon2 is a native
+# module, and it would fail at require() time, not at build time.
+node_modules
+**/node_modules
+
+# Built inside the image. A stale host build copied in would silently win over
+# the one the image makes.
+dist
+**/dist
+.turbo
+**/.turbo
+
+# GENERATED PRISMA CLIENT. Regenerated during the build; copying it in risks
+# shipping output from a schema that has since changed.
+services/*/src/generated
+
+# SECRETS AND LOCAL STATE. keys/ holds the JWT signing key, which the compose
+# setup step generates into a volume instead -- baking one into an image would
+# put a private key in every layer anyone can pull.
+**/keys
+**/.env
+**/.env.local
+
+.git
+.github
+*.log

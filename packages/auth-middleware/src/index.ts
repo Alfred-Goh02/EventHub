@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { isRole, type Role } from '@eventhub/types';
 import { importSPKI, jwtVerify, type CryptoKey } from 'jose';
@@ -69,6 +70,50 @@ export interface AuthContext {
  */
 export async function publicKeyFromBase64(b64: string): Promise<CryptoKey> {
   return importSPKI(Buffer.from(b64, 'base64').toString('utf8'), ALG);
+}
+
+/**
+ * Auth's public key from the environment, as either a base64 value or a path.
+ *
+ * TWO WAYS BECAUSE THERE ARE TWO SITUATIONS, not because one is a fallback.
+ *
+ *   AUTH_PUBLIC_KEY_B64   the key itself. How a deployment injects it, and what
+ *                         CI and a laptop use: one value, no shared filesystem.
+ *   AUTH_PUBLIC_KEY_FILE  a path to the PEM. What docker compose uses, because
+ *                         the keypair does not exist until a setup step has
+ *                         generated it, and compose cannot put a value produced
+ *                         by one container into another container's environment.
+ *                         A shared volume is the only thing both can see.
+ *
+ * Exactly one, and it REFUSES when both are set rather than silently preferring
+ * either. Two sources of the verifying key that disagree is a service that
+ * accepts tokens the operator thinks it rejects, and the failure would surface
+ * as a 401 nobody can explain.
+ *
+ * Throws rather than returning undefined. A service that cannot verify a token
+ * must not start: with no key it would either reject every request or, far
+ * worse, be edited later into treating an absent key as "skip verification".
+ */
+export async function publicKeyFromEnv(env = process.env): Promise<CryptoKey> {
+  const b64 = env['AUTH_PUBLIC_KEY_B64'];
+  const file = env['AUTH_PUBLIC_KEY_FILE'];
+
+  if (b64 && file) {
+    throw new Error(
+      'AUTH_PUBLIC_KEY_B64 and AUTH_PUBLIC_KEY_FILE are both set. Set exactly one: two ' +
+        'sources for the verifying key can disagree, and the symptom is a 401 with no ' +
+        'explanation.',
+    );
+  }
+  if (b64) return publicKeyFromBase64(b64);
+  if (file) {
+    const pem = await readFile(file, 'utf8');
+    return importSPKI(pem, ALG);
+  }
+  throw new Error(
+    'AUTH_PUBLIC_KEY_B64 or AUTH_PUBLIC_KEY_FILE is required. Without Auth\'s public key this ' +
+      'service cannot tell a genuine token from a forged one.',
+  );
 }
 
 export interface RequireAuthOptions {
