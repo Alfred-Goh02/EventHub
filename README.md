@@ -81,10 +81,89 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Three databases and nine roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 13 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 43 executable proofs of the invariants above |
 
 Three separate Postgres databases with their own credentials. CI asserts across
 all six directions that no service can even open a connection to another's.
+
+## How it fits together
+
+```mermaid
+flowchart TB
+  subgraph AUTHSVC["Auth · :3001"]
+    AUTH["Invite-only registration<br/>argon2id · RS256 · refresh rotation"]
+  end
+
+  subgraph EVENTSVC["Event · :3002"]
+    EVENT["Events CRUD<br/>row + outbox in ONE transaction"]
+  end
+
+  subgraph RELAYSVC["Relay"]
+    RELAY["Drains the outbox<br/>one aggregate at a time, in order"]
+  end
+
+  subgraph TKTSVC["Ticketing · :3003"]
+    TKT["Reservations · payments · webhook"]
+    PROJ["Projection consumer"]
+    SWEEP["Sweeper<br/>releases expired holds"]
+    RECON["Reconciler<br/>resolves UNKNOWN charges"]
+  end
+
+  CLIENT(["Client"])
+  DBAUTH[("eventhub_auth")]
+  DBEVENT[("eventhub_event<br/>Event + OutboxMessage")]
+  DBTKT[("eventhub_ticketing<br/>Reservation + Payment + EventProjection")]
+  KAFKA[["Kafka · events.activity<br/>compacted, keyed by event id"]]
+  REGISTRY[["Schema Registry"]]
+  PROVIDER[["Payment provider"]]
+
+  CLIENT -->|"POST /login"| AUTH
+  CLIENT -->|"bearer token"| EVENT
+  CLIENT -->|"bearer token"| TKT
+
+  AUTH -.->|"public key only"| EVENT
+  AUTH -.->|"public key only"| TKT
+
+  AUTH --> DBAUTH
+  EVENT --> DBEVENT
+  TKT --> DBTKT
+  PROJ --> DBTKT
+  SWEEP --> DBTKT
+  RECON --> DBTKT
+
+  DBEVENT -->|"FOR UPDATE SKIP LOCKED"| RELAY
+  RELAY -->|"resolves the subject"| REGISTRY
+  RELAY -->|"Avro"| KAFKA
+  KAFKA --> PROJ
+
+  RECON -->|"asks, never guesses"| PROVIDER
+  PROVIDER -->|"signed webhook"| TKT
+```
+
+**The dotted lines are not calls.** Auth is the only service holding a private
+key; Event and Ticketing hold only the public half, so they can prove a token is
+genuine and cannot mint one. A compromise of either grants no ability to forge an
+identity, which is the whole reason for RS256 rather than a shared secret.
+
+**The solid line that matters most is `DBEVENT → RELAY`.** Event never publishes
+to Kafka. It writes the event row and an outbox row in one transaction, so there
+is no window where the row exists and the message does not, or the reverse — the
+failure every "save, then publish" design has. The relay is what turns those
+committed rows into messages, and everything hard about this repository lives in
+that hop: ordering per aggregate, at-least-once delivery, retries with backoff,
+poison rows that must dead-letter rather than block their aggregate for ever.
+
+**And `KAFKA → PROJ` is the price of database-per-service.** Ticketing cannot
+join to Event's tables — `CONNECT` is revoked, so it genuinely cannot reach them —
+so it subscribes and maintains its own projection. That buys isolation and costs
+at-least-once delivery, out-of-order arrival and the need to dedupe, which is why
+the projection carries a source version and refuses to go backwards.
+
+The topic is **compacted**, so Kafka keeps only the last message per key. That
+makes the ordering above load-bearing in a way that is easy to miss: publish v3
+before v2 and compaction keeps v2, so a rebuild from the topic reconstructs the
+wrong state — permanently, and silently. `scripts/verify-projection-rebuild.mjs`
+is what holds that line.
 
 ## Running it
 
