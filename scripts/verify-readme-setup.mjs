@@ -121,7 +121,11 @@ function main() {
   for (const service of migrated) {
     // Named as a workspace filter or as a directory. Either is an instruction a
     // reader can follow; a bare mention of the word elsewhere is not.
-    const named = new RegExp(`(@eventhub/|services/)${service}(?![\w-])`);
+    //
+    // String.raw, because a plain template literal ate the backslash: `\w` in
+    // one is just `w`, so the lookahead was (?![w-]) and a command filtering
+    // @eventhub/events counted as migrating `event`.
+    const named = new RegExp(String.raw`(@eventhub/|services/)${service}(?![\w-])`);
     const documented = migrateCommands.some((c) => named.test(c));
     check(
       documented,
