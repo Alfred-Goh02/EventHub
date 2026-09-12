@@ -13,9 +13,12 @@
  * private instances on their own ports with deliberately small limits, and the
  * lockouts it provokes die with those processes.
  *
- * Two instances, because the two limits have to be tested apart: the
- * per-account cases need a per-IP budget too large to interfere, and the
- * per-IP case needs a per-account budget too large to interfere.
+ * Three instances, because the three budgets have to be tested apart: each case
+ * needs the budgets it is not testing set far too large to interfere. The third
+ * also runs with TRUST_PROXY=1, which is the only way a test can present itself
+ * as two different clients -- without it X-Forwarded-For is ignored, every
+ * request shares the socket address, and the lockout case cannot be written at
+ * all.
  *
  * Run: node scripts/verify-login-rate-limit.mjs
  */
@@ -31,6 +34,14 @@ const REAL = { email: 'alice@acme.com', password: 'hunter2222' };
 const MAX_FAILURES = 3;
 const MAX_PER_IP = 4;
 
+/**
+ * For the lockout case, which needs the two per-account limits set APART: a
+ * small per-(account, address) budget, and a global per-account budget well
+ * above it. See lockoutCase for why those particular numbers.
+ */
+const LOCKOUT_PER_IP = 3;
+const LOCKOUT_GLOBAL = 10;
+
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
@@ -40,11 +51,21 @@ function check(ok, msg) {
 /** An address that exists nowhere, fresh per run so nothing carries over. */
 const invented = (label) => `${label}-${randomBytes(4).toString('hex')}@nowhere.example`;
 
+/**
+ * `ip` is sent as X-Forwarded-For, which only means anything on an instance
+ * started with TRUST_PROXY=1. On the other instances it is ignored, which is
+ * exactly right: without TRUST_PROXY a client cannot choose its own address,
+ * and a test that could would be testing nothing.
+ */
 function client(port) {
-  return async function login(email, password, tenant = TENANT) {
+  return async function login(email, password, tenant = TENANT, ip) {
     const res = await fetch(`http://localhost:${port}/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': tenant },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tenant-ID': tenant,
+        ...(ip ? { 'X-Forwarded-For': ip } : {}),
+      },
       body: JSON.stringify({ email, password }),
     });
     return { status: res.status, retryAfter: res.headers.get('retry-after'), body: await res.text() };
@@ -259,9 +280,166 @@ async function perIpCase() {
   }
 }
 
+/**
+ * Asserts that a stranger cannot lock a victim out of their own account.
+ *
+ * THE HOLE THIS CLOSES. With one global per-account limit and nothing else,
+ * anyone who knows an address could spend that account's whole budget from
+ * their own machine and the real owner was refused for the rest of the window.
+ * Ten wrong passwords, repeated every fifteen minutes, denied service to any
+ * account whose email address the attacker could guess -- and email addresses
+ * are not secret. The limit meant to protect the account was the attack.
+ *
+ * THE FIX IS WHERE THE COUNTING HAPPENS. The budget that actually refuses is
+ * now keyed on (tenant, email, ADDRESS), so spending it only locks out the
+ * address that spent it. The global per-account budget stays as the backstop
+ * against one password tried from many machines, but it is set far higher,
+ * and -- this is the part that matters -- a request refused by the per-address
+ * budget returns BEFORE anything is counted. So one attacker can no longer
+ * drive the global counter up at all: they contribute their per-address
+ * budget's worth and then stop counting.
+ *
+ * WHY THESE NUMBERS MAKE THE TEST FAIL BEFORE THE FIX. The attacker sends
+ * LOCKOUT_GLOBAL failures, which is exactly what the single old limit allowed,
+ * so before the fix the victim's next attempt was a 429 and the assertion
+ * below was red. After the fix the attacker is cut off at LOCKOUT_PER_IP, the
+ * global counter never passes 3 of its 10, and the victim gets in.
+ */
+async function lockoutCase() {
+  const port = 3095;
+  const auth = await startAuth(port, {
+    LOGIN_MAX_FAILURES_PER_ACCOUNT: String(LOCKOUT_GLOBAL),
+    LOGIN_MAX_FAILURES_PER_ACCOUNT_IP: String(LOCKOUT_PER_IP),
+    // Out of the way: this case is about the per-account budgets, and the
+    // attacker's addresses each send few enough requests to stay well inside
+    // the overall per-address cap anyway.
+    LOGIN_MAX_ATTEMPTS_PER_IP: '1000',
+    // Without this, every request shares the socket address and the whole case
+    // is untestable -- X-Forwarded-For is only honoured behind a declared proxy.
+    TRUST_PROXY: '1',
+  });
+  const login = client(port);
+
+  const ATTACKER = '203.0.113.10';
+  const VICTIM = '198.51.100.25';
+
+  try {
+    check(
+      auth.up,
+      auth.up
+        ? `a third private instance is listening on :${port}, trusting one proxy hop`
+        : 'the third private instance never came up',
+    );
+    if (!auth.up) {
+      console.error(auth.log());
+      return;
+    }
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  X-Forwarded-For is actually being honoured');
+    // -----------------------------------------------------------------------
+    /**
+     * The control for everything below. If the header were ignored -- a missing
+     * TRUST_PROXY, a proxy hop count of the wrong shape -- then the attacker and
+     * the victim would share one address, and every assertion in this case would
+     * be about a single client. Some of them would still pass, for the wrong
+     * reason.
+     *
+     * So: spend the per-address budget from one address, and show that a
+     * DIFFERENT address is unaffected while the first is refused. That can only
+     * be true if the two are being told apart.
+     */
+    const probeAccount = invented('probe');
+    for (let i = 1; i <= LOCKOUT_PER_IP; i += 1) await login(probeAccount, `p-${i}`, TENANT, ATTACKER);
+    const probeSameIp = await login(probeAccount, 'p-again', TENANT, ATTACKER);
+    const probeOtherIp = await login(probeAccount, 'p-again', TENANT, VICTIM);
+    check(
+      probeSameIp.status === 429 && probeOtherIp.status === 401,
+      `the spent address is refused (${probeSameIp.status}) while another is not (${probeOtherIp.status})`,
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  a stranger cannot lock the owner out of their own account');
+    // -----------------------------------------------------------------------
+    /**
+     * Positive control first: the attacker's opening guess is an ordinary 401.
+     * An instance refusing everything would pass the lockout assertion while
+     * proving nothing about counting.
+     */
+    const opening = await login(REAL.email, 'attacker-guess-1', TENANT, ATTACKER);
+    check(opening.status === 401, `the attacker's first guess is an ordinary 401 (got ${opening.status})`);
+
+    const attackerStatuses = [opening.status];
+    for (let i = 2; i <= LOCKOUT_GLOBAL; i += 1) {
+      attackerStatuses.push((await login(REAL.email, `attacker-guess-${i}`, TENANT, ATTACKER)).status);
+    }
+
+    /**
+     * The attacker is cut off at their own budget rather than at the account's.
+     * Before the fix every one of these was a 401 until the global budget ran
+     * out, which is precisely how the victim got locked out.
+     */
+    const attackerRefused = attackerStatuses.filter((s) => s === 429).length;
+    check(
+      attackerRefused === LOCKOUT_GLOBAL - LOCKOUT_PER_IP,
+      `of ${LOCKOUT_GLOBAL} guesses from one address, ${attackerRefused} were refused ` +
+        `(expected ${LOCKOUT_GLOBAL - LOCKOUT_PER_IP}: cut off after ${LOCKOUT_PER_IP})`,
+    );
+
+    /** THE ASSERTION THIS CASE EXISTS FOR. */
+    const victim = await login(REAL.email, REAL.password, TENANT, VICTIM);
+    check(
+      victim.status === 200,
+      victim.status === 200
+        ? 'and the real owner, from their own address, still signs in'
+        : `the real owner is locked out of their own account (${victim.status}) -- a stranger who ` +
+          'knows the address has denied them service',
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  but many addresses together still run the account out of budget');
+    // -----------------------------------------------------------------------
+    /**
+     * The backstop, and an honest statement of what remains. One password tried
+     * against one account from many machines is a real attack that a per-address
+     * budget cannot see, so the global per-account budget stays.
+     *
+     * Which means the lockout is not gone, it is PRICED: it now costs an
+     * attacker LOCKOUT_GLOBAL / LOCKOUT_PER_IP distinct addresses instead of
+     * one. That is the trade, and it is deliberate. Raising the global budget
+     * raises the price and weakens the backstop; there is no setting that does
+     * both.
+     *
+     * The victim's successful login above cleared the global counter, so this
+     * starts from zero.
+     */
+    const needed = Math.ceil(LOCKOUT_GLOBAL / LOCKOUT_PER_IP);
+    for (let n = 0; n < needed; n += 1) {
+      for (let i = 1; i <= LOCKOUT_PER_IP; i += 1) {
+        await login(REAL.email, `spray-${n}-${i}`, TENANT, `203.0.113.${20 + n}`);
+      }
+    }
+    const sprayed = await login(REAL.email, REAL.password, TENANT, VICTIM);
+    check(
+      sprayed.status === 429,
+      sprayed.status === 429
+        ? `${needed} addresses did between them what one no longer can (429), so distributed ` +
+          'guessing is still bounded'
+        : `${needed} addresses spent more than the account's global budget and it still answered ` +
+          `${sprayed.status} -- the backstop against distributed guessing is not there`,
+    );
+  } finally {
+    auth.child.kill();
+  }
+}
+
 async function main() {
   await perAccountCases();
   await perIpCase();
+  await lockoutCase();
 
   console.log('');
   if (failures > 0) {
