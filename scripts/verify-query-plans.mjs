@@ -1,9 +1,10 @@
 /**
- * Asserts that the two retention-critical queries use their index to ORDER, not
- * merely to filter.
+ * Asserts that each plan-critical query uses its index to ORDER, not merely to
+ * filter -- the relay's claim, the relay's prune, and the reconciler's candidate
+ * scan.
  *
- * An index that is "used" is not the same as an index that helps. Both of these
- * queries end in `ORDER BY ... LIMIT n`, and there are two shapes the planner
+ * An index that is "used" is not the same as an index that helps. Each of these
+ * queries ends in `ORDER BY ... LIMIT n`, and there are two shapes the planner
  * can produce:
  *
  *   Index Scan            walks the index in order and stops at n. Work is
@@ -44,6 +45,7 @@
  */
 
 import pg from 'pg';
+import { CLAIM_SQL } from '../services/relay/dist/claim-sql.js';
 
 /**
  * THE ROLE MATTERS, and it is not a detail — it changes the plan.
@@ -77,13 +79,21 @@ function check(ok, msg) {
 }
 
 /**
- * The queries, written to match what the code actually runs.
+ * The queries whose PLAN is part of the contract.
  *
- * Kept verbatim rather than imported, because these are the only two statements
- * in the repository whose PLAN is part of the contract — and a copy that drifts
- * would show up as this file passing while the real query regressed. The
- * `mustMention` field is what pins them together: if the code stops using the
- * index this names, the assertion fails even though the plan still looks fine.
+ * THE CLAIM IS IMPORTED, NOT COPIED, AND THAT CHANGED BECAUSE A COPY FAILED.
+ * This block used to justify hand-written copies on the grounds that "a copy
+ * that drifts would show up as this file passing while the real query
+ * regressed". That sentence describes the failure rather than preventing it, and
+ * it duly happened: the copy of the claim selected a bare `id` out of the CTE,
+ * so it never carried the outer `seq::text AS "seq"` alias — and that alias is
+ * the entirety of #64, where a bare `ORDER BY seq` resolved to the text output
+ * column and published '10' before '9'. This file could not have caught it,
+ * because the query it explained was not the query anyone runs.
+ *
+ * So the claim now comes from services/relay/src/claim-sql.ts, the same text
+ * drain.ts executes. The two prune/reconcile queries below are still written out
+ * here, and that is a weaker position than the claim's: see the note on each.
  */
 const PLANS = [
   {
@@ -130,32 +140,26 @@ const PLANS = [
      * finite. Both are why the claim is a CTE.
      */
     outerSort: 'the CTE bounds it to batchSize rows before the advisory-lock filter sees them',
-    sql: `WITH claimable AS (
-             SELECT o.id, o.seq, o."tenantId", o.topic, o."aggregateId"
-               FROM "OutboxMessage" o
-              WHERE o."publishedAt" IS NULL
-                AND o."deadLetteredAt" IS NULL
-                AND (o."nextAttemptAt" IS NULL OR o."nextAttemptAt" <= now())
-                AND NOT EXISTS (
-                  SELECT 1 FROM "OutboxMessage" older
-                   WHERE older."tenantId" = o."tenantId"
-                     AND older."aggregateId" = o."aggregateId"
-                     AND older.topic = o.topic
-                     AND older.seq < o.seq
-                     AND older."publishedAt" IS NULL
-                     AND older."deadLetteredAt" IS NULL
-                     AND older."nextAttemptAt" IS NOT NULL
-                     AND older."nextAttemptAt" > now()
-                )
-              ORDER BY o.seq
-              LIMIT 100
-                FOR UPDATE SKIP LOCKED
-           )
-           SELECT id FROM claimable c
-            WHERE pg_try_advisory_xact_lock(
-                    hashtext(c."tenantId" || chr(31) || c.topic || chr(31) || c."aggregateId")::bigint
-                  )
-            ORDER BY c.seq`,
+    /**
+     * The real text, imported. See the block above this array for what a copy of
+     * it cost, and claim-sql.ts for why that module exists.
+     */
+    sql: CLAIM_SQL,
+    /** The batch size. EXPLAIN takes parameters; it just never runs the query. */
+    params: [100],
+    /**
+     * The claim reads "OutboxMessage" TWICE, and only one of the two reads was
+     * ever asserted.
+     *
+     * The NOT EXISTS that looks for an older row stuck behind a backoff is a
+     * correlated subquery run for candidate rows, and it has its own partial
+     * index. Nothing checked that the planner used it. Unindexed, that subquery
+     * is a scan of the pending backlog per candidate row — the ordering guard
+     * added in #61 would quietly become the most expensive thing the relay does,
+     * and every assertion in this file would still have passed, because they all
+     * describe the OUTER scan.
+     */
+    alsoUses: ['OutboxMessage_backoff_idx'],
   },
 ];
 
@@ -176,7 +180,7 @@ async function main() {
     await db.query('SET enable_seqscan = off');
     await db.query('SET enable_bitmapscan = off');
 
-    const { rows } = await db.query(`EXPLAIN ${plan.sql}`);
+    const { rows } = await db.query(`EXPLAIN ${plan.sql}`, plan.params ?? []);
     const text = rows.map((r) => r['QUERY PLAN']).join('\n');
 
     /**
@@ -227,6 +231,61 @@ async function main() {
       /Bitmap/.test(scan)
         ? 'it is a Bitmap scan, which is unordered by construction'
         : 'and it is a plain ordered Index Scan',
+    );
+
+    for (const also of plan.alsoUses ?? []) {
+      check(
+        text.includes(also),
+        text.includes(also)
+          ? `and ${also} serves the subquery's read of the same table`
+          : `does NOT use ${also}. This query reads the table more than once, and the read ` +
+            'this index serves is unasserted by every other check here, all of which ' +
+            'describe the outer scan:\n' +
+            text.split('\n').map((l) => `          ${l}`).join('\n'),
+      );
+    }
+
+    /**
+     * WHAT the plan sorts by, not merely whether it sorts.
+     *
+     * Importing the real claim text was necessary to catch #64 and not
+     * sufficient, which is worth recording because it was a surprise. The bug
+     * survives every assertion above: a bare `ORDER BY seq` resolving to the
+     * `seq::text` output column still uses the index, still produces no Sort
+     * inside the scan, and still reports a plain ordered Index Scan. Verified by
+     * reintroducing it -- the run came back entirely green.
+     *
+     * The plans differ in one character sequence:
+     *
+     *   correct   Sort Key: c.seq
+     *   bug #64   Sort Key: ((c.seq)::text)
+     *
+     * and a text sort puts '10' before '9', so any batch straddling a power of
+     * ten published out of order onto a COMPACTED topic -- where ordering
+     * decides which version survives a rebuild.
+     *
+     * Stated as "no cast in the sort key" rather than "the sort key is exactly
+     * c.seq" on purpose. The first is the defect and cannot fire on an unrelated
+     * improvement to the plan; the second would turn any legitimate change to
+     * the ordering into a red build for no reason.
+     */
+    const sortKeys = text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('Sort Key:'))
+      .map((l) => l.replace(/^Sort Key:\s*/, ''));
+
+    const cast = sortKeys.filter((k) => k.includes('::'));
+    check(
+      cast.length === 0,
+      cast.length === 0
+        ? sortKeys.length > 0
+          ? `and it orders by the column itself, uncast: ${sortKeys.join(' | ')}`
+          : 'and it does not sort at all, so there is no sort key to get wrong'
+        : `the sort key is a CAST: ${cast.join(' | ')}. Ordering by a text rendering of a ` +
+          "number sorts '10' before '9' — this is #64, versions published out of order onto a " +
+          'compacted topic. Qualify the column (c.seq), so the name resolves to the bigint ' +
+          'input column rather than to the cast output column that shares its name.',
     );
 
     await db.end();
@@ -318,7 +377,10 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  console.log('both retention-critical queries can stop at their LIMIT rather than sorting the table');
+  console.log(
+    'every plan-critical query stops at its LIMIT rather than sorting the table, and the ' +
+      'claim orders by the bigint it means to',
+  );
 }
 
 main().catch((err) => {
