@@ -1517,6 +1517,45 @@ jobs:
         if: always()
         run: docker compose ps
 
+      # .dockerignore says a secret must never be in a layer. That was a claim
+      # about a file, not about the image -- and the image disagreed: the relay
+      # carries a `.env.ticketing` so one binary can be pointed at the other
+      # service's outbox, `**/.env` matches only the exact name `.env`, and the
+      # file went in with RELAY_DATABASE_URL and its credentials. .gitignore
+      # covers it, so it never reached a commit and nothing ever looked.
+      #
+      # Asserted against the BUILT IMAGE rather than by re-reading the ignore
+      # rules, because re-reading the rules is what missed it. This runs here
+      # because this is the only job that builds the image at all.
+      - name: Assert the image carries no secrets
+        run: |
+          set -euo pipefail
+
+          found=$(docker run --rm --entrypoint sh eventhub/app:local -c '
+            find /app -name ".env*" -not -name "*.example" -not -path "*/node_modules/*"
+            find /app \( -name "*.pem" -o -name "*.key" -o -name "id_rsa*" \) -not -path "*/node_modules/*"
+            ls -d /app/.git 2>/dev/null || true
+          ')
+
+          if [ -n "$found" ]; then
+            echo "these are inside the image and must not be:"
+            echo "$found"
+            echo ""
+            echo "A real .env, key material or the git history in a layer travels with"
+            echo "every copy of the image. Add the shape to .dockerignore -- and note that"
+            echo "**/.env does NOT match .env.something."
+            exit 1
+          fi
+
+          # The control: the committed examples SHOULD be there, so a pass means
+          # the check can see files at all rather than that find matched nothing
+          # because the path was wrong.
+          examples=$(docker run --rm --entrypoint sh eventhub/app:local -c \
+            'find /app -name ".env.example" -not -path "*/node_modules/*" | wc -l')
+          test "$examples" -ge 4 \
+            || { echo "only $examples .env.example files in the image — this check is looking at the wrong place"; exit 1; }
+          echo "  no secrets, and $examples committed examples present"
+
       # Healthy is not the same as working. Every assertion below crosses a
       # container boundary that a healthcheck cannot see.
       - name: Prove it works end to end

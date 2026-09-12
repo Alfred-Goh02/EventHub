@@ -21,8 +21,23 @@ services/*/src/generated
 # setup step generates into a volume instead -- baking one into an image would
 # put a private key in every layer anyone can pull.
 **/keys
+
+# ENV FILES IN EVERY SHAPE THEY TAKE, not just the exact name `.env`.
+#
+# `**/.env` matches a file called `.env` and nothing else, and this repository
+# does not only have those: the relay carries `.env.ticketing` so one binary can
+# be pointed at the other service's outbox. .gitignore already covers it with
+# `.env.*`, so it never reaches a commit -- and it went straight into the image,
+# carrying RELAY_DATABASE_URL and its credentials. Found by listing what actually
+# ended up in /app rather than by reading this file.
+#
+# So the rule matches the family, and the committed examples are added back:
+# they are documentation, they are already public in the repository, and a reader
+# poking around inside the image should find them.
 **/.env
-**/.env.local
+**/.env.*
+!**/.env.example
+!**/.env.*.example
 
 .git
 .github
