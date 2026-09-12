@@ -122,16 +122,29 @@ async function main() {
   for (let i = 0; i < RUNS; i += 1) {
     const a = await timeLogin(email, `wrong-${i}`);
     const b = await timeLogin(`${run}_nobody_${i}@acme.com`, `wrong-${i}`);
+
+    /**
+     * A correct login in EVERY round, not five at the end.
+     *
+     * /login now refuses an account after ten failed attempts, and a
+     * successful login clears that count (see verify-login-rate-limit.mjs).
+     * Twelve wrong passwords in a row against one account locked it before the
+     * series finished, so this file ended up timing 429s -- which answer before
+     * the hash runs -- instead of argon2. A success each round keeps the
+     * account's count at one, and gives the correct-password series the same
+     * protection from a slow patch of CI as the other two.
+     *
+     * The unknown addresses need nothing: each round uses a fresh one, so none
+     * of them ever gets a second failure.
+     */
+    const c = await timeLogin(email, 'hunter2222');
+
     if (a.status !== 401) check(false, `a wrong password should be 401, got ${a.status}`);
     if (b.status !== 401) check(false, `an unknown address should be 401, got ${b.status}`);
+    if (c.status !== 200) check(false, `the correct password should be 200, got ${c.status}`);
     exists.push(a.ms);
     missing.push(b.ms);
-  }
-
-  for (let i = 0; i < 5; i += 1) {
-    const ok = await timeLogin(email, 'hunter2222');
-    if (ok.status !== 200) check(false, `the correct password should be 200, got ${ok.status}`);
-    correct.push(ok.ms);
+    correct.push(c.ms);
   }
 
   const mExists = median(exists);
