@@ -72,6 +72,10 @@ export function createProjectionConsumer(opts: {
   registryUrl: string;
   logger: Logger;
 }) {
+  // A TimeoutNegativeWarning in this service's logs is an upstream kafkajs bug,
+  // not this code: its request queue schedules a timer with `-1 - Date.now()`
+  // whenever a request is fulfilled with an empty pending queue. One needless
+  // 1ms timer, nothing dropped. scripts/create-topics.mjs explains it in full.
   const kafka = new Kafka({
     clientId: 'ticketing-projection',
     brokers: opts.brokers,
