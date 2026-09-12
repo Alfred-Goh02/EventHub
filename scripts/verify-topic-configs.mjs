@@ -61,20 +61,76 @@ async function main() {
 
   const topics = [...new Set(EXPECTED.map((e) => e.topic))];
 
-  const described = await admin.describeConfigs({
-    includeSynonyms: false,
-    resources: topics.map((name) => ({ type: TOPIC_RESOURCE, name })),
-  });
+  /**
+   * THE VACUITY GUARD, and it has to come BEFORE the broker call.
+   *
+   * It is what the check further down was reaching for. That one compared
+   * `described.resources.length` to `topics.length`, and those cannot differ: a
+   * missing topic throws rather than coming back as a short list, and otherwise
+   * describeConfigs returns one resource per resource asked about. It could not
+   * fail, so it guarded nothing.
+   *
+   * The failure worth guarding is an EXPECTED list that is empty — then the loop
+   * below runs zero times and the file reports success having asserted nothing.
+   *
+   * Placed above describeConfigs after watching the first version of this guard
+   * fail to fire: with EXPECTED empty, `topics` is empty too, the broker call
+   * throws "Resources array cannot be empty" first, and the catch below then
+   * blamed a missing topic. A guard that runs after the thing it guards is not a
+   * guard.
+   */
+  check(EXPECTED.length > 0, `${EXPECTED.length} config decision(s) to check`);
+  if (EXPECTED.length === 0) {
+    await admin.disconnect();
+    console.error('\nFAIL: EXPECTED is empty, so there is nothing to assert about the broker');
+    process.exitCode = 1;
+    return;
+  }
 
   /**
-   * The scan has to be looking at something. describeConfigs on a topic that
-   * does not exist returns an empty resource rather than throwing, so without
-   * this every assertion below would read `undefined !== expected` and fail for
-   * the wrong reason — or worse, an empty EXPECTED would pass silently.
+   * A missing topic THROWS here, and the error does not say which one.
+   *
+   * The comment that used to sit below this said describeConfigs returns an
+   * empty resource for a topic that does not exist. It does not — measured
+   * against this broker, asking about one real topic and one invented one threw
+   *
+   *   KafkaJSProtocolError: This server does not host this topic-partition
+   *
+   * naming neither the topic nor the thing that would create it. That is the
+   * same unhelpful failure the README calls out for the relay's first publish,
+   * and it is worth translating here rather than leaving a reader to guess.
    */
+  let described;
+  try {
+    described = await admin.describeConfigs({
+      includeSynonyms: false,
+      resources: topics.map((name) => ({ type: TOPIC_RESOURCE, name })),
+    });
+  } catch (err) {
+    await admin.disconnect();
+    console.error(
+      `\nFAIL: could not describe ${topics.join(', ')} — ${err.message}\n\n` +
+        'That error means at least one of those topics does not exist on the broker, and it ' +
+        'does not say which. The broker runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false on ' +
+        'purpose, so nothing creates them on demand: run `node scripts/create-topics.mjs`.',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  /**
+   * And that the broker actually returned config, not merely a resource shell.
+   * A topic described with no entries makes every assertion below read
+   * "(absent)", which is a failure that says nothing about why.
+   */
+  const empty = described.resources.filter((r) => r.configEntries.length === 0);
   check(
-    described.resources.length === topics.length,
-    `described ${described.resources.length} of ${topics.length} topic(s)`,
+    empty.length === 0,
+    empty.length === 0
+      ? `and the broker returned config for all ${described.resources.length} topic(s)`
+      : `the broker returned NO config entries for ${empty
+          .map((r) => r.resourceName)
+          .join(', ')} — every assertion below would read (absent) and say nothing useful`,
   );
 
   for (const e of EXPECTED) {
