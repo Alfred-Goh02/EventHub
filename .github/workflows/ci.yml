@@ -460,6 +460,32 @@ jobs:
           node scripts/verify-refresh-rotation.mjs
           pkill -f "node dist/index.js" || true
 
+      # /logout had NO test. Not a weak one -- none. Nothing in scripts/ named
+      # the route and nothing here ran it, found by listing every HTTP route in
+      # the three services and asking which had no assertion anywhere. It was
+      # the only one.
+      #
+      # A bad route to leave unasserted: its entire job is revocation, it is the
+      # control a user reaches for on a shared machine, and every way it can fail
+      # fails silently behind a 204. A logout that revoked nothing looks exactly
+      # like one that worked, while the refresh token in somebody else's hands
+      # keeps minting sessions for thirty days.
+      #
+      # The load-bearing case is the second: log out with an already-spent
+      # PARENT and assert the live successor dies too. Revoking only the
+      # presented row passes every other assertion in the file -- verified by
+      # making exactly that change and watching case 2, and only case 2, go red.
+      - name: Assert logging out ends the session, and only that session
+        working-directory: .
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/verify-logout.mjs
+          pkill -f "node dist/index.js" || true
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
