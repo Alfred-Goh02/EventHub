@@ -82,7 +82,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 46 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 47 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -110,11 +110,19 @@ flowchart TB
     RECON["Reconciler<br/>resolves UNKNOWN charges"]
   end
 
+  subgraph LIVESVC["Live · :3004 — two pods shown, to make the fan-out visible"]
+    LIVEA["Live pod A<br/>holds its own sockets"]
+    LIVEB["Live pod B<br/>holds its own sockets"]
+  end
+
   CLIENT(["Client"])
   DBAUTH[("eventhub_auth")]
   DBEVENT[("eventhub_event<br/>Event + OutboxMessage")]
   DBTKT[("eventhub_ticketing<br/>Reservation + Payment + EventProjection")]
+  DBLIVE[("eventhub_live<br/>Question + QuestionVote")]
   KAFKA[["Kafka · events.activity<br/>compacted, keyed by event id"]]
+  KAFKALIVE[["Kafka · live.interactions<br/>durable log, at-most-once"]]
+  REDIS[["Redis Pub/Sub<br/>live:t:{tenant}:e:{event}"]]
   REGISTRY[["Schema Registry"]]
   PROVIDER[["Payment provider"]]
 
@@ -124,6 +132,7 @@ flowchart TB
 
   AUTH -.->|"public key only"| EVENT
   AUTH -.->|"public key only"| TKT
+  AUTH -.->|"public key only"| LIVEA
 
   AUTH --> DBAUTH
   EVENT --> DBEVENT
@@ -139,6 +148,15 @@ flowchart TB
 
   RECON -->|"asks, never guesses"| PROVIDER
   PROVIDER -->|"signed webhook"| TKT
+
+  CLIENT -->|"wss, token in subprotocol"| LIVEA
+  CLIENT -->|"wss"| LIVEB
+  LIVEA --> DBLIVE
+  LIVEB --> DBLIVE
+  LIVEA -->|"PUBLISH"| REDIS
+  REDIS -->|"delivers to every pod"| LIVEA
+  REDIS -->|"delivers to every pod"| LIVEB
+  LIVEA -.->|"fire and forget"| KAFKALIVE
 ```
 
 **The dotted lines are not calls.** Auth is the only service holding a private
@@ -153,6 +171,21 @@ failure every "save, then publish" design has. The relay is what turns those
 committed rows into messages, and everything hard about this repository lives in
 that hop: ordering per aggregate, at-least-once delivery, retries with backoff,
 poison rows that must dead-letter rather than block their aggregate for ever.
+
+**The two Live pods and the Redis loop are the one thing a diagram explains
+better than prose.** A WebSocket is a file descriptor owned by one process, so
+pod B cannot write to a socket held by pod A. A question posted on A is written
+to Postgres, then PUBLISHed to a channel keyed by tenant and event; Redis
+delivers it to every pod holding a client in that room — **including pod A
+itself**, which is why A must not also write to its own sockets or everyone on it
+sees the message twice. The channel name carries the tenant from the signed
+token, so a client cannot subscribe outside its own tenant by construction rather
+than by a check someone might forget.
+
+`live.interactions` is dotted because it is produced fire-and-forget, with no
+outbox. That is the one place in this repository where the outbox pattern is
+deliberately **not** applied: losing a `tickets.purchased` is a financial
+incident, and losing an upvote is a rounding error in an analytics rollup.
 
 **And `KAFKA → PROJ` is the price of database-per-service.** Ticketing cannot
 join to Event's tables — `CONNECT` is revoked, so it genuinely cannot reach them —

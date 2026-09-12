@@ -523,6 +523,34 @@ jobs:
       - name: Assert the logger redacts what its list says it redacts
         run: node scripts/verify-log-redaction.mjs
 
+      # THE ONE CLAIM CHAPTER 5 EXISTS TO MAKE GOOD ON: a question posted on one
+      # Live pod reaches a client connected to a DIFFERENT Live pod.
+      #
+      # Two pods, not one. A WebSocket is a file descriptor owned by one process
+      # -- pod B cannot write to a socket held by pod A -- so a single-pod test
+      # passes identically whether the fan-out layer exists or not.
+      #
+      # The verifier spawns both pods itself on 3104 and 3114 and needs Auth
+      # running to mint a token. Its positive control is free: delivery happens
+      # ONLY in the Redis subscriber callback, so the author's own copy travels
+      # through Redis too -- asserting the author sees exactly one proves the bus
+      # works AND that the handler is not also writing locally, which would give
+      # everyone on the posting pod two copies of everything.
+      - name: Assert a question crosses between Live pods, and only within its tenant
+        env:
+          APP_DATABASE_URL: ${{ env.LIVE_APP_DATABASE_URL }}
+          REDIS_URL: redis://127.0.0.1:6379
+          ALLOWED_ORIGIN_SUFFIX: .eventhub.local
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          export AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          node scripts/verify-live-fanout.mjs
+          pkill -f "node dist/index.js" || true
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
