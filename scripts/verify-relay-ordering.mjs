@@ -168,6 +168,51 @@ async function main() {
     return;
   }
 
+  /**
+   * And the same question again before EVERY drain, not only before the first.
+   *
+   * The check above asks "is the outbox clean?" once, which was enough while
+   * nothing else could be writing to it. It is not enough now: `docker compose
+   * up` starts a relay container and the Event service alongside everything
+   * else, so a row can arrive from a request made in another window halfway
+   * through this file. That row would be claimed by the next drain, handed to
+   * the stub publisher, which reports success -- and drainOnce would mark it
+   * published without it ever reaching Kafka. A message silently lost, by a test.
+   *
+   * "Nothing else is running" is a claim about the whole run, not about its
+   * first moment, so it is asserted for the whole run.
+   *
+   * Scoped by aggregateId prefix rather than by counting everything, because by
+   * this point the outbox legitimately holds THIS run's undelivered rows. Every
+   * aggregate this file seeds is named `${run}_something`, so anything outside
+   * that prefix came from somewhere else.
+   */
+  async function refuseForeignPending(p) {
+    const {
+      rows: [foreign],
+    } = await p.query(
+      `SELECT count(*)::int AS n FROM "OutboxMessage"
+        WHERE "publishedAt" IS NULL AND "deadLetteredAt" IS NULL
+          AND "aggregateId" NOT LIKE $1`,
+      [`${run}_%`],
+    );
+    if (foreign.n > 0) {
+      throw new Error(
+        `${foreign.n} undelivered outbox row(s) appeared that this run did not create. ` +
+          'Something else is writing to the outbox — the Event service, or the relay ' +
+          'container from docker compose. Draining now would hand those rows to the stub ' +
+          'publisher, which reports success, and they would be marked published without ever ' +
+          'reaching Kafka. Stop the other writer and re-run.',
+      );
+    }
+  }
+
+  /** drainOnce, with that guard re-checked immediately before it. */
+  const drain = async (p, publisher, lg, o) => {
+    await refuseForeignPending(p);
+    return drainOnce(p, publisher, lg, o);
+  };
+
   try {
     // -----------------------------------------------------------------------
     console.log('  a clean run publishes every version, in order (positive control)');
@@ -180,7 +225,7 @@ async function main() {
     const clean = `${run}_clean`;
     await seed(app, clean, [1, 2, 3]);
     const okRun = stubPublisher();
-    await drainOnce(pool, okRun.publisher, logger, opts);
+    await drain(pool, okRun.publisher, logger, opts);
     check(
       JSON.stringify(okRun.of(clean)) === JSON.stringify([1, 2, 3]),
       `published ${JSON.stringify(okRun.of(clean))} — expected [1,2,3]`,
@@ -197,7 +242,7 @@ async function main() {
     await seed(app, other, [4, 5]);
 
     const batchRun = stubPublisher(new Set([1]));
-    await drainOnce(pool, batchRun.publisher, logger, opts);
+    await drain(pool, batchRun.publisher, logger, opts);
 
     check(
       !batchRun.of(inBatch).includes(2) && !batchRun.of(inBatch).includes(3),
@@ -225,7 +270,7 @@ async function main() {
     await setRow(app, `${backoff}_v1`, `attempts = 1, "nextAttemptAt" = now() + interval '1 hour'`);
 
     const held = stubPublisher();
-    await drainOnce(pool, held.publisher, logger, opts);
+    await drain(pool, held.publisher, logger, opts);
     check(
       held.of(backoff).length === 0,
       held.of(backoff).length === 0
@@ -236,7 +281,7 @@ async function main() {
     await setRow(app, `${backoff}_v1`, `"nextAttemptAt" = NULL`);
 
     const after = stubPublisher();
-    await drainOnce(pool, after.publisher, logger, opts);
+    await drain(pool, after.publisher, logger, opts);
     check(
       JSON.stringify(after.of(backoff)) === JSON.stringify([1, 2, 3]),
       `once the backoff expired: ${JSON.stringify(after.of(backoff))} — expected [1,2,3]`,
@@ -258,7 +303,7 @@ async function main() {
     await setRow(app, `${dead}_v1`, `"deadLetteredAt" = now()`);
 
     const past = stubPublisher();
-    await drainOnce(pool, past.publisher, logger, opts);
+    await drain(pool, past.publisher, logger, opts);
     check(
       JSON.stringify(past.of(dead)) === JSON.stringify([2, 3]),
       `published ${JSON.stringify(past.of(dead))} — expected [2,3], past the dead letter`,
@@ -315,7 +360,7 @@ async function main() {
     const poolB = new pg.Pool({ connectionString: RELAY_URL, max: 2 });
 
     try {
-      const aDrain = drainOnce(poolA, slow, logger, opts);
+      const aDrain = drain(poolA, slow, logger, opts);
       await insidePublish;
 
       // Now the later versions land, while A still holds seq 1.
@@ -332,7 +377,7 @@ async function main() {
           relayB.push({ aggregateId: row.aggregateId, version: row.payload.version });
         },
       };
-      await drainOnce(poolB, fast, logger, opts);
+      await drain(poolB, fast, logger, opts);
 
       const bTookOurs = relayB.filter((m) => m.aggregateId === race).map((m) => m.version);
       check(
@@ -367,7 +412,7 @@ async function main() {
 
       // Everything held back goes out now, behind what preceded it.
       const after = [];
-      await drainOnce(poolB, {
+      await drain(poolB, {
         async publish(row) {
           after.push({ aggregateId: row.aggregateId, version: row.payload.version });
         },
@@ -443,7 +488,7 @@ async function main() {
     );
 
     const numeric = stubPublisher();
-    await drainOnce(pool, numeric.publisher, logger, opts);
+    await drain(pool, numeric.publisher, logger, opts);
     check(
       JSON.stringify(numeric.of(straddle)) === JSON.stringify([1, 2, 3]),
       `published ${JSON.stringify(numeric.of(straddle))} — expected [1,2,3]; sorting seq as text gives [2,3,1]`,
