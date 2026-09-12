@@ -486,6 +486,20 @@ jobs:
           node scripts/verify-logout.mjs
           pkill -f "node dist/index.js" || true
 
+      # Seventeen variables the code read that no .env.example mentioned -- the
+      # relay's entire pruning configuration, and the whole surface of
+      # Ticketing's reconciler and sweeper. The README tells a reader to copy
+      # .env.example, so each one was a knob they could not know existed.
+      #
+      # AUTH_DEV_TOKEN_SINK is the one that shows why it matters: it is the
+      # switch that prints invite and reset tokens where a developer can see
+      # them, and with it undocumented the README's own invite flow has a step a
+      # reader cannot complete -- the token goes nowhere and nothing says why.
+      #
+      # Needs no services running: it compares source against .env.example.
+      - name: Assert every variable the code reads is one the reader is given
+        run: node scripts/verify-env-documented.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
