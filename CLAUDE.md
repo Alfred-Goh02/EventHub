@@ -97,8 +97,63 @@ that have both bitten: a regex anchored to `$` must tolerate CRLF, and a file
 fetched for byte-exact comparison is fetched raw — never through `git clone`,
 which rewrites line endings on the way in.
 
+## A guard that runs after the thing it guards is not a guard
+
+Check the precondition **before** the call that depends on it, not after.
+
+`verify-topic-configs.mjs` grew a guard against an empty `EXPECTED` list, and it
+was placed below the `describeConfigs` call. With `EXPECTED` empty the topic list
+is empty too, so the broker call threw `Resources array cannot be empty` first and
+the new error handler blamed a missing topic — a confident, wrong diagnosis, from
+the very check added to prevent one. Caught only by running it with the list
+emptied.
+
+## Enumerate the category, then ask what nothing covers
+
+The highest-yield way to find real bugs in this repository has not been reading
+code hoping to notice something. It is picking a category, listing **every**
+member mechanically, and asking which members nothing covers:
+
+- every HTTP route → `/logout` had no test at all
+- every exported function → a second, weaker copy of token verification that
+  nothing called
+- every environment variable the code reads → seventeen undocumented knobs
+- every key a redaction list claims → three that leaked
+- everything inside the built image → a real `.env` with database credentials
+
+Clean sweeps are worth the same trouble and cost a minute: verify scripts versus
+CI, cited file paths, and database roles all came back with nothing, which is
+itself a fact worth having.
+
+## A detector that reads comments finds uses that are not uses
+
+Strip comments before scanning source for anything.
+
+The environment-variable audit reported that the relay reads `PORT` and
+`DATABASE_URL`. It does not — it deliberately does not call `loadBaseEnv`, and
+says so in a comment that names the function twice while explaining why. The
+scan read the explanation as a use, and would have had me document two variables
+the relay has never heard of. Match the **call**, not the name.
+
+## An ignore rule that names one file misses the family
+
+`**/.env` matches a file called `.env` and nothing else. This repository also has
+`.env.ticketing`, so the rule that exists to keep secrets out of the image let one
+in, with database credentials, and `.gitignore` had the mirror of it: `.env.*`
+with a `!.env.example` negation that rescues only the exact name, silently
+ignoring an example file meant to be committed.
+
+Both were found by looking at the **artefact** — what ended up inside the image,
+what git actually tracks — rather than by re-reading the rules. Re-reading the
+rules is what missed them in the first place.
+
 ## Verify before claiming
 
 Run the thing and read the output. "Should work" is not a result, and neither
 is a CI badge nobody opened. When reporting a fix, report the command and what
 it printed.
+
+This includes the tools used to check things. A background command's exit code is
+the exit code of the last thing in the pipe, not of the interesting command — a
+`docker build` that failed 127 on `corepack enable` was reported as exit 0 because
+`tail` succeeded. Print the code you actually mean.
