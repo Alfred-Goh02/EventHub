@@ -1,0 +1,104 @@
+# Working rules for this repository
+
+Every rule below exists because of a specific mistake made in this repository,
+and each one is followed by what that mistake cost. They are written down
+because the same mistakes kept recurring across sessions, and a rule with its
+evidence attached is harder to rationalise away than a rule on its own.
+
+## Never edit a file by manipulating its text in the shell
+
+Use the Edit or Write tool. Not `sed -i`, not a heredoc'd patch script, not
+`node -e` with a regex replace.
+
+What this cost, all in this repository:
+
+- A quoted heredoc ate the backslash in `'\\'` and wrote `'\'` instead.
+- An unquoted one ran `` `tsx watch` `` as a command substitution, because
+  backticks inside double quotes are substitution, not literal text.
+- A patch script matched nothing, changed nothing, and printed
+  `patched successfully`.
+
+Every one of those looked like a working change and took a round trip to
+disprove. The shell is the wrong tool for structured edits because its failure
+mode is silent and plausible.
+
+If a script genuinely must perform one mechanical edit across many files, it
+asserts its own effect: count the matches it made, and exit non-zero when the
+count is zero. A patch that can no-op silently is worse than no patch at all,
+because it produces a green log and an unchanged file.
+
+## Never trust an assertion you have not watched fail
+
+Before an assertion counts as an assertion, break the thing it guards and
+watch it go red. If it cannot be made to fail, it is not testing anything.
+
+What this cost, all real, all found here:
+
+- `seen.sort()` sorts **in place**. A display loop sorted the array, and the
+  ordering check then read the same array and could never fail. Fed `[3,1,2]`
+  it reported `monotonic: true`.
+- `check(relayB.length >= 0 && bTookOurs.length === 0, ...)` printed
+  `0 message(s)` and called it a pass. Both halves are true of nothing, so the
+  assertion held most strongly in the case it was meant to rule out.
+
+Hence the positive controls throughout `scripts/verify-*.mjs`: a test that
+asserts a property must also assert that the machinery producing the property
+is actually running. A suite where every path collapsed to zero would
+otherwise agree with itself and report success.
+
+A test that has never been red is documentation that looks like a test.
+
+## Qualify every ORDER BY column
+
+Postgres resolves a bare name in `ORDER BY` against the **output** columns
+first. So in a query selecting `seq::text AS "seq"`, `ORDER BY seq` sorts the
+text — `'10'` before `'9'`.
+
+This was introduced here while *fixing* an ordering bug (#64). It silently
+reordered outbox claims, which corrupts projection rebuilds on the compacted
+topic, and no test aimed at it caught it — #63's unrelated rebuild check did.
+
+Write `ORDER BY c.seq`. Never `ORDER BY seq`.
+
+## Scope every assertion to data this run created
+
+A verifier once failed its own positive control on rows a previous run had left
+in the outbox. Generate an aggregate id per run and scope every query to it
+(the `of(id)` helper in `scripts/verify-relay-ordering.mjs`), and where a table
+is supposed to be empty at the start, refuse to run when it is not rather than
+asserting against whatever is there.
+
+## A test must not leave the database worse than it found it
+
+A regression test derived its fixture sequence from the current maximum and
+advanced the outbox sequence to the next power of ten on every run — ten times
+per run, which exhausts a bigint in about sixteen local runs. Use explicit
+fixture values. Never derive one from current state.
+
+## Branch, PR, CI, squash — in that order
+
+Check the branch **before** the first commit, not after:
+`git rev-parse --abbrev-ref HEAD`. If it prints `main`, stop and branch.
+
+Never commit to main, never merge into main locally, never force-push it. Push
+the branch, open a PR, wait for CI to go green, then squash-merge. Remove a
+worktree with `git worktree remove` before deleting its branch, or the delete
+fails with the worktree still holding it.
+
+## Commits carry Alfred's name only
+
+No `Co-Authored-By` trailer on commits. No generated-with line in PR
+descriptions.
+
+## This is Windows
+
+PowerShell or Git Bash. `core.autocrlf` is true, which has two consequences
+that have both bitten: a regex anchored to `$` must tolerate CRLF, and a file
+fetched for byte-exact comparison is fetched raw — never through `git clone`,
+which rewrites line endings on the way in.
+
+## Verify before claiming
+
+Run the thing and read the output. "Should work" is not a result, and neither
+is a CI badge nobody opened. When reporting a fix, report the command and what
+it printed.
