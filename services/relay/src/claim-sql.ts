@@ -24,6 +24,33 @@
  * assertion goes red -- verified by making exactly that edit and watching it
  * fail.
  *
+ * WHY THIS CANNOT DEADLOCK, WHICH IS NOT THE USUAL REASON.
+ *
+ * The query takes two kinds of lock in a fixed order -- the row locks first,
+ * inside the CTE, and then the per-aggregate advisory lock in the outer filter.
+ * The usual rule is that a uniform lock order is what saves you, and a reviewer
+ * reasonably asked whether that order is uniform everywhere. It is, today:
+ * pg_try_advisory_xact_lock appears in this file and nowhere else in the
+ * repository.
+ *
+ * But the order is not what makes this safe, and relying on it would be relying
+ * on the wrong thing. Deadlock needs a cycle of transactions each WAITING on
+ * something another holds, and neither acquisition here ever waits:
+ *
+ *   FOR UPDATE SKIP LOCKED       skips a locked row instead of waiting for it
+ *   pg_try_advisory_xact_lock    returns false instead of waiting for it
+ *
+ * Both are the try-variants, so this statement cannot be a blocked edge in any
+ * cycle. It cannot deadlock against another relay, against the Event service
+ * writing new outbox rows, or against the prune.
+ *
+ * WHICH MAKES BOTH OF THOSE LOAD-BEARING. Dropping SKIP LOCKED, or reaching for
+ * pg_advisory_xact_lock because the try-version "sometimes returns false",
+ * removes the property -- and the failure would not be a wrong answer but a
+ * periodic stall under concurrency, which is the kind of thing that reproduces
+ * only in production. Returning false is the design: the aggregate is somebody
+ * else's this pass, and this relay picks it up on the next one.
+ *
  * The parameter is the batch size.
  */
 export const CLAIM_SQL =
