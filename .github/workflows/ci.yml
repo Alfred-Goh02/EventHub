@@ -509,6 +509,15 @@ jobs:
       - name: Assert every variable the code reads is one the reader is given
         run: node scripts/verify-env-documented.mjs
 
+      # The image installs dependencies before copying source, so every
+      # workspace package's manifest is COPYed individually first -- and that
+      # list is a maintenance trap. Adding services/live sprang it: pnpm install
+      # ran without Live's manifest, and the build failed far away with "Local
+      # package.json exists, but node_modules missing", which names the symptom
+      # and not the cause. Nothing connected that message to a missing line.
+      - name: Assert the image installs every workspace package
+        run: node scripts/verify-dockerfile-workspaces.mjs
+
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
       # `authorization` carried no `*.authorization` while all six of its
