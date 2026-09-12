@@ -149,7 +149,7 @@ jobs:
       # same tree would add a build and verify the same code twice. The compose
       # application path is a way to RUN the system, not a second thing to test.
       - name: Start infrastructure
-        run: docker compose up -d --wait postgres kafka schema-registry
+        run: docker compose up -d --wait postgres redis kafka schema-registry
 
       - name: Show what came up
         run: docker compose ps
@@ -549,6 +549,11 @@ jobs:
         env:
           APP_DATABASE_URL: ${{ env.LIVE_APP_DATABASE_URL }}
           REDIS_URL: redis://127.0.0.1:6379
+          # Live produces live.interactions. Its env schema requires this even
+          # though this test never asserts on the topic -- fail-fast at startup
+          # is the point, and the first run without it said exactly that:
+          # "Invalid live-service environment: KAFKA_BROKERS: Required".
+          KAFKA_BROKERS: localhost:9092
           ALLOWED_ORIGIN_SUFFIX: .eventhub.local
         run: |
           (cd services/auth && node dist/index.js &)

@@ -190,6 +190,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       kafka:
         condition: service_healthy
       schema-registry:
@@ -202,7 +204,8 @@ services:
       # can share one variable.
       AUTH_DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
-      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
+      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
+      LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
     volumes:
       - jwt-keys:/app/services/auth/keys
     command:
@@ -227,6 +230,8 @@ services:
         DATABASE_URL="$$EVENT_DATABASE_URL" pnpm --filter @eventhub/event exec prisma migrate deploy
         echo "setup: migrating ticketing"
         DATABASE_URL="$$TICKETING_DATABASE_URL" pnpm --filter @eventhub/ticketing exec prisma migrate deploy
+        echo "setup: migrating live"
+        DATABASE_URL="$$LIVE_DATABASE_URL" pnpm --filter @eventhub/live exec prisma migrate deploy
 
         # Auth only. Every service's prisma.config.ts declares the same seed
         # command and only Auth has the file, so running this against the others
@@ -327,6 +332,58 @@ services:
     command: ["node", "dist/index.js"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3003/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # The Live service: the only stateful one in the fleet.
+  #
+  # Every other service here handles a request and forgets you. Live holds a TCP
+  # connection open for the length of a conference session and pushes messages
+  # down it, which is what makes Redis necessary at all — a socket is a file
+  # descriptor owned by ONE process, so a second replica could not reach it.
+  #
+  # ONE REPLICA HERE, and that is the honest limitation of compose. The thing
+  # worth demonstrating is a message crossing between pods, and
+  # `docker compose up --scale live=2` cannot express it while a host port is
+  # published. scripts/verify-live-fanout.mjs spawns two pods itself and proves
+  # it properly; this container is the one an operator talks to.
+  # ---------------------------------------------------------------------------
+  live:
+    <<: *app
+    container_name: eventhub-live
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    ports:
+      - "3004:3004"
+    environment:
+      <<: *app-env
+      PORT: 3004
+      DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
+      APP_DATABASE_URL: postgresql://eventhub_live_app:eventhub_live_app@postgres:5432/eventhub_live
+      # redis, not 127.0.0.1: inside the network the host mapping does not exist.
+      REDIS_URL: redis://redis:6379
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      # A suffix rather than a list, and permissive locally because there is no
+      # front end yet. WebSocket handshakes are not subject to CORS, so this is
+      # the only thing standing between a page on another origin and a socket.
+      ALLOWED_ORIGIN_SUFFIX: localhost
+      # Nothing to drain from in compose, and waiting 15 s on every `down` is
+      # only irritating. Production wants the real delay.
+      LIVE_DRAIN_DELAY_MS: 0
+    volumes:
+      - jwt-keys:/run/eventhub/keys:ro
+    working_dir: /app/services/live
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      # /health is LIVENESS and never fails during a drain. /ready is the one
+      # that flips to 503 on SIGTERM, which is what a load balancer would watch.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3004/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
