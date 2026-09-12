@@ -31,29 +31,52 @@ RUN apt-get update \
 # version stops existing rather than resolving to whatever is newest.
 RUN npm install -g pnpm@9.15.0
 
+# NOT ROOT FROM HERE DOWN.
+#
+# The node images ship an unprivileged `node` user and default to running as
+# root anyway, so a Dockerfile that never says otherwise ships four services
+# running as uid 0. Nothing here needs it: they open a listening socket above
+# 1024, read their own code, and talk to Postgres and Kafka.
+#
+# The switch happens BEFORE the install rather than after the build, with a
+# chown on the still-empty directory. Doing it the other way -- build as root,
+# then `chown -R node:node /app` at the end -- also works, but changing a file's
+# ownership copies that file into the new layer, so a recursive chown over a
+# fully installed node_modules writes a layer containing the whole tree again.
+# Ordering it this way means no file is ever owned by the wrong user.
+#
+# services/auth/keys is created here, empty and owned by node, because Docker
+# seeds a fresh named volume from the image's directory AND ITS OWNERSHIP. The
+# directory does not otherwise exist in the image (.dockerignore drops **/keys,
+# deliberately -- a signing key must never be in a layer), so without this the
+# volume would be created root-owned and the setup container could not write
+# the keypair into it.
+RUN mkdir -p /app/services/auth/keys && chown -R node:node /app
+USER node
+
 WORKDIR /app
 
 # Manifests first, so a source-only change does not re-run the install. Every
 # workspace package's package.json is needed for the install to resolve the
 # workspace: protocol, which is why this is a list rather than one COPY.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
-COPY contracts/package.json ./contracts/
-COPY packages/auth-middleware/package.json ./packages/auth-middleware/
-COPY packages/config/package.json ./packages/config/
-COPY packages/logger/package.json ./packages/logger/
-COPY packages/tsconfig/package.json ./packages/tsconfig/
-COPY packages/types/package.json ./packages/types/
-COPY services/auth/package.json ./services/auth/
-COPY services/event/package.json ./services/event/
-COPY services/relay/package.json ./services/relay/
-COPY services/ticketing/package.json ./services/ticketing/
+COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
+COPY --chown=node:node contracts/package.json ./contracts/
+COPY --chown=node:node packages/auth-middleware/package.json ./packages/auth-middleware/
+COPY --chown=node:node packages/config/package.json ./packages/config/
+COPY --chown=node:node packages/logger/package.json ./packages/logger/
+COPY --chown=node:node packages/tsconfig/package.json ./packages/tsconfig/
+COPY --chown=node:node packages/types/package.json ./packages/types/
+COPY --chown=node:node services/auth/package.json ./services/auth/
+COPY --chown=node:node services/event/package.json ./services/event/
+COPY --chown=node:node services/relay/package.json ./services/relay/
+COPY --chown=node:node services/ticketing/package.json ./services/ticketing/
 
 # --frozen-lockfile: the build fails rather than quietly resolving something the
 # lockfile does not describe. An image that installed a different tree than the
 # one CI tested is an image whose test results mean nothing.
 RUN pnpm install --frozen-lockfile
 
-COPY . .
+COPY --chown=node:node . .
 
 # Each service's build runs `prisma generate` before tsc. That works without a
 # reachable database -- generate reads the schema file, it does not introspect --
