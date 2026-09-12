@@ -125,6 +125,42 @@ const TOPICS = [
   },
 ];
 
+/**
+ * THE NEGATIVE-TIMEOUT WARNING IS KAFKAJS'S, NOT OURS.
+ *
+ * Every script here that talks to the broker prints this at least once, and so
+ * do the relay and Ticketing in their container logs:
+ *
+ *   TimeoutNegativeWarning: -1789219377436 is a negative number.
+ *   Timeout duration was set to 1.
+ *
+ * The magnitude is the clue -- that number is roughly Date.now(), so something
+ * computed `something - now` where `something` was near zero. It is kafkajs
+ * 2.2.4, src/network/requestQueue/index.js:
+ *
+ *   let scheduleAt = this.throttledUntil - Date.now()      // throttledUntil = -1
+ *   if (!this.throttleCheckTimeoutId) {
+ *     if (this.pending.length > 0) {
+ *       scheduleAt = scheduleAt > 0 ? scheduleAt : CHECK_PENDING_REQUESTS_INTERVAL
+ *     }
+ *     this.throttleCheckTimeoutId = setTimeout(..., scheduleAt)
+ *   }
+ *
+ * `throttledUntil` is initialised to -1 and only moves if the broker actually
+ * throttles us, which it never does here. So scheduleAt is `-1 - Date.now()`.
+ * The clamp that would fix it sits inside `if (this.pending.length > 0)`, and
+ * the queue is empty in exactly the ordinary case: a request fulfilled with
+ * nothing else waiting behind it. Node clamps the delay to 1ms and warns.
+ *
+ * So the cost is one needless 1ms timer and a line of noise. It is not a lost
+ * message, a stalled queue, or a clock problem.
+ *
+ * LEFT ALONE DELIBERATELY. 2.2.4 is the newest stable kafkajs -- everything
+ * published after it is a 2.3.0 beta -- and taking a beta broker client to
+ * silence a cosmetic warning is a bad trade. Suppressing TimeoutNegativeWarning
+ * process-wide would work and would also hide a genuine negative timeout in our
+ * own code, which is a warning worth keeping.
+ */
 const kafka = new Kafka({ clientId: 'eventhub-admin', brokers: [BROKER] });
 const admin = kafka.admin();
 
