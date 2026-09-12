@@ -1,7 +1,7 @@
 # EventHub
 
-A multi-tenant event and community platform, built as four services over Postgres
-and Kafka.
+A multi-tenant event and community platform, built as five services over
+Postgres, Kafka and Redis.
 
 It exists to be **explainable**. Every non-obvious decision in this repository has
 a comment saying what it is working around, and most of them are working around
@@ -79,12 +79,13 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/event` | Events CRUD with a transactional outbox |
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
+| `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
-| `db/init/` | Three databases and nine roles, with `CONNECT` revoked from `PUBLIC` |
+| `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
 | `scripts/verify-*.mjs` | 46 executable proofs of the invariants above |
 
-Three separate Postgres databases with their own credentials. CI asserts across
-all six directions that no service can even open a connection to another's.
+Four separate Postgres databases with their own credentials. CI asserts across
+all twelve directions that no service can even open a connection to another's.
 
 ## How it fits together
 
@@ -270,6 +271,10 @@ pnpm --filter @eventhub/event exec prisma migrate deploy
 
 ```bash
 pnpm --filter @eventhub/ticketing exec prisma migrate deploy
+```
+
+```bash
+pnpm --filter @eventhub/live exec prisma migrate deploy
 ```
 
 Only Auth has a seed. Running this against Event or Ticketing fails with a

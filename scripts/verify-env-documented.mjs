@@ -35,7 +35,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const SERVICES = ['auth', 'event', 'relay', 'ticketing'];
+const SERVICES = ['auth', 'event', 'live', 'relay', 'ticketing'];
 
 let failures = 0;
 function check(ok, msg) {
