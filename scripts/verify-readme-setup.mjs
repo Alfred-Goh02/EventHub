@@ -27,7 +27,7 @@
  * Run: node scripts/verify-readme-setup.mjs
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -98,8 +98,46 @@ function main() {
    *
    * -- the "event" in "@eventhub". The AUTH command was being read as proof that
    * the EVENT service was covered. A check for a command has to look at commands.
+   *
+   * EVERY FENCE IS MATCHED, AND THE SHELL ONES ARE THEN SELECTED. The obvious
+   * regex -- ```(?:bash|sh)?\n -- looks like it does this and does something
+   * worse. It does not match a fence tagged anything else, so it skips that
+   * fence's OPENING line and then matches its CLOSING line as an opener: from
+   * there the pairing is inverted, and every following block's contents are read
+   * as prose while the prose between blocks is read as commands.
+   *
+   * Adding an architecture diagram to the README is what found this. One
+   * ```mermaid block ahead of the commands, and all three migrate assertions
+   * failed at once while the README plainly contained all three commands. The
+   * same inversion can hide the opposite way: prose that happens to mention
+   * `prisma migrate deploy` would have been accepted as the command.
+   *
+   * So: match the info string, whatever it is, and filter afterwards.
    */
-  const commands = [...readme.matchAll(/```(?:bash|sh)?\r?\n([\s\S]*?)```/g)].map((m) => m[1]);
+  const SHELL_FENCES = new Set(['', 'bash', 'sh', 'shell', 'console']);
+  const fences = [...readme.matchAll(/```([\w-]*)\r?\n([\s\S]*?)```/g)];
+
+  /**
+   * Every fence marker accounted for, as exactly one opener or one closer.
+   *
+   * This is the guard on the parse itself, and it exists because the failure it
+   * catches is invisible. An info string this regex cannot match does not produce
+   * an error; it produces a silent off-by-one in the pairing, and the assertions
+   * below then describe the wrong halves of the file. Counting is the cheapest
+   * way to notice, and it fails loudly the moment someone writes a fence tag
+   * shaped differently -- ```js {1,3} , say.
+   */
+  const markers = (readme.match(/```/g) ?? []).length;
+  check(
+    markers === fences.length * 2,
+    markers === fences.length * 2
+      ? `all ${markers} fence markers pair into ${fences.length} block(s)`
+      : `${markers} fence markers but only ${fences.length} block(s) parsed. Some fence has an ` +
+        'info string this parse does not recognise, so the pairing has slipped and every ' +
+        'assertion below is reading the wrong half of the file.',
+  );
+
+  const commands = fences.filter((m) => SHELL_FENCES.has(m[1])).map((m) => m[2]);
 
   check(commands.length > 0, `the README contains ${commands.length} fenced command block(s)`);
 
@@ -133,6 +171,42 @@ function main() {
         ? `${service} — a documented command migrates it`
         : `${service} is migrated by CI and no command in the README migrates it. Its tables ` +
           'will not exist, and the service fails on its first query rather than at startup.',
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  console.log('');
+  console.log('  and the number it claims for itself is the number there are');
+  // -------------------------------------------------------------------------
+  /**
+   * The README advertises a count of verification scripts, and it had drifted
+   * from 13 to 43 -- it was understating the work by thirty files.
+   *
+   * A number in prose has no way of noticing that the directory moved on, and
+   * this is the one number a reader is most likely to check, because it is the
+   * repository's own claim about how much of itself it proves. So it is asserted
+   * rather than maintained: adding a verifier now fails this until the sentence
+   * is updated, which takes one character and costs nothing next to a README
+   * that quietly understates the thing it is advertising.
+   */
+  const verifierCount = readdirSync(join(ROOT, 'scripts')).filter(
+    (f) => f.startsWith('verify-') && f.endsWith('.mjs'),
+  ).length;
+  const claimed = readme.match(/(\d+)\s+executable proofs/);
+
+  check(
+    claimed !== null,
+    claimed !== null
+      ? `the README states a count: "${claimed[0]}"`
+      : 'the README no longer states a count of verification scripts, so this cannot check it',
+  );
+  if (claimed) {
+    const stated = Number(claimed[1]);
+    check(
+      stated === verifierCount,
+      stated === verifierCount
+        ? `and there are ${verifierCount} of them`
+        : `the README says ${stated} verification scripts and scripts/ holds ${verifierCount}`,
     );
   }
 
