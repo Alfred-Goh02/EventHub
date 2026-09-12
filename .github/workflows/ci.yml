@@ -49,6 +49,9 @@ jobs:
       # Ticketing: a third database, again with its own credentials.
       TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@localhost:5432/eventhub_ticketing
       TICKETING_APP_DATABASE_URL: postgresql://eventhub_ticketing_app:eventhub_ticketing_app@localhost:5432/eventhub_ticketing
+
+      LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@localhost:5432/eventhub_live
+      LIVE_APP_DATABASE_URL: postgresql://eventhub_live_app:eventhub_live_app@localhost:5432/eventhub_live
       # The sweeper credential. The reconciler runs on it, and the payment
       # webhook uses it for ONE statement: resolving which tenant a payment
       # belongs to. A webhook arrives with no tenant, and every table here is
@@ -165,6 +168,12 @@ jobs:
         working-directory: services/ticketing
         env:
           DATABASE_URL: ${{ env.TICKETING_DATABASE_URL }}
+        run: pnpm exec prisma migrate deploy
+
+      - name: Apply migrations (live)
+        working-directory: services/live
+        env:
+          DATABASE_URL: ${{ env.LIVE_DATABASE_URL }}
         run: pnpm exec prisma migrate deploy
 
       - name: Seed
@@ -499,6 +508,15 @@ jobs:
       # Needs no services running: it compares source against .env.example.
       - name: Assert every variable the code reads is one the reader is given
         run: node scripts/verify-env-documented.mjs
+
+      # The image installs dependencies before copying source, so every
+      # workspace package's manifest is COPYed individually first -- and that
+      # list is a maintenance trap. Adding services/live sprang it: pnpm install
+      # ran without Live's manifest, and the build failed far away with "Local
+      # package.json exists, but node_modules missing", which names the symptom
+      # and not the cause. Nothing connected that message to a missing line.
+      - name: Assert the image installs every workspace package
+        run: node scripts/verify-dockerfile-workspaces.mjs
 
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
@@ -1439,6 +1457,13 @@ jobs:
           control "$TICKETING_DATABASE_URL" ticketing
           check "$TICKETING_DATABASE_URL" ticketing "'_prisma_migrations'"
 
+          # Live has NO exemptions. Question and QuestionVote are both
+          # tenant-scoped, and the socket carries a verified tenant claim for its
+          # whole life -- there is nothing here that is read before tenant
+          # context exists.
+          control "$LIVE_DATABASE_URL" live
+          check "$LIVE_DATABASE_URL" live "'_prisma_migrations'"
+
       # Database-per-service must hold at the CONNECTION boundary, not merely at
       # the table grants. If this ever starts succeeding, the isolation has been
       # quietly weakened.
@@ -1485,10 +1510,16 @@ jobs:
           # pg_catalog even when the table reads are denied.
           refuse eventhub_event_app     eventhub_auth
           refuse eventhub_event_app     eventhub_ticketing
+          refuse eventhub_event_app     eventhub_live
           refuse eventhub_ticketing_app eventhub_auth
           refuse eventhub_ticketing_app eventhub_event
+          refuse eventhub_ticketing_app eventhub_live
           refuse eventhub_auth_app      eventhub_event
           refuse eventhub_auth_app      eventhub_ticketing
+          refuse eventhub_auth_app      eventhub_live
+          refuse eventhub_live_app      eventhub_auth
+          refuse eventhub_live_app      eventhub_event
+          refuse eventhub_live_app      eventhub_ticketing
 
           # A second control, on the ENV VAR rather than the template above.
           #

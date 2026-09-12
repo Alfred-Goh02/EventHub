@@ -1,0 +1,57 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A question asked during a live event.
+///
+/// The socket is a delivery channel, not a store. Everything a client can see
+/// lives here, which is what makes Redis Pub/Sub an acceptable fan-out bus: a
+/// client that misses messages while disconnected re-reads the list over plain
+/// HTTP rather than replaying anything. Lose the pub/sub message and you lose
+/// nothing that is not still sitting in this table.
+model Question {
+  id        String   @id @default(cuid())
+  tenantId  String
+  eventId   String
+  userId    String
+  body      String
+
+  /// Denormalised, and the list re-sorts on every vote.
+  ///
+  /// The alternative is a COUNT over QuestionVote per row on every render of a
+  /// list that changes constantly during a keynote. This column plus the index
+  /// below turns "the ordered question list for an event" into one indexed read.
+  /// It is maintained in the same transaction as the vote, so it cannot drift.
+  voteCount Int      @default(0)
+
+  createdAt DateTime @default(now())
+  votes     QuestionVote[]
+
+  /// tenantId leads because every query is tenant-scoped by RLS, and the rest
+  /// matches the one ordering the UI actually asks for: most-voted first, then
+  /// oldest-first as the tie-break.
+  @@index([tenantId, eventId, voteCount, createdAt])
+}
+
+/// One upvote, by one user, on one question.
+model QuestionVote {
+  questionId String
+  userId     String
+  tenantId   String
+  createdAt  DateTime @default(now())
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  /// THE COMPOSITE PRIMARY KEY IS THE CONCURRENCY CONTROL.
+  ///
+  /// One vote per user per question, decided by the database rather than by a
+  /// read-then-write that two concurrent clicks both pass. The handler inserts
+  /// and catches P2002; it never checks first. Same reasoning as Ticketing's
+  /// inventory guard — make the check and the write one statement.
+  @@id([questionId, userId])
+  @@index([tenantId])
+}
