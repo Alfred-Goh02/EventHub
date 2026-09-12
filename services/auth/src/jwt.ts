@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { importPKCS8, importSPKI, SignJWT, jwtVerify } from 'jose';
+import { importPKCS8, importSPKI, SignJWT } from 'jose';
 import type { Role } from '@eventhub/types';
 
 const ALG = 'RS256';
@@ -48,15 +48,26 @@ export async function signAccessToken(
     .sign(privateKey);
 }
 
-export async function verifyAccessToken(token: string) {
-  // Passing issuer and audience here makes jose REJECT tokens that do not match,
-  // rather than just returning them for us to check and forget to.
-  // `algorithms` is the important one: without it an attacker can present a
-  // token signed HS256 using the PUBLIC key as the shared secret.
-  const { payload } = await jwtVerify(token, publicKey, {
-    algorithms: [ALG],
-    issuer: ISSUER!,
-    audience: AUDIENCE!,
-  });
-  return payload;
-}
+/**
+ * There is no verifyAccessToken here, and that is deliberate.
+ *
+ * This file used to export one: a second implementation of token verification
+ * that nothing in the repository called. Found by listing every exported
+ * function and asking which ones nothing references — it was the only one.
+ *
+ * An unused copy of a security check is worse than no copy. It reads as the
+ * authoritative one, so somebody following the code arrives at a path that does
+ * not run, and somebody needing verification wires up the nearest thing to hand.
+ * That nearest thing was strictly WEAKER than the live path: it returned the
+ * raw jose payload, so a token minted before `role` existed would arrive with
+ * role undefined and flow onward as though it were a real value. The live
+ * middleware rejects exactly that.
+ *
+ * The repository has been here before. `claimInvite()` carried a perfect
+ * explanation of why read-then-write is wrong while nothing called it, and the
+ * pattern it warned about was inlined elsewhere without the guard.
+ *
+ * Verification lives in @eventhub/auth-middleware, once, and Auth consumes it
+ * through middleware/auth.ts like every other service — passing the `publicKey`
+ * exported above. Auth is the only one that also holds the private half.
+ */
