@@ -81,7 +81,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Three databases and nine roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 44 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 45 executable proofs of the invariants above |
 
 Three separate Postgres databases with their own credentials. CI asserts across
 all six directions that no service can even open a connection to another's.
