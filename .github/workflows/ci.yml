@@ -500,6 +500,20 @@ jobs:
       - name: Assert every variable the code reads is one the reader is given
         run: node scripts/verify-env-documented.mjs
 
+      # The redaction list is a backstop, and a backstop nobody exercises is a
+      # list of strings. This one had three holes that reading it did not reveal:
+      # `authorization` carried no `*.authorization` while all six of its
+      # neighbours had their wildcard, and `secret` and `privateKey` were absent
+      # altogether. Both name variables this codebase holds -- webhooks.ts reads
+      # PAYMENT_WEBHOOK_SECRET into `const secret`, and jwt.ts holds the RS256
+      # signing key.
+      #
+      # Runs the real logger in a child process and reads what came out, because
+      # createLogger writes to stdout and takes no destination. Re-implementing
+      # the redaction to compare against would test a copy.
+      - name: Assert the logger redacts what its list says it redacts
+        run: node scripts/verify-log-redaction.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
