@@ -14,7 +14,8 @@
     "kafkajs": "^2.2.4",
     "pg": "^8.22.0",
     "turbo": "^2.10.7",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=26",

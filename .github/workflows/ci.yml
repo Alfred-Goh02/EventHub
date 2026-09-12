@@ -149,7 +149,7 @@ jobs:
       # same tree would add a build and verify the same code twice. The compose
       # application path is a way to RUN the system, not a second thing to test.
       - name: Start infrastructure
-        run: docker compose up -d --wait postgres kafka schema-registry
+        run: docker compose up -d --wait postgres redis kafka schema-registry
 
       - name: Show what came up
         run: docker compose ps
@@ -531,6 +531,46 @@ jobs:
       # the redaction to compare against would test a copy.
       - name: Assert the logger redacts what its list says it redacts
         run: node scripts/verify-log-redaction.mjs
+
+      # THE ONE CLAIM CHAPTER 5 EXISTS TO MAKE GOOD ON: a question posted on one
+      # Live pod reaches a client connected to a DIFFERENT Live pod.
+      #
+      # Two pods, not one. A WebSocket is a file descriptor owned by one process
+      # -- pod B cannot write to a socket held by pod A -- so a single-pod test
+      # passes identically whether the fan-out layer exists or not.
+      #
+      # The verifier spawns both pods itself on 3104 and 3114 and needs Auth
+      # running to mint a token. Its positive control is free: delivery happens
+      # ONLY in the Redis subscriber callback, so the author's own copy travels
+      # through Redis too -- asserting the author sees exactly one proves the bus
+      # works AND that the handler is not also writing locally, which would give
+      # everyone on the posting pod two copies of everything.
+      - name: Assert a question crosses between Live pods, and only within its tenant
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          # LIVE'S ENV GOES ON THE VERIFIER, NOT ON THE STEP.
+          #
+          # A step-level `env:` block applies to everything the step runs --
+          # including the Auth service started above. Putting
+          # APP_DATABASE_URL=<live> there pointed Auth at eventhub_live, and it
+          # answered /login with
+          #
+          #   The table `public.User` does not exist in the current database.
+          #
+          # Scoped to this one command, the pods the verifier spawns inherit it
+          # and Auth keeps the job's own.
+          #
+          # KAFKA_BROKERS is required by Live's env schema even though this test
+          # asserts nothing about the topic: fail-fast at startup is the point,
+          # and the run without it said exactly "KAFKA_BROKERS: Required".
+          APP_DATABASE_URL="${{ env.LIVE_APP_DATABASE_URL }}"           REDIS_URL="redis://127.0.0.1:6379"           KAFKA_BROKERS="localhost:9092"           ALLOWED_ORIGIN_SUFFIX=".eventhub.local"           AUTH_PUBLIC_KEY_B64="$(base64 -w0 services/auth/keys/public.pem)"             node scripts/verify-live-fanout.mjs
+
+          pkill -f "node dist/index.js" || true
 
       # The password reset flow, including the failure that returns success.
       #
