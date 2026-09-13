@@ -706,6 +706,22 @@ jobs:
           SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-search-pagination.mjs
 
+      # CHAPTER 6, PART 5: changing the index without downtime. Analysis happens
+      # at index time and shard count cannot change in place, so a mapping or
+      # analyzer change is a new index, filled from the old one, and an alias
+      # swap.
+      #
+      # Run against the real migration code on scratch indices, while a tenant's
+      # search loops and writes land: no write is lost (including one after the
+      # copy and before the swap, which only moving writes first can place), no
+      # older copy overwrites a newer write, no search fails or comes back empty,
+      # every tenant alias moves with its filter in the same atomic call, and the
+      # whole thing can be run backwards.
+      - name: Assert a migration to a new index loses nothing, fails nothing, and can be undone
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+        run: node scripts/verify-search-reindex.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
