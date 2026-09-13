@@ -7,7 +7,8 @@
     "dev": "tsx watch --env-file=.env src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "bootstrap:index": "node --env-file-if-exists=.env dist/scripts/bootstrap-index.js"
+    "bootstrap:index": "node --env-file-if-exists=.env dist/scripts/bootstrap-index.js",
+    "reindex": "node --env-file-if-exists=.env dist/scripts/reindex.js"
   },
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
