@@ -5,6 +5,7 @@ import { env } from './env.js';
 import { clusterInfo, os } from './opensearch.js';
 import { createIndexer, indexerMetrics } from './indexer/consumer.js';
 import { search } from './routes/search.js';
+import { searchMetrics } from './search-metrics.js';
 
 const logger = createLogger('search-service');
 const app = express();
@@ -43,12 +44,32 @@ app.get('/ready', (_req, res) => {
 });
 
 /**
- * The indexer's counters. JSON rather than Prometheus text, the same as Live's
- * /metrics and for the same reason: nothing scrapes this yet, and a format with
- * no consumer is a guess.
+ * The indexer's counters and lag, and what search has been doing. JSON rather
+ * than Prometheus text, the same as Live's /metrics and for the same reason:
+ * nothing scrapes this yet, and a format with no consumer is a guess.
+ *
+ * TWO NUMBERS DECIDE WHETHER THIS SERVICE IS HEALTHY, and neither appears in HTTP
+ * metrics: how far the indexer is behind, which IS the staleness of search, and
+ * the version-conflict rate, which separates ordinary redelivery (low and steady)
+ * from a rebalance loop (a spike).
+ *
+ * Lag is two broker round trips, so it is cached for five seconds and bounded at
+ * two: a /metrics request must never be the thing that hangs when Kafka does.
  */
-app.get('/metrics', (_req, res) => {
-  res.json({ indexer: indexerMetrics() });
+let lagCache: { at: number; value: unknown } | null = null;
+
+app.get('/metrics', async (_req, res) => {
+  if (lagCache === null || Date.now() - lagCache.at > 5_000) {
+    const value = await Promise.race([
+      indexer.lag(),
+      sleep(2_000).then(() => ({ error: 'timed out reading offsets' })),
+    ]).catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }));
+    lagCache = { at: Date.now(), value };
+  }
+  res.json({
+    indexer: { ...indexerMetrics(), lag: lagCache.value },
+    search: searchMetrics(),
+  });
 });
 
 app.use(search);

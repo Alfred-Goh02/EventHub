@@ -48,6 +48,12 @@ const searchEnvSchema = baseEnvSchema
      * 'latest' exists for the verifiers, which run under a fresh group each time
      * — replaying the topic's whole history there would index every earlier
      * run's fixtures into the shared index.
+     *
+     * 'latest' LOSES MESSAGES, which is why it is for verifiers only. A partition
+     * the group has never committed on starts at the end EVERY time the consumer
+     * starts, so anything produced there while the indexer was down is skipped
+     * for good. scripts/verify-search-observability.mjs found it: a restart under
+     * 'latest' never indexed the seven events produced while it was stopped.
      */
     SEARCH_INDEXER_START_FROM: z.enum(['earliest', 'latest']).default('earliest'),
 

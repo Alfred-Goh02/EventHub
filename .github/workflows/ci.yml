@@ -722,6 +722,20 @@ jobs:
           OPENSEARCH_NODE: http://127.0.0.1:9200
         run: node scripts/verify-search-reindex.mjs
 
+      # CHAPTER 6, PART 6: the two numbers that decide whether Search is healthy,
+      # and that no HTTP metric shows. Indexer lag, in MESSAGES -- offsets, not
+      # wall-clock time, which read 12329 seconds on an idle healthy consumer
+      # once -- must rise while the indexer is stopped and return to 0 because
+      # it caught up. A replay must raise the version-conflict counter by exactly
+      # the number replayed and dead-letter nothing. Searches are counted by
+      # outcome and timed, and the live index carries its slowlog threshold.
+      - name: Assert /metrics shows how stale search is and whether redelivery is normal
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+          KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+        run: node scripts/verify-search-observability.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
