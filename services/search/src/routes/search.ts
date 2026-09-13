@@ -5,6 +5,7 @@ import { getAuth } from '@eventhub/auth-middleware';
 import { requireAuth } from '../auth.js';
 import { CursorError, decodeCursor, encodeCursor, queryHash } from '../cursor.js';
 import { degradedSearch } from '../degraded.js';
+import { recordSearch } from '../search-metrics.js';
 import {
   closePit,
   openPitForTenant,
@@ -140,6 +141,8 @@ search.get('/search', requireAuth, async (req, res, next) => {
   // The signed claim. X-Tenant-ID is never read on this path.
   const { tenantId } = getAuth(req);
   const p = parsed.data;
+  const started = performance.now();
+  const elapsed = () => performance.now() - started;
 
   /**
    * What PUBLIC search shows: published, upcoming unless asked otherwise. A
@@ -237,6 +240,7 @@ search.get('/search', requireAuth, async (req, res, next) => {
       },
       'search served',
     );
+    recordSearch('served', elapsed());
     res.json(response);
   } catch (err) {
     if (pitGone(err)) {
@@ -244,12 +248,14 @@ search.get('/search', requireAuth, async (req, res, next) => {
       return;
     }
     if (!clusterUnavailable(err)) {
+      recordSearch('failed', elapsed());
       next(err);
       return;
     }
     if (p.cursor) {
       // The degraded path has no pages to continue. Returning its first page to
       // a request for page four would look like results and be wrong.
+      recordSearch('failed', elapsed());
       res.status(503).json({ error: 'search is degraded and cannot continue this page' });
       return;
     }
@@ -261,10 +267,12 @@ search.get('/search', requireAuth, async (req, res, next) => {
         includePast: p.includePast,
         limit: p.limit,
       });
+      recordSearch('degraded', elapsed());
       res.setHeader('X-Search-Degraded', 'true');
       res.json({ ...fallback, nextCursor: null });
     } catch (fallbackErr) {
       logger.error({ err: fallbackErr }, 'the degraded path failed as well');
+      recordSearch('failed', elapsed());
       res.status(503).json({ error: 'search is unavailable' });
     }
   }

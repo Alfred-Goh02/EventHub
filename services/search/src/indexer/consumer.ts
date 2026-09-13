@@ -5,6 +5,7 @@ import type { Logger } from '@eventhub/logger';
 import { eventSnapshot } from './contract.js';
 import { toIndexAction, type IndexAction } from './to-document.js';
 import { bulkIndex, type ItemOutcome } from './bulk.js';
+import { consumerLag, type ConsumerLag } from './lag.js';
 
 const TOPIC = 'events.activity';
 const DLQ = 'events.activity.dlq';
@@ -89,6 +90,9 @@ export function createIndexer(opts: {
   const registry = new SchemaRegistry({ host: opts.registryUrl });
   const consumer = kafka.consumer({ groupId: opts.groupId });
   const producer = kafka.producer();
+  // Reads offsets for the lag measurement. Its own connection, so a slow
+  // metadata request never waits behind a fetch.
+  const admin = kafka.admin();
 
   /**
    * Parks a message where an operator can find it, with enough to replay it.
@@ -215,6 +219,7 @@ export function createIndexer(opts: {
   return {
     async start(): Promise<void> {
       await producer.connect();
+      await admin.connect();
       await consumer.connect();
 
       consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => {
@@ -240,9 +245,15 @@ export function createIndexer(opts: {
       opts.logger.info({ topic: TOPIC, group: opts.groupId, startFrom: opts.startFrom }, 'indexer running');
     },
 
+    /** Messages behind, per partition. See lag.ts. */
+    lag(): Promise<ConsumerLag> {
+      return consumerLag(admin, opts.groupId, TOPIC);
+    },
+
     async stop(): Promise<void> {
       await consumer.disconnect().catch(() => {});
       await producer.disconnect().catch(() => {});
+      await admin.disconnect().catch(() => {});
     },
   };
 }
