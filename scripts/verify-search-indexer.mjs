@@ -52,6 +52,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
+import { searchServiceEnv } from './lib/search-service-env.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -71,7 +72,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    // HERE, not only at the end. A `return` inside the try below runs the
+    // finally and then skips the end-of-run gate, and this file once printed
+    // FAIL twice and exited 0 — a red run CI would have called green.
+    process.exitCode = 1;
+  }
 }
 
 const run = randomUUID().replace(/-/g, '').slice(0, 8);
@@ -180,10 +187,9 @@ async function main() {
 
     child = spawn(process.execPath, ['dist/index.js'], {
       cwd: join(ROOT, 'services', 'search'),
-      env: {
-        PATH: process.env['PATH'],
-        SystemRoot: process.env['SystemRoot'],
-        NODE_ENV: 'development',
+      // Search's own .env.example plus these. See scripts/lib/search-service-env.mjs
+      // for the three times a hand-written list here fell behind the service.
+      env: searchServiceEnv(ROOT, {
         LOG_LEVEL: 'warn',
         PORT: String(PORT),
         OPENSEARCH_NODE: process.env['OPENSEARCH_NODE'],
@@ -191,13 +197,7 @@ async function main() {
         SCHEMA_REGISTRY_URL: REGISTRY,
         KAFKA_CONSUMER_GROUP: GROUP,
         SEARCH_INDEXER_START_FROM: 'latest',
-        // The service verifies tokens at startup since GET /search exists, so it
-        // needs a key and issuer to boot at all, even though nothing here calls it.
-        AUTH_PUBLIC_KEY_B64: readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem')).toString('base64'),
-        JWT_ISSUER: process.env['JWT_ISSUER'] ?? 'https://auth.eventhub.local',
-        JWT_AUDIENCE: process.env['JWT_AUDIENCE'] ?? 'eventhub-api',
-        EVENT_SERVICE_URL: process.env['EVENT_URL'] ?? 'http://127.0.0.1:3002',
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.stdout.on('data', (c) => (childOutput += c));

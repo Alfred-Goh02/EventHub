@@ -83,7 +83,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 51 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 52 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -426,8 +426,8 @@ before being trusted. An assertion nobody has seen go red is a guess.
 Chapters 1–5 are built: foundations, auth and RLS, the Event service and the
 Kafka backbone, Ticketing through payments, and live Q&A over WebSockets.
 Chapter 6, search, is in progress: the index, per-tenant isolation, the Kafka
-indexer and the query API with its degraded fallback exist and are verified.
-Deep pagination, the reindex-and-swap migration and indexer observability do not
+indexer, the query API with its degraded fallback, and deep pagination exist and
+are verified. The reindex-and-swap migration and indexer observability do not
 exist yet.
 Later chapters (analytics, notifications, community) are designed and documented
 but not implemented.

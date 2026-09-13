@@ -196,6 +196,12 @@ export const eventSearchRequest = z
     startsBefore: z.string().datetime().optional(),
     /** Events starting from the current hour onward. See the range below. */
     upcomingOnly: z.boolean().optional(),
+    /**
+     * The previous page's last sort values, for search_after. Scalars only, and
+     * no more than the sort has keys: this came back from a client, inside a
+     * signed cursor, and is still validated as though it had not.
+     */
+    after: z.array(z.union([z.string(), z.number(), z.null()])).max(3).optional(),
     facets: z.array(z.enum(FACETS)).max(FACETS.length).optional(),
     from: z.number().int().min(0).max(10_000).optional(),
     size: z.number().int().min(0).max(100).optional(),
@@ -216,11 +222,18 @@ export function buildSearchBody(
   tenantId: string,
 ): Record<string, unknown> {
   /**
-   * The tenant term is REDUNDANT with the alias filter, deliberately. The alias
-   * is the enforcement; this is a third layer after the signed claim and the
-   * alias, so that a broken alias and a broken builder would both have to fail
-   * at once. It costs nothing: a term filter on a keyword field is a cached
-   * bitset.
+   * The tenant term looks REDUNDANT with the alias filter, and on an ordinary
+   * search it is: the alias enforces, and this is a third layer after the signed
+   * claim and the alias. It costs nothing — a term filter on a keyword field is a
+   * cached bitset.
+   *
+   * With a Point-in-Time it is not redundant at all. A PIT search names no index,
+   * so the alias is whatever the PIT was opened through, and the PIT id arrives
+   * inside a cursor the client handed back. The cursor is signed, but removing
+   * this filter was run against scripts/verify-search-pagination.mjs with a
+   * validly signed cursor for tenant B carrying tenant A's PIT, and B read 10 of
+   * A's events. So a leaked signing secret would be a cross-tenant read, and
+   * this line is the only thing that stops it.
    */
   const filter: unknown[] = [{ term: { tenantId } }];
   for (const [field, values] of Object.entries(request.filters ?? {})) {
@@ -313,6 +326,7 @@ export function buildSearchBody(
       fields: { title: {}, description: { fragment_size: 150, number_of_fragments: 1 } },
     },
     _source: ['tenantId', 'eventId', 'slug', 'title', 'startsAt', 'endsAt', 'city', 'category', 'status'],
+    ...(request.after ? { search_after: request.after } : {}),
     ...(Object.keys(aggs).length > 0 ? { aggs } : {}),
   };
 }
@@ -327,20 +341,34 @@ export function buildSearchBody(
 export async function searchForTenant(
   tenantId: string,
   request: unknown,
+  page?: { pitId: string },
 ): Promise<Record<string, unknown>> {
   const parsed = eventSearchRequest.parse(request);
   const alias = await ensureTenantAlias(tenantId);
 
   try {
-    const { body } = await os.search({
-      index: alias,
-      body: buildSearchBody(parsed, tenantId),
-      // Belt and braces with the id check: the target is one literal name, and
-      // if it ever were not, nothing would expand it.
-      expand_wildcards: 'none',
-      allow_no_indices: false,
-      ignore_unavailable: false,
-    });
+    /**
+     * With a PIT the request names NO index — OpenSearch refuses one — because
+     * the PIT already pins which shards and which snapshot are read. It was
+     * opened through this tenant's alias, and the alias filter travels with it:
+     * measured with two tenants on the same shard, a PIT opened through a
+     * routing-only alias returned both, and one opened through the filtered
+     * alias returned one. The tenant term in the body stays as the backstop for
+     * a PIT id that did not come from this tenant.
+     */
+    const { body } = page
+      ? await os.search({
+          body: { ...buildSearchBody(parsed, tenantId), pit: { id: page.pitId, keep_alive: PIT_KEEP_ALIVE } },
+        })
+      : await os.search({
+          index: alias,
+          body: buildSearchBody(parsed, tenantId),
+          // Belt and braces with the id check: the target is one literal name,
+          // and if it ever were not, nothing would expand it.
+          expand_wildcards: 'none',
+          allow_no_indices: false,
+          ignore_unavailable: false,
+        });
     return body as Record<string, unknown>;
   } catch (err) {
     // Whatever went wrong, stop trusting the cached verification: an alias that
@@ -348,6 +376,33 @@ export async function searchForTenant(
     verified.delete(alias);
     throw err;
   }
+}
+
+/**
+ * How long a Point-in-Time outlives its last use. Each page renews it.
+ *
+ * A PIT holds its segments open, so merges cannot reclaim them while it lives —
+ * the reason Scroll was replaced, and the reason this is a minute rather than
+ * the length of a browsing session. A reader who pauses longer starts again.
+ */
+const PIT_KEEP_ALIVE = '1m';
+
+/**
+ * Opens a PIT through the tenant's alias — the only way this module opens one,
+ * so a PIT for a raw index cannot be created by mistake either.
+ */
+export async function openPitForTenant(tenantId: string): Promise<string> {
+  const alias = await ensureTenantAlias(tenantId);
+  const { body } = await os.createPit({ index: alias, keep_alive: PIT_KEEP_ALIVE });
+  return (body as { pit_id: string }).pit_id;
+}
+
+/**
+ * Releases a PIT as soon as a traversal ends, rather than leaving it to expire.
+ * Best effort: a PIT that is already gone has nothing left to release.
+ */
+export async function closePit(pitId: string): Promise<void> {
+  await os.deletePit({ body: { pit_id: [pitId] } }).catch(() => {});
 }
 
 /** Test seam: forget verified aliases so a fresh run re-checks the cluster. */

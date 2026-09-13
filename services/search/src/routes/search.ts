@@ -3,8 +3,14 @@ import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { getAuth } from '@eventhub/auth-middleware';
 import { requireAuth } from '../auth.js';
+import { CursorError, decodeCursor, encodeCursor, queryHash } from '../cursor.js';
 import { degradedSearch } from '../degraded.js';
-import { searchForTenant, type EventSearchRequest } from '../tenant-alias.js';
+import {
+  closePit,
+  openPitForTenant,
+  searchForTenant,
+  type EventSearchRequest,
+} from '../tenant-alias.js';
 
 const logger = createLogger('search-route');
 
@@ -38,12 +44,14 @@ export const searchParams = z
     city: oneOrMany,
     includePast: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     limit: z.coerce.number().int().min(1).max(100).default(20),
+    cursor: z.string().max(4096).optional(),
   })
   .strict();
 
 interface Hit {
   _source: Record<string, unknown>;
   highlight?: Record<string, string[]>;
+  sort?: Array<string | number | null>;
 }
 interface Bucket {
   key: string | number;
@@ -56,8 +64,8 @@ interface TermsAgg {
   sum_other_doc_count?: number;
 }
 
-function toResponse(body: Record<string, unknown>): Record<string, unknown> {
-  const hits = (body['hits'] as { hits: Hit[]; total: { value: number } });
+function toResponse(body: Record<string, unknown>, nextCursor: string | null): Record<string, unknown> {
+  const hits = body['hits'] as { hits: Hit[]; total: { value: number } };
   const aggs = (body['aggregations'] ?? {}) as Record<string, TermsAgg>;
   const terms = (name: string) =>
     (aggs[name]?.buckets ?? []).map((b) => ({ value: b.key, count: b.doc_count }));
@@ -89,6 +97,7 @@ function toResponse(body: Record<string, unknown>): Record<string, unknown> {
     facetsExact: ['category', 'city'].every(
       (n) => (aggs[n]?.doc_count_error_upper_bound ?? 0) === 0 && (aggs[n]?.sum_other_doc_count ?? 0) === 0,
     ),
+    nextCursor,
     tookMs: body['took'],
     degraded: false,
   };
@@ -107,6 +116,18 @@ function clusterUnavailable(err: unknown): boolean {
     e.name === 'ResponseError' &&
     (status >= 500 || status === 429 || e.meta?.body?.error?.type === 'index_not_found_exception')
   );
+}
+
+/**
+ * Whether a failure is a PIT that no longer exists — expired, or released.
+ *
+ * Matched on what the cluster actually returns, measured by releasing a PIT and
+ * searching with it: a search_phase_execution_exception whose every root cause
+ * is search_context_missing_exception, "No search context found for id [347]".
+ */
+function pitGone(err: unknown): boolean {
+  const text = JSON.stringify((err as { meta?: { body?: unknown } })?.meta?.body ?? '');
+  return /search_context_missing_exception/.test(text);
 }
 
 search.get('/search', requireAuth, async (req, res, next) => {
@@ -138,9 +159,69 @@ search.get('/search', requireAuth, async (req, res, next) => {
     size: p.limit,
   };
 
+  // Every parameter but the cursor itself, in a fixed order, so the same query
+  // always hashes the same.
+  const hash = queryHash({
+    q: p.q ?? null,
+    category: p.category ?? null,
+    city: p.city ?? null,
+    includePast: p.includePast,
+    limit: p.limit,
+  });
+
+  let after: EventSearchRequest['after'];
+  let pitId: string | undefined;
+  if (p.cursor) {
+    try {
+      const cursor = decodeCursor(p.cursor, tenantId, hash);
+      after = cursor.a as EventSearchRequest['after'];
+      pitId = cursor.p;
+    } catch (err) {
+      if (!(err instanceof CursorError)) throw err;
+      logger.warn({ tenantId, reason: err.message }, 'refused a cursor');
+      res.status(400).json({ error: 'the cursor is not valid for this search' });
+      return;
+    }
+  }
+
   try {
-    const body = await searchForTenant(tenantId, request);
-    const response = toResponse(body);
+    /**
+     * DEEP PAGINATION: search_after inside a Point-in-Time.
+     *
+     * from/size is refused past max_result_window, and raising that limit trades
+     * an error for heap: every shard sorts from + size hits and throws all but
+     * size away. search_after seeks from the last sort values instead, at a
+     * constant cost per page — which is why the sort ends in a unique eventId.
+     *
+     * The PIT is what stops pages shifting while the indexer writes: without a
+     * snapshot a reader sees duplicates and skips. It is opened on the SECOND
+     * page, not the first. Opening one for every first page would open one for
+     * nearly every search, and most are never paged; the price is that page one
+     * and page two are not guaranteed one snapshot, while everything after is.
+     */
+    if (p.cursor && !pitId) pitId = await openPitForTenant(tenantId);
+
+    const body = await searchForTenant(
+      tenantId,
+      { ...request, ...(after ? { after } : {}) },
+      pitId ? { pitId } : undefined,
+    );
+
+    const hits = (body['hits'] as { hits: Hit[] }).hits;
+    // A search inside a PIT may hand back a new id; the latest is the one to keep.
+    const livePit = (body['pit_id'] as string | undefined) ?? pitId;
+    const last = hits[hits.length - 1];
+    const more = hits.length === p.limit && Array.isArray(last?.sort);
+
+    const nextCursor = more
+      ? encodeCursor({ t: tenantId, h: hash, a: last!.sort!, ...(livePit ? { p: livePit } : {}) })
+      : null;
+
+    // The traversal is over: release the snapshot now rather than in a minute.
+    // Awaited, so the last page is answered with nothing left open behind it.
+    if (!more && livePit) await closePit(livePit);
+
+    const response = toResponse(body, nextCursor);
 
     // The query's SHAPE, never its text: search terms are user content and can
     // carry personal data, so they do not belong in an info-level log line.
@@ -151,14 +232,25 @@ search.get('/search', requireAuth, async (req, res, next) => {
         total: response['total'],
         hasQuery: Boolean(p.q),
         qLength: p.q?.length ?? 0,
+        paged: Boolean(p.cursor),
         filters: [p.category ? 'category' : null, p.city ? 'city' : null].filter(Boolean),
       },
       'search served',
     );
     res.json(response);
   } catch (err) {
+    if (pitGone(err)) {
+      res.status(410).json({ error: 'this page has expired; start the search again' });
+      return;
+    }
     if (!clusterUnavailable(err)) {
       next(err);
+      return;
+    }
+    if (p.cursor) {
+      // The degraded path has no pages to continue. Returning its first page to
+      // a request for page four would look like results and be wrong.
+      res.status(503).json({ error: 'search is degraded and cannot continue this page' });
       return;
     }
 
@@ -170,7 +262,7 @@ search.get('/search', requireAuth, async (req, res, next) => {
         limit: p.limit,
       });
       res.setHeader('X-Search-Degraded', 'true');
-      res.json(fallback);
+      res.json({ ...fallback, nextCursor: null });
     } catch (fallbackErr) {
       logger.error({ err: fallbackErr }, 'the degraded path failed as well');
       res.status(503).json({ error: 'search is unavailable' });
