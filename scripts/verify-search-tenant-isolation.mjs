@@ -66,6 +66,7 @@ process.env['NODE_ENV'] ??= 'development';
 process.env['PORT'] ??= '3005';
 process.env['OPENSEARCH_NODE'] ??= 'http://127.0.0.1:9200';
 process.env['KAFKA_BROKERS'] ??= '127.0.0.1:9092';
+process.env['SCHEMA_REGISTRY_URL'] ??= 'http://127.0.0.1:8081';
 
 const mod = (rel) => import(pathToFileURL(join(ROOT, 'services', 'search', 'dist', rel)).href);
 

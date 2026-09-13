@@ -121,6 +121,9 @@ export function createProjectionConsumer(opts: {
           headers: {
             ...message.headers,
             'dlq-reason': reason,
+            // The DLQ is shared with Search's indexer, which parks its own copy of
+            // the same poison message. This says whose failure this copy records.
+            'dlq-consumer-group': GROUP,
             'dlq-source-topic': topic,
             'dlq-source-partition': String(partition),
             'dlq-source-offset': message.offset,

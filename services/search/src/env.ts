@@ -42,6 +42,20 @@ const searchEnvSchema = baseEnvSchema.omit({ DATABASE_URL: true }).extend({
    * load-balancing IS what you want — the opposite of Live's fan-out problem.
    */
   KAFKA_CONSUMER_GROUP: z.string().default('search-indexer'),
+
+  /** Where the indexer resolves Avro schema ids. The relay registers them. */
+  SCHEMA_REGISTRY_URL: z.string().url(),
+
+  /**
+   * Where a consumer group with NO committed offsets begins.
+   *
+   * 'earliest' is the real setting: the topic is compacted precisely so that a
+   * new deployment, or a wiped index, rebuilds by replaying from the start.
+   * 'latest' exists for scripts/verify-search-indexer.mjs, which runs under a
+   * fresh group each time — replaying the topic's whole history there would
+   * index every earlier run's fixtures into the shared index.
+   */
+  SEARCH_INDEXER_START_FROM: z.enum(['earliest', 'latest']).default('earliest'),
 });
 
 export const env = loadEnv(searchEnvSchema);
