@@ -165,8 +165,11 @@ export async function ensureTenantAlias(tenantId: string): Promise<string> {
   return alias;
 }
 
-/** The only fields a facet can be asked for. Each is a keyword field. */
+/** Keyword fields a terms facet can be asked for. */
 export const FACET_FIELDS = ['category', 'city', 'country', 'tags'] as const;
+
+/** Every facet a request can name: the terms facets, plus events per week. */
+export const FACETS = [...FACET_FIELDS, 'week'] as const;
 
 const keywordValues = z.array(z.string().min(1).max(200)).max(50);
 
@@ -191,7 +194,9 @@ export const eventSearchRequest = z
       .optional(),
     startsAfter: z.string().datetime().optional(),
     startsBefore: z.string().datetime().optional(),
-    facets: z.array(z.enum(FACET_FIELDS)).max(FACET_FIELDS.length).optional(),
+    /** Events starting from the current hour onward. See the range below. */
+    upcomingOnly: z.boolean().optional(),
+    facets: z.array(z.enum(FACETS)).max(FACETS.length).optional(),
     from: z.number().int().min(0).max(10_000).optional(),
     size: z.number().int().min(0).max(100).optional(),
   })
@@ -206,8 +211,18 @@ export type EventSearchRequest = z.infer<typeof eventSearchRequest>;
  * not affect the score, which is right for "city is Berlin", and its result is
  * cacheable across requests, which a scored clause is not.
  */
-export function buildSearchBody(request: EventSearchRequest): Record<string, unknown> {
-  const filter: unknown[] = [];
+export function buildSearchBody(
+  request: EventSearchRequest,
+  tenantId: string,
+): Record<string, unknown> {
+  /**
+   * The tenant term is REDUNDANT with the alias filter, deliberately. The alias
+   * is the enforcement; this is a third layer after the signed claim and the
+   * alias, so that a broken alias and a broken builder would both have to fail
+   * at once. It costs nothing: a term filter on a keyword field is a cached
+   * bitset.
+   */
+  const filter: unknown[] = [{ term: { tenantId } }];
   for (const [field, values] of Object.entries(request.filters ?? {})) {
     if (values && values.length > 0) filter.push({ terms: { [field]: values } });
   }
@@ -222,16 +237,45 @@ export function buildSearchBody(request: EventSearchRequest): Record<string, unk
     });
   }
 
+  if (request.upcomingOnly) {
+    // now/h, not now. `now` changes every millisecond, so a filter on it is a
+    // new filter on every request and never cached; rounded to the hour it is
+    // the same filter for an hour, at the cost of showing events that started
+    // up to an hour ago.
+    filter.push({ range: { startsAt: { gte: 'now/h' } } });
+  }
+
+  /**
+   * RELEVANCE, and every setting is a decision:
+   *
+   *   boosts       a title match outranks a description match for the same word
+   *   fuzziness    AUTO: no edits for 1-2 characters, one for 3-5, two beyond —
+   *                "festvl" still finds "festival"
+   *   prefix_length 1  the first character must match exactly, which prunes most
+   *                of the term dictionary before any edit distance is computed,
+   *                for a small cost in recall
+   *   operator and every word must match somewhere; `or` makes a two-word query
+   *                return anything containing either word
+   *
+   * With no text there is NO must clause, rather than match_all: match_all
+   * scores every document the same, and sorting by an identical score is
+   * arbitrary order. The browse page needs a real sort, which is below.
+   */
   const must = request.text
     ? [
         {
           multi_match: {
             query: request.text,
-            fields: ['title^3', 'description', 'venueName', 'organizerName'],
+            fields: ['title^3', 'tags^2', 'venueName^2', 'organizerName^1.5', 'description'],
+            type: 'best_fields',
+            fuzziness: 'AUTO',
+            prefix_length: 1,
+            max_expansions: 50,
+            operator: 'and',
           },
         },
       ]
-    : [{ match_all: {} }];
+    : [];
 
   /**
    * min_doc_count: 1, ALWAYS. At 0 a terms aggregation fills its buckets from
@@ -247,7 +291,9 @@ export function buildSearchBody(request: EventSearchRequest): Record<string, unk
   const aggs = Object.fromEntries(
     (request.facets ?? []).map((field) => [
       field,
-      { terms: { field, size: 50, min_doc_count: 1 } },
+      field === 'week'
+        ? { date_histogram: { field: 'startsAt', calendar_interval: 'week', min_doc_count: 1 } }
+        : { terms: { field, size: 50, min_doc_count: 1 } },
     ]),
   );
 
@@ -256,6 +302,17 @@ export function buildSearchBody(request: EventSearchRequest): Record<string, unk
     size: request.size ?? 20,
     track_total_hits: true,
     query: { bool: { must, filter } },
+    // Ending in eventId, a unique keyword, so the order is TOTAL: two events at
+    // the same moment always come back in the same order, which paging by
+    // search_after will need.
+    sort: request.text
+      ? [{ _score: 'desc' }, { startsAt: 'asc' }, { eventId: 'asc' }]
+      : [{ startsAt: 'asc' }, { eventId: 'asc' }],
+    highlight: {
+      require_field_match: false,
+      fields: { title: {}, description: { fragment_size: 150, number_of_fragments: 1 } },
+    },
+    _source: ['tenantId', 'eventId', 'slug', 'title', 'startsAt', 'endsAt', 'city', 'category', 'status'],
     ...(Object.keys(aggs).length > 0 ? { aggs } : {}),
   };
 }
@@ -277,7 +334,7 @@ export async function searchForTenant(
   try {
     const { body } = await os.search({
       index: alias,
-      body: buildSearchBody(parsed),
+      body: buildSearchBody(parsed, tenantId),
       // Belt and braces with the id check: the target is one literal name, and
       // if it ever were not, nothing would expand it.
       expand_wildcards: 'none',

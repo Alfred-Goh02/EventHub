@@ -1,5 +1,6 @@
 import { Client } from '@opensearch-project/opensearch';
-import { env } from './env.js';
+// The cluster's settings only — not the service's. See cluster-env.ts.
+import { clusterEnv as env } from './cluster-env.js';
 
 /**
  * The one place that knows how to reach the cluster.

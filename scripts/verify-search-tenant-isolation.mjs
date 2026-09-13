@@ -60,13 +60,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-// The Search env schema is fail-fast, so these must be present before the module
-// graph loads. Defaults match services/search/.env.example.
-process.env['NODE_ENV'] ??= 'development';
-process.env['PORT'] ??= '3005';
+// The cluster settings are fail-fast, so this must be present before the module
+// graph loads. It is the only one: the modules imported here read cluster-env.ts,
+// not the service's whole configuration.
 process.env['OPENSEARCH_NODE'] ??= 'http://127.0.0.1:9200';
-process.env['KAFKA_BROKERS'] ??= '127.0.0.1:9092';
-process.env['SCHEMA_REGISTRY_URL'] ??= 'http://127.0.0.1:8081';
 
 const mod = (rel) => import(pathToFileURL(join(ROOT, 'services', 'search', 'dist', rel)).href);
 

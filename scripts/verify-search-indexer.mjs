@@ -47,6 +47,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Kafka, logLevel } from 'kafkajs';
@@ -54,8 +55,6 @@ import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-process.env['NODE_ENV'] ??= 'development';
-process.env['PORT'] ??= '3005';
 process.env['OPENSEARCH_NODE'] ??= 'http://127.0.0.1:9200';
 process.env['KAFKA_BROKERS'] ??= '127.0.0.1:9092';
 process.env['SCHEMA_REGISTRY_URL'] ??= 'http://127.0.0.1:8081';
@@ -192,6 +191,12 @@ async function main() {
         SCHEMA_REGISTRY_URL: REGISTRY,
         KAFKA_CONSUMER_GROUP: GROUP,
         SEARCH_INDEXER_START_FROM: 'latest',
+        // The service verifies tokens at startup since GET /search exists, so it
+        // needs a key and issuer to boot at all, even though nothing here calls it.
+        AUTH_PUBLIC_KEY_B64: readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem')).toString('base64'),
+        JWT_ISSUER: process.env['JWT_ISSUER'] ?? 'https://auth.eventhub.local',
+        JWT_AUDIENCE: process.env['JWT_AUDIENCE'] ?? 'eventhub-api',
+        EVENT_SERVICE_URL: process.env['EVENT_URL'] ?? 'http://127.0.0.1:3002',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
