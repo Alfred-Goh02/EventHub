@@ -315,6 +315,68 @@ events.get('/', requireAuth, ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// Search, degraded
+// ---------------------------------------------------------------------------
+
+/**
+ * The most rows the degraded path will ever return, whatever is asked.
+ *
+ * The cap is the point of this route. It exists for when OpenSearch is down, and
+ * an uncapped fallback would turn a search outage into a Postgres outage — every
+ * search the cluster was absorbing, now arriving here as an ILIKE.
+ */
+const DEGRADED_CAP = 50;
+
+/**
+ * What the Search service calls when OpenSearch is unavailable.
+ *
+ * DECLARED BEFORE /:id, because Express matches in order and /:id would take
+ * "search" as an event id.
+ *
+ * Search forwards the CALLER'S bearer token rather than holding a credential of
+ * its own, so the tenant comes from the signed claim and RLS enforces it here
+ * exactly as on every other read.
+ *
+ * PUBLISHED only, for every role: this stands in for public search, which shows
+ * nothing else. No relevance, no facets, no typo tolerance — a title substring,
+ * soonest first, which is what "degraded" honestly means.
+ *
+ * The caller's text is escaped before it becomes a pattern. Unescaped, a search
+ * for "%" is a pattern that matches every title.
+ */
+events.get('/search', requireAuth, ah(async (req, res) => {
+  const query = z
+    .object({
+      q: z.string().trim().min(1).max(200).optional(),
+      includePast: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+    })
+    .strict()
+    .safeParse(req.query);
+
+  if (!query.success) {
+    return res.status(400).json({ error: query.error.flatten() });
+  }
+
+  const { q, includePast } = query.data;
+  const pattern = q ? `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+
+  const rows = await withTenant(req.auth!.tenantId, (tx) =>
+    tx.$queryRaw<Array<{ id: string; slug: string; title: string; startsAt: Date; endsAt: Date }>>`
+      SELECT e.id, e.slug, e.title, e."startsAt", e."endsAt"
+        FROM "Event" e
+       WHERE e."deletedAt" IS NULL
+         AND e.status = 'PUBLISHED'
+         AND (${includePast} OR e."startsAt" >= now())
+         AND (${pattern}::text IS NULL OR e.title ILIKE ${pattern} ESCAPE '\\')
+       ORDER BY e."startsAt" ASC, e.id ASC
+       LIMIT ${DEGRADED_CAP}
+    `,
+  );
+
+  return res.json({ data: rows, cap: DEGRADED_CAP });
+}));
+
+// ---------------------------------------------------------------------------
 // Read one
 // ---------------------------------------------------------------------------
 events.get('/:id', requireAuth, ah(async (req, res) => {

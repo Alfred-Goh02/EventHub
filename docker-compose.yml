@@ -343,10 +343,10 @@ services:
         echo "setup: registering Avro schemas"
         node scripts/register-schemas.mjs
 
-        # From index-definition.ts, before the indexer can write anything. PORT
-        # only because the shared base schema requires one; nothing binds it.
+        # From index-definition.ts, before the indexer can write anything. Needs
+        # only OPENSEARCH_NODE, set above: the script reads cluster-env.ts.
         echo "setup: creating the search index"
-        PORT=3005 pnpm --filter @eventhub/search run bootstrap:index
+        pnpm --filter @eventhub/search run bootstrap:index
 
         echo "setup: done"
 
@@ -544,6 +544,11 @@ services:
       <<: *app-env
       PORT: 3005
       OPENSEARCH_NODE: http://opensearch:9200
+      # The degraded path, called with the caller's own token.
+      EVENT_SERVICE_URL: http://event:3002
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+    volumes:
+      - jwt-keys:/run/eventhub/keys:ro
     working_dir: /app/services/search
     command: ["node", "dist/index.js"]
     healthcheck:

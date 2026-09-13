@@ -2,8 +2,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { env } from './env.js';
-import { clusterInfo } from './opensearch.js';
+import { clusterInfo, os } from './opensearch.js';
 import { createIndexer, indexerMetrics } from './indexer/consumer.js';
+import { search } from './routes/search.js';
 
 const logger = createLogger('search-service');
 const app = express();
@@ -15,17 +16,26 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Readiness reports whether the CLUSTER is reachable, which is a different
- * question from whether this process is alive.
+ * Readiness reports whether the CLUSTER can serve, which is a different question
+ * from whether this process is alive.
  *
  * Search is the one service in the fleet that is allowed to be degraded rather
  * than broken: its store is a derived read model, so losing it costs the search
  * box and nothing else. Saying so here — rather than failing /health and being
  * restarted in a loop — is what makes that degradation orderly.
+ *
+ * wait_for_status=yellow, not green: one node can never place a replica, so
+ * green is unreachable locally, while red means a PRIMARY is unassigned, which
+ * is real unavailability. Liveness goes to /health and must never point here, or
+ * a slow cluster restarts every replica at once.
  */
 app.get('/ready', (_req, res) => {
-  clusterInfo()
-    .then((info) => res.json({ ready: true, opensearch: info }))
+  os.cluster
+    .health({ wait_for_status: 'yellow', timeout: '2s' })
+    .then(({ body }) => {
+      if (body.timed_out) res.status(503).json({ ready: false, cluster: body.status });
+      else res.json({ ready: true, cluster: body.status });
+    })
     .catch((err: unknown) => {
       logger.warn({ err }, 'opensearch unreachable');
       res.status(503).json({ ready: false });
@@ -40,6 +50,8 @@ app.get('/ready', (_req, res) => {
 app.get('/metrics', (_req, res) => {
   res.json({ indexer: indexerMetrics() });
 });
+
+app.use(search);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error({ err }, 'unhandled error');

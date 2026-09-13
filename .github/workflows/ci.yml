@@ -204,15 +204,13 @@ jobs:
       # mapping the one that exists.
       - name: Create the search index
         working-directory: services/search
-        # Search's schema is fail-fast. Locally its variables come from
-        # services/search/.env. Here there is no .env: PORT comes from the job env
-        # above (the shared base requires one even of a script that binds
-        # nothing), and the two below are Search's own. The package script uses
+        # Only the cluster address. The script reads cluster-env.ts, not the
+        # service's whole configuration -- it used to read all of it, and twice
+        # a variable added for the HTTP or Kafka side broke this step. Locally
+        # the address comes from services/search/.env; the package script uses
         # --env-file-if-exists precisely so that both paths work.
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
-          KAFKA_BROKERS: localhost:9092
-          SCHEMA_REGISTRY_URL: http://localhost:8081
         run: pnpm run bootstrap:index
 
       # Keys are gitignored, so CI generates its own throwaway pair. Never reuse
@@ -633,8 +631,6 @@ jobs:
       - name: Assert a tenant's search cannot reach another tenant's documents
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
-          KAFKA_BROKERS: localhost:9092
-          SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-search-tenant-isolation.mjs
 
       # CHAPTER 6, PART 2: the indexer, under the delivery Kafka actually gives
@@ -659,6 +655,35 @@ jobs:
           KAFKA_BROKERS: localhost:9092
           SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-search-indexer.mjs
+
+      # CHAPTER 6, PART 3: GET /search, over HTTP, against the real service.
+      #
+      # The tenant is the signed claim and nothing else -- no token, a forged
+      # one, alg none, an expired or wrong-audience token are 401, and
+      # X-Tenant-ID changes nothing. Public search shows published, upcoming
+      # events; ?includePast=false is sent as the STRING "false", because
+      # z.coerce.boolean() would read it as true. Typos still find, a title
+      # match outranks a description match, facets add up to the total.
+      #
+      # And with OpenSearch unreachable, a second Search instance falls back to
+      # the Event service: capped at 50, published only, scoped by the caller's
+      # own token through RLS, with a literal "%" matching only a literal "%".
+      # So Event runs here too, from this build, for its /events/search.
+      - name: Assert GET /search answers only for the signed tenant, and degrades rather than breaks
+        run: |
+          AUTH_PUBLIC_KEY_B64=$(base64 -w0 services/auth/keys/public.pem)
+          export AUTH_PUBLIC_KEY_B64
+
+          (cd services/event && PORT=3002 DATABASE_URL="$EVENT_DATABASE_URL" APP_DATABASE_URL="$EVENT_APP_DATABASE_URL" node dist/index.js &)
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3002/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          OPENSEARCH_NODE=http://127.0.0.1:9200 KAFKA_BROKERS=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8081 EVENT_URL=http://localhost:3002 \
+            node scripts/verify-search-api.mjs
+
+          pkill -f "node dist/index.js" || true
 
       # The password reset flow, including the failure that returns success.
       #

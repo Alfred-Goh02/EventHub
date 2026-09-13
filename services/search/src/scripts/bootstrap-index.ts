@@ -1,5 +1,5 @@
 import { createLogger } from '@eventhub/logger';
-import { env } from '../env.js';
+import { clusterEnv as env } from '../cluster-env.js';
 import { os } from '../opensearch.js';
 import { INDEX_NAME, READ_ALIAS, WRITE_ALIAS, indexBody } from '../index-definition.js';
 

@@ -80,10 +80,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
-| `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, and each tenant is confined by a filtered alias. The query API is next |
+| `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 50 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 51 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -230,8 +230,16 @@ the system is up rather than merely that the containers were created.
 
 Search's indexer fills the index from `events.activity` as soon as it starts,
 replaying the compacted topic from the beginning, so an event created before
-Search existed is still found. The query API that reads the index is the next
-part of Chapter 6.
+Search existed is still found. Search reads it with the same token:
+
+```bash
+curl -sf "http://localhost:3005/search?q=smoke" -H "Authorization: Bearer $TOKEN"
+```
+
+That answers with an empty `hits` list, and that is correct. The `Smoke` event
+above is a DRAFT: it is in the index, but public search shows only published,
+upcoming events, so it appears once `POST /events/:id/publish` has published it.
+An empty result for a draft is the policy working, not the indexer failing.
 
 | Service   | URL                     |
 | --------- | ----------------------- |
@@ -417,8 +425,10 @@ before being trusted. An assertion nobody has seen go red is a guess.
 
 Chapters 1–5 are built: foundations, auth and RLS, the Event service and the
 Kafka backbone, Ticketing through payments, and live Q&A over WebSockets.
-Chapter 6, search, is in progress: the index, per-tenant isolation and the Kafka
-indexer exist and are verified, and the query API does not exist yet.
+Chapter 6, search, is in progress: the index, per-tenant isolation, the Kafka
+indexer and the query API with its degraded fallback exist and are verified.
+Deep pagination, the reindex-and-swap migration and indexer observability do not
+exist yet.
 Later chapters (analytics, notifications, community) are designed and documented
 but not implemented.
 
