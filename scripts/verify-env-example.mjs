@@ -47,6 +47,9 @@ const SERVICES = [
   // /health proves only that the process started. /ready answers 200 only once
   // the example's OPENSEARCH_NODE has actually been reached.
   { name: 'search', portVar: 'PORT', port: 3906, path: '/ready' },
+  // /ready for the same reason as Search: it answers 200 only once ClickHouse has
+  // been reached as the example's analytics_app user, not merely once listening.
+  { name: 'analytics', portVar: 'PORT', port: 3907, path: '/ready' },
 ];
 
 const KEY_PATH = join('services', 'auth', 'keys', 'public.pem');

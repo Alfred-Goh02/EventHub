@@ -1,7 +1,7 @@
 # EventHub
 
-A multi-tenant event and community platform, built as six services over
-Postgres, Kafka, Redis and OpenSearch.
+A multi-tenant event and community platform, built as seven services over
+Postgres, Kafka, Redis, OpenSearch and ClickHouse.
 
 It exists to be **explainable**. Every non-obvious decision in this repository has
 a comment saying what it is working around, and most of them are working around
@@ -81,9 +81,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
+| `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement. Kafka ingest and the read API are next |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 54 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 55 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -219,11 +220,11 @@ docker compose up -d --wait
 
 That builds one image, shared by every application service, and then:
 
-1. waits for Postgres, Redis, Kafka, the Schema Registry and OpenSearch to pass their healthchecks
+1. waits for Postgres, Redis, Kafka, the Schema Registry, OpenSearch and ClickHouse to pass their healthchecks
 2. runs a `setup` container that migrates all four databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
-   and generates a signing keypair into a volume
-3. and only then starts Auth, Event, Ticketing, Live, Search and the outbox relay
+   migrates ClickHouse, and generates a signing keypair into a volume
+3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics and the outbox relay
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
@@ -248,6 +249,7 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Ticketing | `http://localhost:3003` |
 | Live      | `http://localhost:3004`, WebSockets on the same port |
 | Search    | `http://localhost:3005/metrics` |
+| Analytics | `http://localhost:3006/ready` |
 | Relay     | `http://localhost:3010/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
@@ -299,7 +301,7 @@ services stay down and the ports stay free for the ones you run yourself.
 half-started broker:
 
 ```bash
-docker compose up -d --wait postgres redis kafka schema-registry opensearch
+docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse
 ```
 
 The Postgres container creates all four databases and their roles on first boot
@@ -366,6 +368,15 @@ isolation rests on. Re-running it is safe:
 
 ```bash
 pnpm --filter @eventhub/search run bootstrap:index
+```
+
+Create the analytics schema in ClickHouse. The runner connects as
+`analytics_migrator`, the only user that can create a table; the service itself
+runs as `analytics_app`, which can only read and insert. It is idempotent, and it
+refuses a migration that was edited after it was applied:
+
+```bash
+pnpm --filter @eventhub/analytics run migrate
 ```
 
 Finally, a throwaway signing keypair:

@@ -130,6 +130,19 @@ jobs:
       - name: Assert the shared types match their schemas and contracts
         run: node scripts/verify-shared-types.mjs
 
+      # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
+      # ClickHouse measured the 72G root filesystem at 91% used by the time the
+      # Search verifiers ran, and OpenSearch refuses to create any index past its
+      # 90% high watermark: the reindex verifier failed with `cluster
+      # create-index blocked (api)`, with cluster.blocks.create_index set to true.
+      # These are preinstalled SDKs and images this job never uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h /
+
       # The EXACT stack a developer runs, from the same file, with the same
       # config. --wait blocks until every healthcheck passes, so nothing below
       # races a half-started broker.
@@ -159,10 +172,23 @@ jobs:
       # minutes (start_period 30s, then 20 retries 10s apart) and fail the job,
       # blaming OpenSearch for doing exactly what a single node has to do.
       - name: Start infrastructure
-        run: docker compose up -d --wait postgres redis kafka schema-registry opensearch
+        run: docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse
 
       - name: Show what came up
         run: docker compose ps
+
+      # The guard for "Free runner disk", placed before anything writes to
+      # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
+      # disk, rather than minutes later as an index_create_block_exception in
+      # whichever verifier happens to create an index next.
+      - name: Assert the runner has disk headroom for OpenSearch
+        run: |
+          used=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          echo "root filesystem ${used}% used"
+          if [ "$used" -ge 85 ]; then
+            echo "::error::root filesystem ${used}% used; OpenSearch stops creating indices at its 90% high watermark"
+            exit 1
+          fi
 
       - name: Apply migrations (auth)
         working-directory: services/auth
@@ -212,6 +238,34 @@ jobs:
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
         run: pnpm run bootstrap:index
+
+      # ClickHouse has no migration tool and no DDL transactions, so the runner
+      # applies idempotent statements in filename order and refuses a migration
+      # edited after it was applied. It connects as analytics_migrator: the only
+      # credential that can create a table, held by this step and by nothing that
+      # answers requests.
+      - name: Migrate analytics (ClickHouse)
+        working-directory: services/analytics
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_MIGRATOR_USER: analytics_migrator
+          CLICKHOUSE_MIGRATOR_PASSWORD: analytics_migrator
+        run: pnpm run migrate
+
+      # CHAPTER 7, PART 1: what Analytics' storage rests on, asserted before any
+      # code writes to it. The service's user is refused CREATE, DROP, TRUNCATE
+      # and DELETE (tested on a victim table, so a wrong grant can only destroy
+      # the victim). Migrations apply once and refuse an edited one. The sparse
+      # index prunes by tenant and prunes nothing without it.
+      #
+      # And a retried batch counts once in the raw table AND the rollup. The
+      # Field Guide says the dedup token propagates to materialized views; on
+      # ClickHouse 25.8 it does not by itself -- the duplicate was dropped from
+      # the raw table and aggregated into the rollup, and only the sums showed
+      # it. The verifier keeps that measurement as a check, so a ClickHouse that
+      # changes it turns this red instead of leaving the migration's warning stale.
+      - name: Assert analytics storage is least-privilege, deduplicated, and pruned by tenant
+        run: node scripts/verify-analytics-schema.mjs
 
       # Keys are gitignored, so CI generates its own throwaway pair. Never reuse
       # a real signing key in CI — anything in a build environment is readable by

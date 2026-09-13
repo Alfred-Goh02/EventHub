@@ -170,6 +170,48 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
+  # ClickHouse: the column store behind Analytics.
+  #
+  # PINNED to an LTS line, never :latest. MergeTree defaults, async_insert
+  # behaviour and deduplication settings have moved between releases, and a
+  # study environment whose defaults change underneath it is not reproducible.
+  #
+  # Only the HTTP interface is published. The Node client speaks HTTP on 8123;
+  # the native port 9000 collides with MinIO, Portainer and some VPN clients on
+  # Windows, and the CLI is reachable through `docker exec` without it.
+  #
+  # CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT lets the admin user run CREATE USER and
+  # GRANT. Without it the users in db/clickhouse-init are never created, and the
+  # failure is a permission error that does not say why.
+  #
+  # nofile is raised because ClickHouse holds a file handle per column per part;
+  # Docker's default produces "Too many open files" under merge load, which looks
+  # like corruption and is not.
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: eventhub-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: eventhub
+      CLICKHOUSE_PASSWORD: eventhub
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./db/clickhouse-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user eventhub --password eventhub --query 'SELECT 1' >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
   # Kafka in KRaft mode — one process that is both broker and controller, with
   # no ZooKeeper. ZooKeeper was removed from Kafka in 4.0; every tutorial older
   # than about 2024 still shows a second container for it, and you do not need it.
@@ -292,9 +334,15 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       <<: *app-env
       OPENSEARCH_NODE: http://opensearch:9200
+      # Analytics migrations run as the migrator, which only setup holds.
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATOR_USER: analytics_migrator
+      CLICKHOUSE_MIGRATOR_PASSWORD: analytics_migrator
       # One per service, because `prisma migrate deploy` reads DATABASE_URL and
       # each service owns a different database. They are passed under distinct
       # names and assigned per command below, rather than hoping three migrations
@@ -347,6 +395,10 @@ services:
         # only OPENSEARCH_NODE, set above: the script reads cluster-env.ts.
         echo "setup: creating the search index"
         pnpm --filter @eventhub/search run bootstrap:index
+
+        # Idempotent, and refuses a migration edited after it was applied.
+        echo "setup: migrating analytics"
+        pnpm --filter @eventhub/analytics run migrate
 
         echo "setup: done"
 
@@ -561,10 +613,40 @@ services:
       retries: 6
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # Analytics: the read side of ClickHouse. Connects as analytics_app — SELECT
+  # and INSERT only — and never holds the migrator credential, which setup uses
+  # and nothing else does.
+  # ---------------------------------------------------------------------------
+  analytics:
+    <<: *app
+    container_name: eventhub-analytics
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3006:3006"
+    environment:
+      <<: *app-env
+      PORT: 3006
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: analytics
+      CLICKHOUSE_USER: analytics_app
+      CLICKHOUSE_PASSWORD: analytics_app
+    working_dir: /app/services/analytics
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3006/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
 volumes:
   postgres-data:
   kafka-data:
   opensearch-data:
+  clickhouse-data:
   # The JWT keypair, generated once by setup. A volume rather than a bind mount
   # so it never lands in the working tree, and never in an image layer.
   jwt-keys:
