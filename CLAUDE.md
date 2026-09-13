@@ -157,3 +157,64 @@ This includes the tools used to check things. A background command's exit code i
 the exit code of the last thing in the pipe, not of the interesting command — a
 `docker build` that failed 127 on `corepack enable` was reported as exit 0 because
 `tail` succeeded. Print the code you actually mean.
+
+## A failed check sets the exit code where it fails
+
+In a verifier, `check()` sets `process.exitCode = 1` the moment an assertion
+fails — not only in a summary at the end.
+
+Two search verifiers printed FAIL and exited 0. Each had a `return` inside a `try`
+for the case where its service never started; the `finally` ran, the function
+returned, and the end-of-run `if (failures > 0)` gate below it never executed. CI
+would have reported a run that could not even start the thing under test as green.
+
+## A fixture has to be able to show the failure
+
+A negative result is only evidence if the setup could have produced the positive
+one. Chapter 6 found four setups that could not:
+
+- Two tenants on **different shards**. A search through tenant A's alias only
+  visits A's shard, so it could not have returned B's documents even with the
+  alias filter deleted. Tenants in the isolation tests are now chosen, by asking
+  the cluster, to share a shard.
+- The first probe of whether a Point-in-Time keeps an alias filter made the same
+  mistake, and would have credited the filter with what routing did.
+- "A title match outranks a description match" stayed green with the field
+  boosts deleted, because BM25 already favours short fields. The fixture now needs
+  the boost to win.
+- A search loop's control required more than 20 iterations, and passed with 22
+  on a quick run. It now requires answers from both sides of the swap it watches.
+
+Ask what the run would look like if the guard were missing. If the answer is
+"the same", the fixture is wrong, not the guard.
+
+## A module everything imports must not require what only one caller needs
+
+Search's OpenSearch client loaded the whole service configuration, and every
+script and verifier that talks to the cluster imports that client. So each
+variable added for the HTTP or Kafka side became one a bootstrap script had to be
+given: `SCHEMA_REGISTRY_URL` broke them all in one PR, and `JWT_ISSUER`,
+`JWT_AUDIENCE` and `EVENT_SERVICE_URL` broke them all again in the next.
+The cluster settings now live in `cluster-env.ts`, which is all the client reads.
+
+## Derive a list from its source; never copy it
+
+A hand-written copy of a list falls behind the list, silently. In this repository:
+
+- a verifier's environment for spawning Search fell behind the service three
+  times — it is now read from Search's own `.env.example`
+- `verify-env-example.mjs` never booted Live or Search, and
+  `verify-env-documented.mjs` kept its own service list — both now check against
+  `services/`
+- the Dockerfile's manifest list missed Live — `verify-dockerfile-workspaces.mjs`
+
+Where a list must stay hand-written, check it against what it describes.
+
+## Check what owns a port before trusting its answer
+
+Compose application containers run with `restart: unless-stopped`, so after a
+Docker restart they come back — built from whatever image was last built. A
+freshly built Ticketing crashed with `EADDRINUSE` on 3003 while `/health` on 3003
+answered 200 from the old container, and the DLQ verifier then failed against code
+this branch had already changed. Stop the container a test needs to replace, run
+the fresh build, and start the container again afterwards.
