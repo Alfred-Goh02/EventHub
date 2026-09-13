@@ -5,11 +5,13 @@ import type { ActivityRow } from './mappers.js';
 export interface WriteOutcome {
   /** Rows sent to activity_events on this call. */
   inserted: number;
-  /** Rows dropped because the same message_id and line was already stored, or appeared twice in the batch. */
+  /** Rows dropped because the same tenant, message_id and line was already stored, or appeared twice in the batch. */
   duplicates: number;
 }
 
-const rowKey = (r: { message_id: string; line: number }): string => `${r.message_id}#${r.line}`;
+/** A row's identity. Tenant ids cannot contain a space, so the key cannot be forged across fields. */
+const rowKey = (r: { tenant_id: string; message_id: string; line: number }): string =>
+  `${r.tenant_id} ${r.message_id}#${r.line}`;
 
 /**
  * Which of a batch's rows are already stored.
@@ -19,12 +21,12 @@ const rowKey = (r: { message_id: string; line: number }): string => `${r.message
  * event_id from the primary key — both as a parameter and as literals — which is
  * the search scripts/verify-analytics-schema.mjs measured reading every granule.
  * Two lists use tenant_id and event_id both. Their cross product can name pairs the
- * batch does not contain, which costs nothing: message_id is unique, so the match
- * stays exact.
+ * batch does not contain, which costs nothing: the match is made in code on
+ * (tenant_id, message_id, line), so it stays exact.
  *
  * Exported so scripts/verify-analytics-ingest.mjs can EXPLAIN this exact text.
  */
-export const EXISTING_ROWS_QUERY = `SELECT message_id, line FROM activity_events
+export const EXISTING_ROWS_QUERY = `SELECT tenant_id, message_id, line FROM activity_events
  WHERE tenant_id IN {tenants:Array(String)}
    AND event_id IN {events:Array(String)}
    AND occurred_at BETWEEN {from:DateTime64(3, 'UTC')} AND {to:DateTime64(3, 'UTC')}
@@ -49,10 +51,15 @@ export const EXISTING_ROWS_QUERY = `SELECT message_id, line FROM activity_events
  *
  * SO IDENTITY COMES FROM THE MESSAGE, in two layers:
  *
- *   1. Rows whose (message_id, line) is already stored are dropped before the
- *      insert. This catches both cases above, whatever the batch boundaries. A
- *      duplicate carries the same occurred_at as its original, so the time bounds
- *      prune monthly partitions as well.
+ *   1. Rows whose (tenant_id, message_id, line) is already stored are dropped
+ *      before the insert. This catches both cases above, whatever the batch
+ *      boundaries. The tenant is part of the identity because Kafka is not
+ *      tenant-scoped and an id is only as unique as its producer makes it:
+ *      keyed on the id alone, one tenant's message silently suppressed another
+ *      tenant's, both inside one batch and against a row already stored, which
+ *      scripts/verify-analytics-ingest.mjs measured. A duplicate carries the same
+ *      occurred_at as its original, so the time bounds prune monthly partitions
+ *      as well.
  *
  *   2. insertRows derives its deduplication token from the rows' identities. The
  *      lookup and the insert are two statements, so an insert that timed out on the
@@ -85,7 +92,7 @@ export async function writeActivity(ch: ClickHouseClient, rows: ActivityRow[]): 
     },
     format: 'JSONEachRow',
   });
-  const stored = new Set((await existing.json<{ message_id: string; line: number }>()).map(rowKey));
+  const stored = new Set((await existing.json<{ tenant_id: string; message_id: string; line: number }>()).map(rowKey));
   const fresh = candidates.filter((r) => !stored.has(rowKey(r)));
 
   if (fresh.length > 0) await insertRows(ch, fresh);
@@ -98,6 +105,12 @@ export async function writeActivity(ch: ClickHouseClient, rows: ActivityRow[]): 
  * not already seen. deduplicate_blocks_in_dependent_materialized_views carries the
  * deduplication into every rollup; without it the raw table deduplicates and the
  * rollups double-count, which scripts/verify-analytics-schema.mjs measured.
+ *
+ * THE TENANT IS IN THE TOKEN for the same reason it is in the lookup. Hashed from
+ * message ids alone, a second tenant's rows under a colliding id produced the same
+ * token as the first tenant's, and ClickHouse discarded them as a duplicate block
+ * while the caller counted them inserted: scripts/verify-analytics-ingest.mjs found
+ * 0 rows stored for a tenant the writer reported writing.
  *
  * Exported so a verifier can play the retry that got past the lookup.
  */

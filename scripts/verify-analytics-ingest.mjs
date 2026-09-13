@@ -48,6 +48,14 @@
  * And this file was wrong once: it wanted four rows behind the poison where the
  * fixture sends five, and failed on a correct consumer.
  *
+ * The cross-tenant checks came later, from the real ingest container storing this
+ * file's reused canary id under three tenants. Against the writer as it was then,
+ * one id under two tenants in a batch kept only the first tenant's rows, and a
+ * second tenant's copy written on its own was stored as nothing at all: its token,
+ * hashed from ids without the tenant, matched the first tenant's block. The check
+ * that leans on that copy passed anyway — so its precondition is now a control
+ * read from the table, which went red.
+ *
  * Run (after pnpm build, topics and schemas, with ClickHouse up):
  *   node scripts/verify-analytics-ingest.mjs
  */
@@ -245,6 +253,47 @@ async function main() {
 
     // -----------------------------------------------------------------------
     console.log('');
+    console.log("  one tenant's message id cannot suppress another tenant's message");
+    // -----------------------------------------------------------------------
+    // Kafka is not tenant-scoped, and a message id is only as unique as its
+    // producer makes it. This file's own canary once reused one id across runs,
+    // under a new tenant each time, and the real ingest stored it three times —
+    // correctly, but only because each copy arrived in a different batch.
+    const shared = (tenant, n) =>
+      toRows({ topic: 'tickets.purchased', partition: 0, offset: String(n) }, purchase(tenant, EV, n, { messageId: `shared_${run}` }));
+    const TX = `t_ing_x_${run}`;
+    const TY = `t_ing_y_${run}`;
+    const w6 = await writeActivity(app, [...shared(TX, 0), ...shared(TY, 1)]);
+    check(
+      w6.inserted === 4 && w6.duplicates === 0,
+      `one id under two tenants in the same batch: inserted ${w6.inserted}, skipped ${w6.duplicates} (want 4, 0)`,
+    );
+    const TZ = `t_ing_z_${run}`;
+    const TW = `t_ing_w_${run}`;
+    await writeActivity(app, shared(TW, 2));
+    // The precondition, checked in the TABLE rather than trusted from the writer's
+    // count. Without it the next check passed on the broken writer: its token was
+    // hashed from ids alone, so this copy reused an earlier tenant's token and
+    // ClickHouse discarded it as a duplicate block — leaving nothing to collide with.
+    const tw = await totals(TW);
+    check(
+      same(tw, { raw: 2, tickets: 3, gross: 7000 }),
+      `CONTROL: the other tenant's copy is really stored before the batch that shares its id: ${fmt(tw)}`,
+    );
+    const w7 = await writeActivity(app, [...shared(TZ, 3), ...rowsFor(TW, 7, 7)]);
+    check(
+      w7.inserted === 4 && w7.duplicates === 0,
+      `an id already stored for another tenant that shares the batch: inserted ${w7.inserted}, skipped ${w7.duplicates} (want 4, 0)`,
+    );
+    const perTenant = await Promise.all([TX, TY, TZ].map(totals));
+    const twAfter = await totals(TW);
+    check(
+      perTenant.every((t) => same(t, { raw: 2, tickets: 3, gross: 7000 })) && same(twAfter, { raw: 4, tickets: 6, gross: 14000 }),
+      `and each tenant holds exactly its own purchases: ${[...perTenant, twAfter].map(fmt).join(' | ')} (want 2 rows each, 4 for the last)`,
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
     console.log("  the duplicate lookup is narrowed by tenant, the key's first column");
     // -----------------------------------------------------------------------
     const explain = await ch(ADMIN, `EXPLAIN indexes = 1 ${EXISTING_ROWS_QUERY}`, {
@@ -317,7 +366,7 @@ async function main() {
     const CANARY_EV = `evt_canary_${run}`;
     let canary = false;
     for (let attempt = 1; attempt <= 10 && !canary; attempt++) {
-      await sendJson({ kind: 'question.created', tenantId: TE, eventId: CANARY_EV, userId: 'u_canary', questionId: `q_canary_${attempt}`, occurredAt: new Date().toISOString() });
+      await sendJson({ kind: 'question.created', tenantId: TE, eventId: CANARY_EV, userId: 'u_canary', questionId: `q_canary_${run}_${attempt}`, occurredAt: new Date().toISOString() });
       canary = Boolean(await waitFor(async () => (await rawCount(`tenant_id = '${TE}' AND event_id = '${CANARY_EV}'`)) > 0, 4_000));
     }
     check(canary, 'CONTROL: a canary produced after the group settled became a row');
