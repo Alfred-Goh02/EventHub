@@ -76,6 +76,99 @@ services:
       retries: 10
 
   # ---------------------------------------------------------------------------
+  # OpenSearch, as the Search service's read model.
+  #
+  # Postgres stays the write model — normalised, constrained, transactional.
+  # OpenSearch is DERIVED: flat, denormalised, and indexed for one job, which is
+  # finding events by text and returning facet counts fast enough for a filter
+  # sidebar to feel instant. Nothing writes to both in one transaction, because
+  # no such transaction exists; the index is fed from Kafka and is rebuildable by
+  # definition. That is CQRS, and its price is that the index is eventually
+  # consistent — there is a window where Postgres knows something it does not.
+  #
+  # SECURITY PLUGIN OFF, LOCALLY ONLY. It would mean TLS and credential setup in
+  # every step of this chapter, and the production path is SigV4 against an
+  # in-VPC domain — a completely different mechanism — so the local config would
+  # be throwaway work either way.
+  #
+  # Lucene memory-maps its segment files, so vm.max_map_count should be at least
+  # 262144 in the Docker VM. With discovery.type=single-node that is NOT enforced
+  # at startup: bootstrap checks are skipped, a low value only logs a warning, the
+  # healthcheck passes, and the failure arrives much later as `Map failed` once
+  # enough segments exist — so a mmap error days in means this, not the data. On
+  # Windows:
+  #   wsl -d docker-desktop -e sh -c "sysctl -w vm.max_map_count=262144"
+  # ---------------------------------------------------------------------------
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: eventhub-opensearch
+    restart: unless-stopped
+    environment:
+      - cluster.name=eventhub-local
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      # Small on purpose: this is a laptop and a CI runner, not a cluster.
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # Refuse to INVENT an index whose name belongs to this application.
+      #
+      # The default is true, and on it the rule "the index comes from
+      # index-definition.ts, never from the first write" was a comment rather
+      # than a property. A document written to events-write before bootstrap
+      # ran would create an INDEX named events-write with a guessed mapping —
+      # tenantId as analysed text — and bootstrap could then never point an
+      # alias of that name anywhere, because an index already holds it.
+      #
+      # Denies events-* and tenant-*, allows everything else, first match wins.
+      # Everything else matters: OpenSearch's own plugins create indices such as
+      # top_queries-* and .opensearch-observability, and a bare `false` would
+      # break them. Measured on this cluster: a write to events-probe returns
+      # 404 "[action.auto_create_index] contains [-events-*] which forbids
+      # automatic creation", while writes through the real events-write alias
+      # still land.
+      - "action.auto_create_index=-events-*,-tenant-*,+*"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      # yellow is the healthy answer for a single node: the index asks for zero
+      # replicas locally, but the cluster still reports yellow while any
+      # system index wants one. Requiring green here would never pass.
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Dashboards, for looking at the engine by hand — _analyze to see a
+  # token stream, _explain to see why one hit outranks another.
+  #
+  # BEHIND A PROFILE, so the ordinary `docker compose up` does not pay for it.
+  # It is a development tool, nothing depends on it, and it is another JVM.
+  #   docker compose --profile tools up -d opensearch-dashboards
+  # ---------------------------------------------------------------------------
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    container_name: eventhub-dashboards
+    restart: unless-stopped
+    profiles: ["tools"]
+    environment:
+      - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
   # Kafka in KRaft mode — one process that is both broker and controller, with
   # no ZooKeeper. ZooKeeper was removed from Kafka in 4.0; every tutorial older
   # than about 2024 still shows a second container for it, and you do not need it.
@@ -204,7 +297,7 @@ services:
       # can share one variable.
       AUTH_DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
-      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
+      TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
     volumes:
       - jwt-keys:/app/services/auth/keys
@@ -425,6 +518,7 @@ services:
 volumes:
   postgres-data:
   kafka-data:
+  opensearch-data:
   # The JWT keypair, generated once by setup. A volume rather than a bind mount
   # so it never lands in the working tree, and never in an image layer.
   jwt-keys:

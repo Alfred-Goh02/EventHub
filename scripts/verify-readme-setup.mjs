@@ -176,6 +176,42 @@ function main() {
 
   // -------------------------------------------------------------------------
   console.log('');
+  console.log('  and every service CI seeds is a service the README tells you to seed');
+  // -------------------------------------------------------------------------
+  /**
+   * Found by the review of Chapter 6, by deleting the README's seed command: every
+   * assertion in this file still passed. Seeding is how the admin in the README's
+   * own sign-in example comes to exist, and no detector here looked for it — the
+   * migrate check matches `prisma migrate deploy`, the script check matches
+   * `node scripts/*.mjs`, and `pnpm exec prisma db seed` is neither.
+   */
+  const withoutComments = (body) =>
+    body
+      .split(/\r?\n/)
+      .filter((l) => !l.trim().startsWith('#'))
+      .join('\n');
+  const seeded = steps
+    .filter((s) => /prisma db seed/.test(withoutComments(s.body)))
+    .map((s) => s.wd.replace(/^services\//, ''));
+
+  check(seeded.length > 0, `CI seeds ${seeded.length} service(s): ${seeded.join(', ')}`);
+
+  for (const service of seeded) {
+    const named = new RegExp(String.raw`(@eventhub/|services/)${service}(?![\w-])`);
+    const documented = commands.some((c) =>
+      c.split(/\r?\n/).some((line) => /prisma db seed/.test(line) && named.test(line)),
+    );
+    check(
+      documented,
+      documented
+        ? `${service} — a documented command seeds it`
+        : `${service} is seeded by CI and no command in the README seeds it, so the account the ` +
+          "README's sign-in example uses will not exist",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  console.log('');
   console.log('  and the number it claims for itself is the number there are');
   // -------------------------------------------------------------------------
   /**
@@ -235,6 +271,121 @@ function main() {
       documented
         ? `${file} — the README tells you to run it`
         : `${file} is required to stand the system up and the README never mentions it`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  console.log('');
+  console.log('  and every package script CI runs to stand the system up is one the README gives you');
+  // -------------------------------------------------------------------------
+  /**
+   * SETUP ALSO HIDES IN PACKAGE SCRIPTS, and the loop above cannot see it.
+   *
+   * That loop matches `node scripts/*.mjs`, which was every setup step when it
+   * was written. Chapter 6 created the search index as `pnpm run bootstrap:index`
+   * in services/search — without it Search has no index, and the first document
+   * written would make OpenSearch invent a mapping, typing tenantId as analysed
+   * text — and this file went on calling the README complete, because nothing it
+   * knew how to read had changed.
+   *
+   * YAML comments are dropped before matching. A step's comment block can say
+   * "pnpm run" while explaining something, and a detector that reads the
+   * explanation as a use asks for documentation of a step that does not exist.
+   *
+   * Build and test scripts are not setup: `pnpm build` is already the README's
+   * first command, and nothing needs a test run to exist.
+   */
+  const NOT_SETUP_PKG = new Set(['build', 'test', 'lint', 'typecheck']);
+
+  /**
+   * pnpm's own commands, which are never package scripts. `pnpm exec prisma ...`
+   * is covered by the migrate and seed checks, `install` by the README's first
+   * command.
+   */
+  const PNPM_BUILTINS = new Set([
+    'install', 'i', 'add', 'remove', 'rm', 'update', 'up', 'exec', 'dlx', 'why',
+    'list', 'ls', 'outdated', 'store', 'fetch', 'rebuild', 'prune', 'link', 'unlink',
+  ]);
+
+  /**
+   * Every `pnpm` invocation on a line, as { script, service } — PARSED, not
+   * matched with one regex.
+   *
+   * The first version was /pnpm (?:--filter (\S+) )?run ([\w:.-]+)/, and the
+   * review of Chapter 6 showed what that misses: `pnpm bootstrap:index` (run is
+   * optional), `-F`, `--filter=`, `-C` and `--dir`, flags after `run`, and a
+   * double space. It also read `pnpm run --filter x y` as a script called
+   * `--filter`. And the documented-side check was a substring, so README text
+   * running `bootstrap:index` counted as documenting a script named `bootstrap`.
+   * Tokens fix all of it; the script name is compared whole.
+   */
+  function pnpmInvocations(line, defaultService) {
+    const out = [];
+    const t = line.trim().split(/\s+/);
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] !== 'pnpm') continue;
+      let service = defaultService;
+      let script = null;
+      let sawRun = false;
+      for (let j = i + 1; j < t.length; j++) {
+        const tok = t[j];
+        if (tok === '&&' || tok === '||' || tok === ';' || tok === '|') break;
+        if (tok === '--filter' || tok === '-F' || tok === '-C' || tok === '--dir') {
+          const v = t[++j] ?? '';
+          service = v.replace(/^@eventhub\//, '').replace(/^\.?\/?services\//, '');
+          continue;
+        }
+        if (tok.startsWith('--filter=')) {
+          service = tok.slice('--filter='.length).replace(/^@eventhub\//, '');
+          continue;
+        }
+        if (tok.startsWith('-')) continue;
+        if (tok === 'run' && !sawRun) {
+          sawRun = true;
+          continue;
+        }
+        if (!sawRun && PNPM_BUILTINS.has(tok)) break;
+        script = tok;
+        break;
+      }
+      if (script) out.push({ script, service });
+    }
+    return out;
+  }
+
+  const pkgSteps = [];
+  for (const step of steps) {
+    const wdService = step.wd.startsWith('services/') ? step.wd.replace(/^services\//, '') : null;
+    for (const line of step.body.split(/\r?\n/)) {
+      // YAML comments are prose, and prose saying "pnpm run" is not a step.
+      const code = line.trim().startsWith('#') ? '' : line.replace(/^\s*run:\s*/, '');
+      for (const inv of pnpmInvocations(code, wdService)) {
+        if (NOT_SETUP_PKG.has(inv.script)) continue;
+        pkgSteps.push(inv);
+      }
+    }
+  }
+
+  check(
+    pkgSteps.length > 0,
+    `CI runs ${pkgSteps.length} setup package script(s): ` +
+      pkgSteps.map((p) => `${p.service} ${p.script}`).join(', '),
+  );
+
+  for (const { service, script } of pkgSteps) {
+    const documented = commands.some((c) =>
+      c
+        .split(/\r?\n/)
+        .some((line) =>
+          pnpmInvocations(line, null).some((inv) => inv.script === script && inv.service === service),
+        ),
+    );
+    check(
+      documented,
+      documented
+        ? `${service} ${script} — a documented command runs it`
+        : `CI runs \`${script}\` in ${service} to stand the system up, and no command in the ` +
+          'README runs it',
     );
   }
 

@@ -148,8 +148,18 @@ jobs:
       # builds from the working tree, so testing a container image built from the
       # same tree would add a build and verify the same code twice. The compose
       # application path is a way to RUN the system, not a second thing to test.
+      # opensearch, but NOT opensearch-dashboards: Dashboards sits behind the
+      # `tools` profile, so naming services here would not start it anyway, and
+      # it is a second JVM that nothing in this job talks to.
+      #
+      # --wait waits for the healthcheck, and that healthcheck asks for YELLOW
+      # rather than green on purpose. One node cannot place a replica, so any
+      # system index wanting one holds the cluster at yellow forever; waiting
+      # for green here would mark the container unhealthy after about four
+      # minutes (start_period 30s, then 20 retries 10s apart) and fail the job,
+      # blaming OpenSearch for doing exactly what a single node has to do.
       - name: Start infrastructure
-        run: docker compose up -d --wait postgres redis kafka schema-registry
+        run: docker compose up -d --wait postgres redis kafka schema-registry opensearch
 
       - name: Show what came up
         run: docker compose ps
@@ -179,6 +189,30 @@ jobs:
       - name: Seed
         working-directory: services/auth
         run: pnpm exec prisma db seed
+
+      # The search index is a schema, so it is created the same way the database
+      # schemas are: from a checked-in definition, by a step in this list, never
+      # by hand in Dashboards and never by letting the first write invent it.
+      #
+      # Letting the first write invent it is the specific thing being ruled out.
+      # OpenSearch will happily infer a mapping from whatever document arrives
+      # first, and the field it would infer wrong is the one isolation rests on:
+      # a JSON string becomes `text` with a `.keyword` sub-field, and a `term`
+      # filter on an analysed field compares an unanalysed value against
+      # analysed terms. The mapping in index-definition.ts pins tenantId to
+      # `keyword` for that reason, and this step is what makes the pinned
+      # mapping the one that exists.
+      - name: Create the search index
+        working-directory: services/search
+        # Search's schema is fail-fast. Locally its variables come from
+        # services/search/.env. Here there is no .env: PORT comes from the job env
+        # above (the shared base requires one even of a script that binds
+        # nothing), and the two below are Search's own. The package script uses
+        # --env-file-if-exists precisely so that both paths work.
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+          KAFKA_BROKERS: localhost:9092
+        run: pnpm run bootstrap:index
 
       # Keys are gitignored, so CI generates its own throwaway pair. Never reuse
       # a real signing key in CI — anything in a build environment is readable by
@@ -571,6 +605,35 @@ jobs:
           APP_DATABASE_URL="${{ env.LIVE_APP_DATABASE_URL }}"           REDIS_URL="redis://127.0.0.1:6379"           KAFKA_BROKERS="localhost:9092"           ALLOWED_ORIGIN_SUFFIX=".eventhub.local"           AUTH_PUBLIC_KEY_B64="$(base64 -w0 services/auth/keys/public.pem)"             node scripts/verify-live-fanout.mjs
 
           pkill -f "node dist/index.js" || true
+
+      # CHAPTER 6'S ISOLATION CLAIM: every tenant's events share ONE index, and
+      # a tenant's search still cannot return another tenant's documents.
+      #
+      # One index rather than one per tenant, because a shard is a whole Lucene
+      # index carrying tens of megabytes of heap even when nearly empty, and a
+      # long tail of small tenants kills a cluster on heap long before disk. The
+      # isolation comes instead from a filtered alias per tenant, which the
+      # engine ANDs onto every query sent through it.
+      #
+      # TWO LAYERS, and the first version of this step checked one. The alias
+      # filter confines which DOCUMENTS match. It does not confine what the
+      # engine reads off the shard: through tenant A's own filtered alias, a
+      # min_doc_count 0 aggregation listed tenant B's titles and a suggester
+      # offered B's words. So the module accepts no raw body -- a closed,
+      # validated request, built into a query server-side -- and this step sends
+      # the raw leak as a control before asserting the module cannot express it.
+      #
+      # Also asserted: tenant ids shaped like index expressions ('*', commas) are
+      # refused; an existing alias with no filter is repaired rather than trusted
+      # by name; a document indexed without routing is invisible to its own
+      # tenant. Every tenant in the test shares one shard, chosen by asking the
+      # cluster, because on different shards each of those leaks passes as
+      # isolation. Nothing is written until the index and aliases are confirmed.
+      - name: Assert a tenant's search cannot reach another tenant's documents
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+          KAFKA_BROKERS: localhost:9092
+        run: node scripts/verify-search-tenant-isolation.mjs
 
       # The password reset flow, including the failure that returns success.
       #
