@@ -745,6 +745,19 @@ jobs:
       # older copy overwrites a newer write, no search fails or comes back empty,
       # every tenant alias moves with its filter in the same atomic call, and the
       # whole thing can be run backwards.
+      # DIAGNOSTIC. On PR #96 the next step was refused with `cluster
+      # create-index blocked (api)`, which OpenSearch applies when disk crosses
+      # its high watermark (90%). That run added ClickHouse to this runner. This
+      # prints what the disk and the cluster actually say, so the fix answers
+      # evidence rather than a guess.
+      - name: Show disk use and OpenSearch blocks
+        run: |
+          df -h /
+          docker system df
+          curl -s 'http://127.0.0.1:9200/_cat/allocation?v'
+          curl -s 'http://127.0.0.1:9200/_cluster/settings?flat_settings=true'
+          echo
+
       - name: Assert a migration to a new index loses nothing, fails nothing, and can be undone
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
