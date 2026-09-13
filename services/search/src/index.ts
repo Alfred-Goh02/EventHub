@@ -1,0 +1,66 @@
+import express from 'express';
+import { createLogger } from '@eventhub/logger';
+import { env } from './env.js';
+import { clusterInfo } from './opensearch.js';
+
+const logger = createLogger('search-service');
+const app = express();
+
+app.use(express.json());
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'search' });
+});
+
+/**
+ * Readiness reports whether the CLUSTER is reachable, which is a different
+ * question from whether this process is alive.
+ *
+ * Search is the one service in the fleet that is allowed to be degraded rather
+ * than broken: its store is a derived read model, so losing it costs the search
+ * box and nothing else. Saying so here — rather than failing /health and being
+ * restarted in a loop — is what makes that degradation orderly.
+ */
+app.get('/ready', (_req, res) => {
+  clusterInfo()
+    .then((info) => res.json({ ready: true, opensearch: info }))
+    .catch((err: unknown) => {
+      logger.warn({ err }, 'opensearch unreachable');
+      res.status(503).json({ ready: false });
+    });
+});
+
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error({ err }, 'unhandled error');
+  res.status(500).json({ error: 'internal error' });
+});
+
+async function main(): Promise<void> {
+  /**
+   * LISTEN FIRST, then look for the cluster.
+   *
+   * This used to await the cluster before listening and exit 1 when it was not
+   * there, which contradicted the comment above /ready. A pod started during an
+   * OpenSearch maintenance window would crash, be restarted, and crash again —
+   * the restart loop that separating liveness from readiness exists to prevent.
+   * Now the process comes up, /health answers, and /ready says 503 until the
+   * cluster can be reached.
+   */
+  app.listen(env.PORT, () => {
+    logger.info(`search-service listening on port ${env.PORT}`);
+  });
+
+  // Log what we are actually talking to. A version mismatch between the client
+  // and the cluster produces failures that look like bugs in the query.
+  try {
+    const info = await clusterInfo();
+    logger.info(info, 'connected to opensearch');
+  } catch (err) {
+    logger.warn({ err }, 'opensearch unreachable at startup; /ready reports 503 until it is');
+  }
+}
+
+main().catch((err) => {
+  logger.error({ err }, 'search-service failed to start');
+  process.exit(1);
+});

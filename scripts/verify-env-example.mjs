@@ -33,7 +33,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Scratch ports, well away from anything a developer is likely to be running. */
@@ -42,6 +42,11 @@ const SERVICES = [
   { name: 'event', portVar: 'PORT', port: 3902, path: '/health' },
   { name: 'ticketing', portVar: 'PORT', port: 3903, path: '/health' },
   { name: 'relay', portVar: 'RELAY_METRICS_PORT', port: 3904, path: '/metrics' },
+  { name: 'live', portVar: 'PORT', port: 3905, path: '/health' },
+  // /ready, not /health. Search listens whether or not the cluster is there, so
+  // /health proves only that the process started. /ready answers 200 only once
+  // the example's OPENSEARCH_NODE has actually been reached.
+  { name: 'search', portVar: 'PORT', port: 3906, path: '/ready' },
 ];
 
 const KEY_PATH = join('services', 'auth', 'keys', 'public.pem');
@@ -164,13 +169,43 @@ async function main() {
   }
   const publicKeyB64 = readFileSync(KEY_PATH).toString('base64');
 
+  /**
+   * THE LIST ABOVE IS HAND-WRITTEN, SO IT IS CHECKED AGAINST THE DIRECTORY.
+   *
+   * It was written with four services and stayed at four while a fifth and a
+   * sixth arrived. Chapter 5 added Live with its own .env.example and eleven
+   * variables, and this file went on printing "every service starts from the
+   * configuration its .env.example documents" — true of every service it had
+   * heard of. A check whose coverage is a literal is a check that silently
+   * stops covering, which is the same trap verify-dockerfile-workspaces.mjs
+   * exists for in the image.
+   *
+   * Asserted BEFORE anything boots, so a missing service is the first thing
+   * reported rather than a line after a run that looked clean.
+   */
+  const onDisk = readdirSync('services', { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join('services', d.name, 'package.json')))
+    .map((d) => d.name)
+    .sort();
+  const listed = new Set(SERVICES.map((s) => s.name));
+  const unlisted = onDisk.filter((n) => !listed.has(n));
+  check(onDisk.length > 0, `services/ holds ${onDisk.length} service(s): ${onDisk.join(', ')}`);
+  check(
+    unlisted.length === 0,
+    unlisted.length === 0
+      ? 'and every one of them is booted below'
+      : `${unlisted.join(', ')} ${unlisted.length === 1 ? 'is' : 'are'} in services/ and never booted ` +
+        'here, so a broken .env.example there would pass this check',
+  );
+  console.log('');
+
   for (const svc of SERVICES) {
     await bootFromExample(svc, publicKeyB64);
   }
 
   console.log('');
   if (failures > 0) {
-    console.error(`FAIL: ${failures} service(s) could not start from their documented configuration`);
+    console.error(`FAIL: ${failures} assertion(s) failed`);
     process.exit(1);
   }
   console.log('every service starts from the configuration its .env.example documents');

@@ -1,7 +1,7 @@
 # EventHub
 
-A multi-tenant event and community platform, built as five services over
-Postgres, Kafka and Redis.
+A multi-tenant event and community platform, built as six services over
+Postgres, Kafka, Redis and OpenSearch.
 
 It exists to be **explainable**. Every non-obvious decision in this repository has
 a comment saying what it is working around, and most of them are working around
@@ -80,9 +80,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
+| `services/search` | Event search on OpenSearch: one shared index, each tenant confined by a filtered alias. The index and its isolation are built; the Kafka indexer and query API are next |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 48 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 49 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -210,22 +211,27 @@ system work; the second is how to develop on it.
 docker compose up -d --wait
 ```
 
-That builds one image, shared by all four services, and then:
+That builds one image, shared by every application service, and then:
 
-1. waits for Postgres, Kafka and the Schema Registry to pass their healthchecks
-2. runs a `setup` container that migrates all three databases, seeds Auth,
+1. waits for Postgres, Redis, Kafka and the Schema Registry to pass their healthchecks
+2. runs a `setup` container that migrates all four databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, and generates a signing
    keypair into a volume
-3. and only then starts Auth, Event, Ticketing and the outbox relay
+3. and only then starts Auth, Event, Ticketing, Live and the outbox relay
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
+
+OpenSearch comes up as well, but nothing on this path uses it yet. The Search
+service's indexer and query API are the rest of Chapter 6; until they exist, its
+index is created on the development path below.
 
 | Service   | URL                     |
 | --------- | ----------------------- |
 | Auth      | `http://localhost:3001` |
 | Event     | `http://localhost:3002` |
 | Ticketing | `http://localhost:3003` |
+| Live      | `http://localhost:3004`, WebSockets on the same port |
 | Relay     | `http://localhost:3010/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
@@ -271,26 +277,26 @@ is one place to change it. `pnpm` is pinned via `packageManager`.
 pnpm install && pnpm build
 ```
 
-Bring up only the infrastructure, naming the three containers so the application
+Bring up only the infrastructure, naming the containers so the application
 services stay down and the ports stay free for the ones you run yourself.
 `--wait` blocks until every healthcheck passes, so nothing below races a
 half-started broker:
 
 ```bash
-docker compose up -d --wait postgres kafka schema-registry
+docker compose up -d --wait postgres redis kafka schema-registry opensearch
 ```
 
-The Postgres container creates all three databases and their roles on first boot
+The Postgres container creates all four databases and their roles on first boot
 through its own `/docker-entrypoint-initdb.d` hook, so there is no separate
 bootstrap step.
 
 Each service ships a committed `.env.example`; copy it to `.env` (the real one is
-gitignored). Each carries **two** connection strings on purpose — `DATABASE_URL`
+gitignored). Each one that owns a database carries **two** connection strings on purpose — `DATABASE_URL`
 owns the tables and runs migrations, `APP_DATABASE_URL` owns nothing and is what
 the service connects as at runtime. That separation is what makes row-level
 security work at all.
 
-Then migrate each service. All three have their own migrations, and each reads
+Then migrate each service. All four have their own migrations, and each reads
 the `DATABASE_URL` from its own `.env` — which is why the copy above has to
 happen first:
 
@@ -336,6 +342,16 @@ fails at the first publish, with an error that names neither the missing piece
 nor the script that creates it — the broker says `This server does not host this
 topic-partition`, and the registry 404s on a subject nobody registered.
 
+Create the search index. It is a schema in the same sense the migrations are, so
+it comes from a checked-in definition rather than from the first write —
+OpenSearch would otherwise infer a mapping from whatever document arrived first,
+and it would type `tenantId` as analysed text, which is the one field tenant
+isolation rests on. Re-running it is safe:
+
+```bash
+pnpm --filter @eventhub/search run bootstrap:index
+```
+
 Finally, a throwaway signing keypair:
 
 ```bash
@@ -346,7 +362,7 @@ Keys are gitignored. Never reuse a real signing key here — anything in a build
 environment is readable by anything else running there.
 
 **`.github/workflows/ci.yml` is the authoritative setup for this second path.**
-It brings up the same `docker-compose.yml` a laptop does — naming the same three
+It brings up the same `docker-compose.yml` a laptop does — naming the same
 infrastructure services, with the same healthchecks and the same config — and
 then runs the application services from the working tree exactly as the steps
 above do. So the two cannot drift. If anything in this section disagrees with the
@@ -355,7 +371,7 @@ workflow, believe the workflow.
 CI deliberately does **not** exercise the container path. It builds from the
 working tree, so running an image built from that same tree would add a build and
 verify the same code twice; and a bare `docker compose up -d --wait` would start
-the application containers on 3001–3003, which is where CI starts its own. The
+the application containers on 3001–3004, and CI starts its own on 3001–3003. The
 container path is a way to run the system, not a second thing to test.
 
 That sentence was doing more work than it should have. The instructions above
@@ -391,10 +407,12 @@ before being trusted. An assertion nobody has seen go red is a guess.
 
 ## Status
 
-Chapters 1–4 are built: foundations, auth and RLS, the Event service and the
-Kafka backbone, and Ticketing through payments. Later chapters (live features,
-search, analytics, notifications, community) are designed and documented but not
-implemented.
+Chapters 1–5 are built: foundations, auth and RLS, the Event service and the
+Kafka backbone, Ticketing through payments, and live Q&A over WebSockets.
+Chapter 6, search, is in progress: the index, its mapping and per-tenant isolation
+exist and are verified, and the Kafka indexer and query API do not exist yet.
+Later chapters (analytics, notifications, community) are designed and documented
+but not implemented.
 
 Known gaps, named rather than hidden:
 

@@ -1,0 +1,28 @@
+{
+  "name": "@eventhub/search",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "bootstrap:index": "node --env-file-if-exists=.env dist/scripts/bootstrap-index.js"
+  },
+  "dependencies": {
+    "@eventhub/auth-middleware": "workspace:*",
+    "@eventhub/config": "workspace:*",
+    "@eventhub/logger": "workspace:*",
+    "@eventhub/types": "workspace:*",
+    "@opensearch-project/opensearch": "^2.13.0",
+    "express": "^4.21.2",
+    "kafkajs": "^2.2.4",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@eventhub/tsconfig": "workspace:*",
+    "@types/express": "^4.17.21",
+    "dotenv": "^17.4.2",
+    "tsx": "^4.19.2"
+  }
+}
