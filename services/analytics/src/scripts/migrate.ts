@@ -14,6 +14,11 @@ const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..',
 /**
  * Statements are separated by a marker line, never by splitting on semicolons,
  * which breaks the first time a statement contains one inside a string literal.
+ *
+ * This tolerates CRLF, which is worth knowing before anyone "fixes" it: in a
+ * JavaScript multiline regex `$` matches before `\r` as well as before `\n`, so
+ * `-- >>>\r\n` still matches. Measured by checking these files out with CRLF and
+ * running scripts/verify-analytics-schema.mjs against the runner as it was.
  */
 const SEPARATOR = /^-- >>>[ \t]*$/m;
 
@@ -72,6 +77,8 @@ async function main(): Promise<void> {
     let ran = 0;
     for (const file of files) {
       const text = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
+      // Normalised, so a Windows checkout (CRLF under core.autocrlf) and CI (LF)
+      // record the same checksum for the same migration.
       const checksum = createHash('sha256').update(text.replace(/\r\n/g, '\n')).digest('hex');
       const previous = applied.get(file);
 
