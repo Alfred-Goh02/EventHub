@@ -66,6 +66,7 @@ COPY --chown=node:node packages/config/package.json ./packages/config/
 COPY --chown=node:node packages/logger/package.json ./packages/logger/
 COPY --chown=node:node packages/tsconfig/package.json ./packages/tsconfig/
 COPY --chown=node:node packages/types/package.json ./packages/types/
+COPY --chown=node:node services/analytics/package.json ./services/analytics/
 COPY --chown=node:node services/auth/package.json ./services/auth/
 COPY --chown=node:node services/event/package.json ./services/event/
 COPY --chown=node:node services/live/package.json ./services/live/
