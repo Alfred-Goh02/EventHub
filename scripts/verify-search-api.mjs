@@ -53,6 +53,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Kafka, logLevel } from 'kafkajs';
 import pg from 'pg';
+import { searchServiceEnv } from './lib/search-service-env.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -75,7 +76,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    // HERE, not only at the end. A `return` inside the try below runs the
+    // finally and then skips the end-of-run gate, and this file once printed
+    // FAIL and exited 0 — a red run CI would have called green.
+    process.exitCode = 1;
+  }
 }
 
 const run = randomUUID().replace(/-/g, '').slice(0, 8);
@@ -176,19 +183,17 @@ async function main() {
   let wroteIndex = false;
   let wroteEvents = false;
 
-  const baseEnv = {
-    PATH: process.env['PATH'],
-    SystemRoot: process.env['SystemRoot'],
-    NODE_ENV: 'development',
+  // Search's own .env.example plus these. See scripts/lib/search-service-env.mjs
+  // for the three times a hand-written list here fell behind the service.
+  const baseEnv = searchServiceEnv(ROOT, {
     LOG_LEVEL: 'warn',
     KAFKA_BROKERS: process.env['KAFKA_BROKERS'],
     SCHEMA_REGISTRY_URL: process.env['SCHEMA_REGISTRY_URL'],
     SEARCH_INDEXER_START_FROM: 'latest',
-    AUTH_PUBLIC_KEY_B64: readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem')).toString('base64'),
     JWT_ISSUER: ISSUER,
     JWT_AUDIENCE: AUDIENCE,
     EVENT_SERVICE_URL: EVENT_URL,
-  };
+  });
 
   function start(port, opensearchNode, group) {
     const child = spawn(process.execPath, ['dist/index.js'], {

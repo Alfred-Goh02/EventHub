@@ -547,6 +547,9 @@ services:
       # The degraded path, called with the caller's own token.
       EVENT_SERVICE_URL: http://event:3002
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      # Signs pagination cursors. Local only, and the same value .env.example
+      # carries; a real deployment generates its own and never commits it.
+      SEARCH_CURSOR_SECRET: local-development-cursor-secret-0123456789
     volumes:
       - jwt-keys:/run/eventhub/keys:ro
     working_dir: /app/services/search

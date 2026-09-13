@@ -70,7 +70,12 @@ const mod = (rel) => import(pathToFileURL(join(ROOT, 'services', 'search', 'dist
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    // HERE, not only at the end: the `return` after a failed bulk skips the
+    // end-of-run gate. Two sibling verifiers printed FAIL and exited 0 that way.
+    process.exitCode = 1;
+  }
 }
 
 const run = randomUUID().replace(/-/g, '').slice(0, 8);

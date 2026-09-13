@@ -64,6 +64,14 @@ const searchEnvSchema = baseEnvSchema
      * with the caller's own token; Search holds no credential for it.
      */
     EVENT_SERVICE_URL: z.string().url(),
+
+    /**
+     * Signs pagination cursors so a client cannot edit one — see cursor.ts. At
+     * least 32 characters, because an HMAC key is only as strong as its entropy.
+     * Rotating it invalidates every cursor in flight, which costs a reader one
+     * "start again" and nothing more.
+     */
+    SEARCH_CURSOR_SECRET: z.string().min(32),
   });
 
 export const env = loadEnv(searchEnvSchema);

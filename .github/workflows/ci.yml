@@ -685,6 +685,27 @@ jobs:
 
           pkill -f "node dist/index.js" || true
 
+      # CHAPTER 6, PART 4: deep pagination -- search_after inside a
+      # Point-in-Time, behind a signed cursor.
+      #
+      # 50 events at 10 a page must come back as exactly 50 distinct ids,
+      # including ten that share one start time across a page boundary, which
+      # is where a sort with no unique tiebreaker skips rows. An event indexed
+      # mid-traversal must not appear in later pages. A cursor presented by
+      # another tenant, with another query, or with one byte changed is a 400.
+      # A traversal that ends leaves no PIT open, and a page whose PIT has gone
+      # is a 410.
+      #
+      # And the backstop: a VALIDLY signed cursor for tenant B carrying tenant
+      # A's PIT -- what a leaked signing secret would allow -- still reads
+      # nothing of A's, because every query filters on the caller's tenant too.
+      - name: Assert paging returns every result once, holds still, and cannot cross tenants
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+          KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+        run: node scripts/verify-search-pagination.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
