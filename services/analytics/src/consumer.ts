@@ -45,10 +45,31 @@ app.get('/metrics', (_req, res) => {
   res.json({ ingest: ingestMetrics() });
 });
 
+let ingestStarted = false;
+
+/**
+ * Ready once the consumer has connected to Kafka and subscribed, and ClickHouse
+ * answers as this process's user.
+ *
+ * Not "has joined its group". A join can wait out a dead member's session
+ * timeout — 30 seconds here, and a hard kill routinely leaves one behind — and a
+ * probe that failed for that long would restart a healthy process into the same
+ * wait.
+ */
+app.get('/ready', async (_req, res) => {
+  const clickhouse = await ch
+    .ping()
+    .then((r) => r.success)
+    .catch(() => false);
+  const ready = ingestStarted && clickhouse;
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not ready', consumer: ingestStarted, clickhouse });
+});
+
 async function startIngestor(): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await ingestor.start();
+      ingestStarted = true;
       return;
     } catch (err) {
       const waitMs = Math.min(30_000, 1_000 * 2 ** attempt);

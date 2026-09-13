@@ -790,6 +790,23 @@ jobs:
           SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-search-observability.mjs
 
+      # CHAPTER 7, PART 2: Kafka into ClickHouse, each message counted once.
+      # Delivery is at least once and a rollup cannot be deduplicated after the
+      # fact, so the write must be safe to repeat. The first design took its
+      # dedup token from the batch's offsets; a redelivery that ends later counts
+      # the overlap twice under it, which this keeps as a control. The one that
+      # shipped dedupes by message id, which also catches a republish at a new
+      # offset. Also asserted: one row per ticket line with its own money, poison
+      # kept in ingest_dlq without blocking its partition, and offsets committed
+      # after the write -- which the first version never did: kafkajs's
+      # commitOffsetsIfNecessary() with autoCommit off commits nothing, and the
+      # group's offsets sat at -1 after every message was written.
+      - name: Assert ingest counts each message once, keeps poison, and commits after the write
+        env:
+          KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+        run: node scripts/verify-analytics-ingest.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password

@@ -28,6 +28,26 @@
  * group has resolved its position — so a canary goes first, and nothing is
  * asserted before it lands.
  *
+ * WATCHED FAIL: a real bug first, then six guards broken across two runs.
+ *
+ *   the consumer as first written      committed offsets -1 on all three topics
+ *                                      after every message had been written
+ *   run 1, 14 red:
+ *     writer lookup bypassed           a redelivery inserted 20 and skipped 0;
+ *                                      a republish inserted 4
+ *     lookup as a tuple IN             the primary-key step used [event_id] only
+ *     line money = the charge total    purchase lines of 7000 and 7000, and a
+ *                                      rollup gross of 14000
+ *     ZodError message kept raw        the DLQ error was multi-line JSON
+ *   run 2, 10 red:
+ *     dedup token emptied              the raced retry landed: 12 rows, not 6 —
+ *                                      ClickHouse's own block hash did not catch it
+ *     poison thrown, not kept          0 of 5 rows behind it, nothing in the DLQ,
+ *                                      committed offsets stopped at the poison
+ *
+ * And this file was wrong once: it wanted four rows behind the poison where the
+ * fixture sends five, and failed on a correct consumer.
+ *
  * Run (after pnpm build, topics and schemas, with ClickHouse up):
  *   node scripts/verify-analytics-ingest.mjs
  */
