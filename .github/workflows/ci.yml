@@ -130,6 +130,19 @@ jobs:
       - name: Assert the shared types match their schemas and contracts
         run: node scripts/verify-shared-types.mjs
 
+      # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
+      # ClickHouse measured the 72G root filesystem at 91% used by the time the
+      # Search verifiers ran, and OpenSearch refuses to create any index past its
+      # 90% high watermark: the reindex verifier failed with `cluster
+      # create-index blocked (api)`, with cluster.blocks.create_index set to true.
+      # These are preinstalled SDKs and images this job never uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h /
+
       # The EXACT stack a developer runs, from the same file, with the same
       # config. --wait blocks until every healthcheck passes, so nothing below
       # races a half-started broker.
@@ -163,6 +176,19 @@ jobs:
 
       - name: Show what came up
         run: docker compose ps
+
+      # The guard for "Free runner disk", placed before anything writes to
+      # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
+      # disk, rather than minutes later as an index_create_block_exception in
+      # whichever verifier happens to create an index next.
+      - name: Assert the runner has disk headroom for OpenSearch
+        run: |
+          used=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          echo "root filesystem ${used}% used"
+          if [ "$used" -ge 85 ]; then
+            echo "::error::root filesystem ${used}% used; OpenSearch stops creating indices at its 90% high watermark"
+            exit 1
+          fi
 
       - name: Apply migrations (auth)
         working-directory: services/auth
@@ -745,19 +771,6 @@ jobs:
       # older copy overwrites a newer write, no search fails or comes back empty,
       # every tenant alias moves with its filter in the same atomic call, and the
       # whole thing can be run backwards.
-      # DIAGNOSTIC. On PR #96 the next step was refused with `cluster
-      # create-index blocked (api)`, which OpenSearch applies when disk crosses
-      # its high watermark (90%). That run added ClickHouse to this runner. This
-      # prints what the disk and the cluster actually say, so the fix answers
-      # evidence rather than a guess.
-      - name: Show disk use and OpenSearch blocks
-        run: |
-          df -h /
-          docker system df
-          curl -s 'http://127.0.0.1:9200/_cat/allocation?v'
-          curl -s 'http://127.0.0.1:9200/_cluster/settings?flat_settings=true'
-          echo
-
       - name: Assert a migration to a new index loses nothing, fails nothing, and can be undone
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
