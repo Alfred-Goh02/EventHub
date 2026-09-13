@@ -1,11 +1,12 @@
 # What every application container shares.
 #
-# Defined here rather than repeated five times, and defined ABOVE services
+# Defined here rather than repeated for every service, and defined ABOVE services
 # because a YAML anchor has to exist before it is referenced.
 #
-# ONE IMAGE, FIVE COMMANDS. All of them name the same `image:` and the same
-# `build:`, so compose builds it once and the other four reuse it. Give them
-# different image names and you get four builds of the same lockfile.
+# ONE IMAGE, MANY COMMANDS. Every application container and setup name the same
+# `image:` and the same `build:`, so compose builds it once and the rest reuse it.
+# Give them different image names and you get one build of the same lockfile per
+# service.
 x-app: &app
   image: eventhub/app:local
   build:
@@ -289,8 +290,11 @@ services:
         condition: service_healthy
       schema-registry:
         condition: service_healthy
+      opensearch:
+        condition: service_healthy
     environment:
       <<: *app-env
+      OPENSEARCH_NODE: http://opensearch:9200
       # One per service, because `prisma migrate deploy` reads DATABASE_URL and
       # each service owns a different database. They are passed under distinct
       # names and assigned per command below, rather than hoping three migrations
@@ -338,6 +342,11 @@ services:
         node scripts/create-topics.mjs
         echo "setup: registering Avro schemas"
         node scripts/register-schemas.mjs
+
+        # From index-definition.ts, before the indexer can write anything. PORT
+        # only because the shared base schema requires one; nothing binds it.
+        echo "setup: creating the search index"
+        PORT=3005 pnpm --filter @eventhub/search run bootstrap:index
 
         echo "setup: done"
 
@@ -510,6 +519,35 @@ services:
       # /metrics is the only route it serves, and answering it means the process
       # is up AND its database connection works -- the endpoint runs a query.
       test: ["CMD-SHELL", "curl -sf http://localhost:3010/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Search: the indexer consuming events.activity into OpenSearch, and the
+  # service that will answer queries.
+  #
+  # Waits on setup only. setup already waits for OpenSearch and creates the index,
+  # and the service itself listens whether or not the cluster is there — /ready
+  # is what says whether it can serve.
+  # ---------------------------------------------------------------------------
+  search:
+    <<: *app
+    container_name: eventhub-search
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3005:3005"
+    environment:
+      <<: *app-env
+      PORT: 3005
+      OPENSEARCH_NODE: http://opensearch:9200
+    working_dir: /app/services/search
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3005/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6

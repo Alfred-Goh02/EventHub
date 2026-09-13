@@ -126,16 +126,24 @@ async function main() {
     messages: [{ key: `${run}_garbage`, value: Buffer.from('this is not a Confluent frame') }],
   });
 
+  /**
+   * ONLY TICKETING'S COPIES. events.activity.dlq is shared: Search's indexer
+   * consumes the same topic and parks its own copy of the same poison message,
+   * with its own dlq-reason wording. Matching on the key alone would pass or fail
+   * depending on which consumer happened to write first.
+   */
+  const ours = () => seen.filter((m) => m.headers['dlq-consumer-group'] === 'ticketing-event-projection');
+
   // Give the projection consumer time to read both and produce to the DLQ.
-  for (let i = 0; i < 30 && seen.length < 2; i += 1) await sleep(1000);
+  for (let i = 0; i < 30 && ours().length < 2; i += 1) await sleep(1000);
 
   await consumer.disconnect();
   await producer.disconnect();
 
   console.log('');
 
-  const empty = seen.find((m) => m.key === `${run}_empty`);
-  const garbage = seen.find((m) => m.key === `${run}_garbage`);
+  const empty = ours().find((m) => m.key === `${run}_empty`);
+  const garbage = ours().find((m) => m.key === `${run}_garbage`);
 
   check(
     garbage !== undefined,

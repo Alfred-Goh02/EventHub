@@ -212,6 +212,7 @@ jobs:
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
           KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
         run: pnpm run bootstrap:index
 
       # Keys are gitignored, so CI generates its own throwaway pair. Never reuse
@@ -633,7 +634,31 @@ jobs:
         env:
           OPENSEARCH_NODE: http://127.0.0.1:9200
           KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-search-tenant-isolation.mjs
+
+      # CHAPTER 6, PART 2: the indexer, under the delivery Kafka actually gives
+      # -- at least once, in no promised order across a rebalance.
+      #
+      # Asserted: the same snapshot twice leaves _version alone; an OLDER
+      # snapshot arriving late changes nothing; a stale snapshot replayed over a
+      # deleted event leaves it deleted (why deletes are a status, not a DELETE:
+      # tombstones are garbage-collected after 60 seconds and a later stale write
+      # would resurrect the event); an undecodable message is parked and the
+      # partition moves past it; and what the indexer writes is found through
+      # its tenant's alias only, which holds only if its routing is right.
+      #
+      # Every "nothing changed" waits first for the version-conflict counter to
+      # rise by one. A duplicate that was never consumed also changes nothing.
+      #
+      # The verifier starts its own indexer under a fresh consumer group, so no
+      # other step here has a second consumer writing to the shared DLQ.
+      - name: Assert the search indexer is idempotent, refuses stale snapshots, and is never blocked
+        env:
+          OPENSEARCH_NODE: http://127.0.0.1:9200
+          KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+        run: node scripts/verify-search-indexer.mjs
 
       # The password reset flow, including the failure that returns success.
       #

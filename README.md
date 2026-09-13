@@ -80,10 +80,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
-| `services/search` | Event search on OpenSearch: one shared index, each tenant confined by a filtered alias. The index and its isolation are built; the Kafka indexer and query API are next |
+| `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, and each tenant is confined by a filtered alias. The query API is next |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 49 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 50 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -116,6 +116,10 @@ flowchart TB
     LIVEB["Live pod B<br/>holds its own sockets"]
   end
 
+  subgraph SEARCHSVC["Search · :3005"]
+    INDEXER["Indexer<br/>external versioning · DLQ"]
+  end
+
   CLIENT(["Client"])
   DBAUTH[("eventhub_auth")]
   DBEVENT[("eventhub_event<br/>Event + OutboxMessage")]
@@ -146,6 +150,8 @@ flowchart TB
   RELAY -->|"resolves the subject"| REGISTRY
   RELAY -->|"Avro"| KAFKA
   KAFKA --> PROJ
+  KAFKA --> INDEXER
+  INDEXER -->|"routed by tenant"| OPENSEARCH[("OpenSearch · events-v1<br/>one filtered alias per tenant")]
 
   RECON -->|"asks, never guesses"| PROVIDER
   PROVIDER -->|"signed webhook"| TKT
@@ -213,18 +219,19 @@ docker compose up -d --wait
 
 That builds one image, shared by every application service, and then:
 
-1. waits for Postgres, Redis, Kafka and the Schema Registry to pass their healthchecks
+1. waits for Postgres, Redis, Kafka, the Schema Registry and OpenSearch to pass their healthchecks
 2. runs a `setup` container that migrates all four databases, seeds Auth,
-   creates the Kafka topics, registers the Avro schemas, and generates a signing
-   keypair into a volume
-3. and only then starts Auth, Event, Ticketing, Live and the outbox relay
+   creates the Kafka topics, registers the Avro schemas, creates the search index,
+   and generates a signing keypair into a volume
+3. and only then starts Auth, Event, Ticketing, Live, Search and the outbox relay
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
 
-OpenSearch comes up as well, but nothing on this path uses it yet. The Search
-service's indexer and query API are the rest of Chapter 6; until they exist, its
-index is created on the development path below.
+Search's indexer fills the index from `events.activity` as soon as it starts,
+replaying the compacted topic from the beginning, so an event created before
+Search existed is still found. The query API that reads the index is the next
+part of Chapter 6.
 
 | Service   | URL                     |
 | --------- | ----------------------- |
@@ -232,6 +239,7 @@ index is created on the development path below.
 | Event     | `http://localhost:3002` |
 | Ticketing | `http://localhost:3003` |
 | Live      | `http://localhost:3004`, WebSockets on the same port |
+| Search    | `http://localhost:3005/metrics` |
 | Relay     | `http://localhost:3010/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
@@ -371,7 +379,7 @@ workflow, believe the workflow.
 CI deliberately does **not** exercise the container path. It builds from the
 working tree, so running an image built from that same tree would add a build and
 verify the same code twice; and a bare `docker compose up -d --wait` would start
-the application containers on 3001–3004, and CI starts its own on 3001–3003. The
+the application containers on 3001–3005, and CI starts its own on 3001–3003. The
 container path is a way to run the system, not a second thing to test.
 
 That sentence was doing more work than it should have. The instructions above
@@ -409,8 +417,8 @@ before being trusted. An assertion nobody has seen go red is a guess.
 
 Chapters 1–5 are built: foundations, auth and RLS, the Event service and the
 Kafka backbone, Ticketing through payments, and live Q&A over WebSockets.
-Chapter 6, search, is in progress: the index, its mapping and per-tenant isolation
-exist and are verified, and the Kafka indexer and query API do not exist yet.
+Chapter 6, search, is in progress: the index, per-tenant isolation and the Kafka
+indexer exist and are verified, and the query API does not exist yet.
 Later chapters (analytics, notifications, community) are designed and documented
 but not implemented.
 
