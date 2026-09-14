@@ -42,7 +42,12 @@ const eventId = `evt_fanout_${Date.now()}`;
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    // HERE, not only in the gate at the end, per CLAUDE.md: a return inside the
+    // try below runs the finally and skips that gate.
+    process.exitCode = 1;
+  }
 }
 function fatal(msg) {
   console.error(`\nFAIL: ${msg}`);
@@ -234,6 +239,39 @@ async function main() {
     check(
       a.of('question.created').length === 2,
       `and the second question still reached its own tenant (${a.of('question.created').length} total)`,
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  an upvote counts for the event its question belongs to, and no other');
+    // -----------------------------------------------------------------------
+    /**
+     * The vote row and the count key only on the question id, and the Kafka
+     * message Analytics counts carried the eventId the CLIENT sent. Unchecked,
+     * any member of a tenant could credit an upvote to any event id, one that
+     * does not exist included, and every engagement dashboard would disagree
+     * with Live's own Postgres. Found by the review of Analytics' ingest.
+     */
+    const questionId = b.of('question.created')[0]?.question?.id;
+    check(typeof questionId === 'string', `CONTROL: the question posted above has an id to vote on (${questionId})`);
+
+    const errorsBefore = a.of('error').length;
+    a.ws.send(JSON.stringify({ t: 'question.upvote', eventId: `${eventId}_elsewhere`, questionId }));
+    await settle(1200);
+    const refused = a.of('error').slice(errorsBefore);
+    check(
+      refused.length === 1 && refused[0].code === 'no_such_question',
+      `an upvote naming another event id is refused as no_such_question (got ${JSON.stringify(refused)})`,
+    );
+
+    // The control that makes the refusal mean something: had the wrong-event vote
+    // committed, this one would be already_voted and no count would arrive.
+    a.ws.send(JSON.stringify({ t: 'question.upvote', eventId, questionId }));
+    await settle(1200);
+    const counted = b.of('question.upvoted').filter((m) => m.id === questionId);
+    check(
+      counted.length === 1 && counted[0].voteCount === 1,
+      `CONTROL: the same vote under the question's own event counts, as its first: ${JSON.stringify(counted)}`,
     );
 
     for (const client of [a, b, c]) client.ws.close();
