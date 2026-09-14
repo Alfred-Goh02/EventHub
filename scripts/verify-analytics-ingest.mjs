@@ -10,9 +10,13 @@
  *   FAITHFUL ROWS              one row per line, with that line's quantity and
  *                              money, at the UTC instant the producer stamped,
  *                              carrying the Kafka coordinates it was read from
- *   NOT BLOCKED                a message that can never be a row is kept in
- *                              ingest_dlq with its coordinates and bytes, and its
- *                              partition moves past it
+ *   NOT BLOCKED                a message that can never be a row — refused by the
+ *                              mapper, or by ClickHouse — is kept in ingest_dlq
+ *                              with its coordinates and bytes, and its partition
+ *                              moves past it; a failure that is not the message's
+ *                              fault is thrown for redelivery instead
+ *   REFUSED BEFORE CHANGED     what ClickHouse would silently store as something
+ *                              else never reaches it
  *   COMMITTED AFTER THE WRITE  the group's committed offset reaches past what was
  *                              written, so a restart does not replay it
  *
@@ -55,6 +59,24 @@
  * hashed from ids without the tenant, matched the first tenant's block. The check
  * that leans on that copy passed anyway — so its precondition is now a control
  * read from the table, which went red.
+ *
+ * The refusal checks came from review. A lone surrogate the mapper accepted made
+ * ClickHouse refuse the whole insert, and the batch was redelivered forever:
+ * against that consumer this file went 5 red — the partition stalled at one
+ * offset while kafkajs crash-looped, and the truncated JSON beside the surrogate
+ * never reached the DLQ either. Then two runs against broken guards:
+ *
+ *   run 3, 6 red   the mapper's four refusals    all five cases mapped; the
+ *                  loosened                      surrogate reached ClickHouse and
+ *                                                was kept by the writer instead —
+ *                                                and its partition still moved
+ *   run 4, 4 red   the writer's per-message pass the refused batch stored
+ *                  emptied, and any ClickHouse   nothing; a missing database was
+ *                  error called a refusal        kept aside rather than thrown
+ *
+ * One run between those proved nothing and is not counted: ClickHouse refused a
+ * plain count() with MEMORY_LIMIT_EXCEEDED while the stuck compose ingest
+ * container retried beside it.
  *
  * Run (after pnpm build, topics and schemas, with ClickHouse up):
  *   node scripts/verify-analytics-ingest.mjs
