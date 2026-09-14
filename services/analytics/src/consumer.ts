@@ -4,6 +4,7 @@ import { createLogger } from '@eventhub/logger';
 import { ingestEnv as env } from './ingest/env.js';
 import { createClickHouse } from './clickhouse.js';
 import { createIngestor, ingestHealth, ingestMetrics } from './ingest/consumer.js';
+import { partCounts } from './ingest/parts.js';
 
 /**
  * The ingest process — a separate entrypoint from the read API, and in
@@ -45,8 +46,28 @@ const app = express();
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'analytics-ingest' });
 });
-app.get('/metrics', (_req, res) => {
-  res.json({ ingest: ingestMetrics() });
+/**
+ * The counters, plus the two numbers that decide whether this pipeline is healthy:
+ * consumer lag, which says it is broken, and part counts, which say it is about to
+ * be.
+ *
+ * Both take round trips — to the brokers and to ClickHouse — so they are cached for
+ * five seconds and bounded at two, the way Search bounds its lag: a /metrics
+ * request must never be the thing that hangs when Kafka or ClickHouse does.
+ */
+let slow: { at: number; lag: unknown; parts: unknown } | null = null;
+
+const bounded = <T>(work: Promise<T>): Promise<T | { error: string }> =>
+  Promise.race([work, sleep(2_000).then(() => ({ error: 'timed out after 2s' }))]).catch((err: unknown) => ({
+    error: err instanceof Error ? err.message : String(err),
+  }));
+
+app.get('/metrics', async (_req, res) => {
+  if (slow === null || Date.now() - slow.at > 5_000) {
+    const [lag, parts] = await Promise.all([bounded(ingestor.lag()), bounded(partCounts(ch, env.CLICKHOUSE_DATABASE))]);
+    slow = { at: Date.now(), lag, parts };
+  }
+  res.json({ ingest: { ...ingestMetrics(), lag: slow.lag, parts: slow.parts } });
 });
 
 /**

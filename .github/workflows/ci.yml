@@ -817,6 +817,20 @@ jobs:
       - name: Assert the analytics API answers only the token's tenant, with numbers that add up
         run: node scripts/verify-analytics-api.mjs
 
+      # CHAPTER 7, PART 4: the failure drills, run rather than described. One
+      # insert per message makes one part per message where a batch makes one, and
+      # /metrics reports each table's worst partition beside the server's own
+      # thresholds. A rollup corrupted on purpose is rebuilt from the raw table and
+      # comes back equal to it. A consumer whose ClickHouse is unreachable commits
+      # nothing while lag climbs by exactly what was produced, and drains to zero
+      # with every message landed once when ClickHouse is back. "Unreachable" is a
+      # closed port, never a stopped container every other step shares.
+      - name: Assert analytics survives its failure drills, and shows lag and part counts
+        env:
+          KAFKA_BROKERS: localhost:9092
+          SCHEMA_REGISTRY_URL: http://localhost:8081
+        run: node scripts/verify-analytics-drills.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
