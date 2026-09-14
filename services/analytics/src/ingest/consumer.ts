@@ -5,6 +5,7 @@ import { ZodError } from 'zod';
 import type { Logger } from '@eventhub/logger';
 import { INGEST_TOPICS, isIngestTopic, toRows } from './mappers.js';
 import { writeMessages, type MessageRows } from './writer.js';
+import { consumerLag, type ConsumerLag } from './lag.js';
 
 interface DlqRow {
   source_topic: string;
@@ -245,6 +246,9 @@ export function createIngestor(opts: {
     minBytes: 1_000_000,
     sessionTimeout: 30_000,
   });
+  // Reads offsets for the lag measurement. Its own connection, so a slow
+  // metadata request never waits behind a fetch.
+  const admin = kafka.admin();
 
   async function decode(topic: string, value: Buffer | null): Promise<unknown> {
     if (value === null) throw new Error('null value (a tombstone)');
@@ -256,6 +260,7 @@ export function createIngestor(opts: {
 
   return {
     async start(): Promise<void> {
+      await admin.connect();
       await consumer.connect();
       consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => {
         assignedPartitions = Object.values(payload.memberAssignment).reduce((n, p) => n + p.length, 0);
@@ -281,9 +286,15 @@ export function createIngestor(opts: {
       opts.logger.info({ group: opts.groupId, topics: Object.keys(INGEST_TOPICS), startFrom: opts.startFrom }, 'ingest running');
     },
 
+    /** Messages behind, per partition of every ingest topic. See lag.ts. */
+    lag(): Promise<ConsumerLag> {
+      return consumerLag(admin, opts.groupId, Object.keys(INGEST_TOPICS));
+    },
+
     async stop(): Promise<void> {
       health.subscribed = false;
       await consumer.disconnect().catch(() => {});
+      await admin.disconnect().catch(() => {});
     },
   };
 }
