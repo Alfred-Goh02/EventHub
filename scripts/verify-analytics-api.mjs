@@ -64,6 +64,7 @@ import { serviceEnv } from './lib/service-env.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 3917;
 const PORT_DOWN = 3918;
+const PORT_WRONG_PASSWORD = 3919;
 
 const mod = (rel) => import(pathToFileURL(join(ROOT, 'services', 'analytics', 'dist', rel)).href);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -206,6 +207,7 @@ async function main() {
 
   let api = null;
   let down = null;
+  let wrongPassword = null;
 
   try {
     await createScratchDatabase(DB);
@@ -449,9 +451,21 @@ async function main() {
     );
     const downMetrics = await fetch(`http://127.0.0.1:${PORT_DOWN}/metrics`).then((r) => r.json());
     check(downMetrics.queries?.funnel?.unavailableTotal === 1, `and it is counted as unavailable, not failed (${JSON.stringify(downMetrics.queries?.funnel)})`);
+
+    // ClickHouse answers GET /ping without authenticating, so a readiness check
+    // built on a plain ping said ready with a wrong password (found by the review
+    // of the ingest, whose /ready had the same line).
+    wrongPassword = startApi(PORT_WRONG_PASSWORD, { CLICKHOUSE_PASSWORD: 'not-the-password' });
+    const wrongPasswordListening = await waitForHttp(PORT_WRONG_PASSWORD, '/health');
+    const wrongPasswordReady = await fetch(`http://127.0.0.1:${PORT_WRONG_PASSWORD}/ready`).then((r) => r.status).catch(() => 0);
+    check(
+      wrongPasswordListening && wrongPasswordReady === 503,
+      `an API given a wrong ClickHouse password is listening but not ready (${wrongPasswordReady})`,
+    );
   } finally {
     await stop(api);
     await stop(down);
+    await stop(wrongPassword);
     const gone = await dropScratchDatabase(DB);
     console.log(`\n    cleanup: scratch database ${gone ? 'dropped' : 'STILL PRESENT'}`);
   }
