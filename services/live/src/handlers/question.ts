@@ -115,13 +115,21 @@ async function onUpvote(
      *
      * Both statements are in one transaction, so voteCount cannot drift from the
      * vote rows even if the second fails.
+     *
+     * THE EVENT IS PART OF THE MATCH. The vote row keys only on the question, and
+     * the eventId here is whatever the client sent — the same value that names the
+     * channel below and goes to Kafka for Analytics to count. Matching on id alone
+     * let any member of a tenant credit an upvote to any event id, one that does
+     * not exist included (found by the review of Analytics' ingest, and measured
+     * in scripts/verify-live-fanout.mjs). With the event in the WHERE, a question
+     * that is not in that event is P2025, which rolls the vote row back with it.
      */
     const updated = await withTenant(ws.tenantId, async (tx) => {
       await tx.questionVote.create({
         data: { questionId: msg.questionId, userId: ws.userId, tenantId: ws.tenantId },
       });
       return tx.question.update({
-        where: { id: msg.questionId },
+        where: { id: msg.questionId, eventId: msg.eventId },
         data: { voteCount: { increment: 1 } },
         select: { id: true, voteCount: true },
       });
@@ -147,9 +155,10 @@ async function onUpvote(
         send(ws, { t: 'error', code: 'already_voted' });
         return;
       }
-      // P2025: the question does not exist, or RLS hid it because it belongs to
-      // another tenant. Those are indistinguishable from here, and deliberately
-      // so — saying which would confirm the existence of another tenant's row.
+      // P2025: the question does not exist, is not in the event named, or RLS
+      // hid it because it belongs to another tenant. Those are indistinguishable
+      // from here, and deliberately so — saying which would confirm the existence
+      // of another tenant's row.
       if (err.code === 'P2025') {
         send(ws, { t: 'error', code: 'no_such_question' });
         return;
