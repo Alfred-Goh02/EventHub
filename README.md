@@ -82,12 +82,14 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |
+| `services/notification` | The start of the one service that will send email: its own database, and a sent-log under row-level security whose claim is unique per tenant. Nothing sends yet |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
-| `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 58 executable proofs of the invariants above |
+| `db/init/` | Five databases and thirteen roles, with `CONNECT` revoked from `PUBLIC` |
+| `scripts/verify-*.mjs` | 60 executable proofs of the invariants above |
 
-Four separate Postgres databases with their own credentials. CI asserts across
-all twelve directions that no service can even open a connection to another's.
+Five separate Postgres databases with their own credentials. CI reads every
+database and login role from `db/init` and asserts that no role can even open a
+connection to a database it was not granted.
 
 ## How it fits together
 
@@ -221,10 +223,10 @@ docker compose up -d --wait
 That builds one image, shared by every application service, and then:
 
 1. waits for Postgres, Redis, Kafka, the Schema Registry, OpenSearch and ClickHouse to pass their healthchecks
-2. runs a `setup` container that migrates all four databases, seeds Auth,
+2. runs a `setup` container that migrates all five databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
    migrates ClickHouse, and generates a signing keypair into a volume
-3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, and the outbox relay
+3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relay
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
@@ -251,6 +253,7 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Search    | `http://localhost:3005/metrics` |
 | Analytics | `http://localhost:3006/ready` |
 | Analytics ingest | `http://localhost:3016/metrics` |
+| Notification | `http://localhost:3007/ready` |
 | Relay     | `http://localhost:3010/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
@@ -305,9 +308,13 @@ half-started broker:
 docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse
 ```
 
-The Postgres container creates all four databases and their roles on first boot
+The Postgres container creates all five databases and their roles on first boot
 through its own `/docker-entrypoint-initdb.d` hook, so there is no separate
-bootstrap step.
+bootstrap step. First boot only: the hook never runs against an existing data
+volume, so a volume created before a service's database was added does not have
+it. `docker compose down -v` recreates the volume and discards its data; the
+alternative is to run that service's lines from `db/init/01-bootstrap.sql` as the
+`eventhub` superuser.
 
 Each service ships a committed `.env.example`; copy it to `.env` (the real one is
 gitignored). Each one that owns a database carries **two** connection strings on purpose — `DATABASE_URL`
@@ -315,7 +322,7 @@ owns the tables and runs migrations, `APP_DATABASE_URL` owns nothing and is what
 the service connects as at runtime. That separation is what makes row-level
 security work at all.
 
-Then migrate each service. All four have their own migrations, and each reads
+Then migrate each service. All five have their own migrations, and each reads
 the `DATABASE_URL` from its own `.env` — which is why the copy above has to
 happen first:
 
@@ -333,6 +340,10 @@ pnpm --filter @eventhub/ticketing exec prisma migrate deploy
 
 ```bash
 pnpm --filter @eventhub/live exec prisma migrate deploy
+```
+
+```bash
+pnpm --filter @eventhub/notification exec prisma migrate deploy
 ```
 
 Only Auth has a seed. Running this against Event or Ticketing fails with a
@@ -461,8 +472,10 @@ route is checked against another tenant's event. The failure drills run in CI:
 
 A rollup rebuild is `pnpm --filter @eventhub/analytics run rebuild-rollups`, with
 the ingest stopped first: a row that lands mid-rebuild would be counted twice.
-Later chapters (notifications, community) are designed and documented but not
-implemented.
+Chapter 8, notifications, has its foundation: its own database, reachable only by
+its own roles, and a sent-log under row-level security whose claim is unique per
+tenant. Nothing sends yet. Chapter 9, community, is designed and documented but
+not implemented.
 
 Known gaps, named rather than hidden:
 

@@ -52,6 +52,8 @@ jobs:
 
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@localhost:5432/eventhub_live
       LIVE_APP_DATABASE_URL: postgresql://eventhub_live_app:eventhub_live_app@localhost:5432/eventhub_live
+      NOTIFICATION_DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@localhost:5432/eventhub_notification
+      NOTIFICATION_APP_DATABASE_URL: postgresql://eventhub_notification_app:eventhub_notification_app@localhost:5432/eventhub_notification
       # The sweeper credential. The reconciler runs on it, and the payment
       # webhook uses it for ONE statement: resolving which tenant a payment
       # belongs to. A webhook arrives with no tenant, and every table here is
@@ -210,6 +212,12 @@ jobs:
         working-directory: services/live
         env:
           DATABASE_URL: ${{ env.LIVE_DATABASE_URL }}
+        run: pnpm exec prisma migrate deploy
+
+      - name: Apply migrations (notification)
+        working-directory: services/notification
+        env:
+          DATABASE_URL: ${{ env.NOTIFICATION_DATABASE_URL }}
         run: pnpm exec prisma migrate deploy
 
       - name: Seed
@@ -1763,72 +1771,44 @@ jobs:
           control "$LIVE_DATABASE_URL" live
           check "$LIVE_DATABASE_URL" live "'_prisma_migrations'"
 
+          # Notification has NO exemptions, though the Field Guide exempted its
+          # sent-log. The claim is made while handling a message, and every
+          # message carries its tenant, so tenant context is set before it --
+          # the reason is written out in the RLS migration.
+          control "$NOTIFICATION_DATABASE_URL" notification
+          check "$NOTIFICATION_DATABASE_URL" notification "'_prisma_migrations'"
+
       # Database-per-service must hold at the CONNECTION boundary, not merely at
-      # the table grants. If this ever starts succeeding, the isolation has been
-      # quietly weakened.
+      # the table grants: a credential that can open a session can still
+      # enumerate another service's schema from pg_catalog.
+      #
+      # DERIVED, NOT LISTED. This step used to spell out every direction by
+      # hand, and its positive control had stopped at three services while a
+      # fourth database existed. The verifier reads the databases, their CONNECT
+      # grants and every login role from db/init, connects each database's own
+      # roles first through the same code path, then requires every other role
+      # to be refused with 42501 -- not merely to fail, which a wrong port does.
       - name: Assert services cannot connect to each other's databases
         run: |
-          refuse() {
-            local role="$1" db="$2"
-            if psql "postgresql://$role:$role@localhost:5432/$db" -tAc 'SELECT 1' >/dev/null 2>&1; then
-              echo "ISOLATION FAILED: $role opened a session against $db"
-              exit 1
-            fi
-            echo "  refused   $role -> $db"
-          }
+          node scripts/verify-database-isolation.mjs
 
-          # The positive control, built from the SAME URL template as refuse().
+          # A second control, on the ENV VAR rather than the verifier's own
+          # connections.
           #
-          # refuse() passes whenever psql fails for ANY reason. A typo in that
-          # template -- wrong port, wrong host, a stray character -- would make
-          # all six refusals pass while testing nothing, and the run would print
-          # six reassuring "refused" lines.
-          #
-          # The previous control used $TICKETING_APP_DATABASE_URL, which proved
-          # psql worked and that env var was right, but shared no code with the
-          # string refuse() actually builds. This one exercises the template.
-          permit() {
-            local role="$1" db="$2"
-            psql "postgresql://$role:$role@localhost:5432/$db" -tAc 'SELECT 1' >/dev/null 2>&1 || {
-              echo "CONTROL FAILED: $role could not reach its OWN database $db."
-              echo "The URL template is wrong, so every refusal below proves nothing."
-              exit 1
-            }
-            echo "  connected $role -> $db"
-          }
-
-          # Run the control FIRST. If the template is broken, fail here rather
-          # than after printing six false negatives.
-          permit eventhub_auth_app      eventhub_auth
-          permit eventhub_event_app     eventhub_event
-          permit eventhub_ticketing_app eventhub_ticketing
-
-          # Every cross-service direction. Database-per-service must hold at the
-          # CONNECTION boundary, not merely at the table grants — otherwise a
-          # leaked credential can still enumerate another service's schema from
-          # pg_catalog even when the table reads are denied.
-          refuse eventhub_event_app     eventhub_auth
-          refuse eventhub_event_app     eventhub_ticketing
-          refuse eventhub_event_app     eventhub_live
-          refuse eventhub_ticketing_app eventhub_auth
-          refuse eventhub_ticketing_app eventhub_event
-          refuse eventhub_ticketing_app eventhub_live
-          refuse eventhub_auth_app      eventhub_event
-          refuse eventhub_auth_app      eventhub_ticketing
-          refuse eventhub_auth_app      eventhub_live
-          refuse eventhub_live_app      eventhub_auth
-          refuse eventhub_live_app      eventhub_event
-          refuse eventhub_live_app      eventhub_ticketing
-
-          # A second control, on the ENV VAR rather than the template above.
-          #
-          # permit() proves the string refuse() builds is right. This proves the
-          # environment variable every other step uses is right too -- they are
-          # different failures, and only this one would catch a bad
+          # The verifier proves the connections it builds are right. This proves
+          # the environment variable every other step uses is right too -- they
+          # are different failures, and only this one would catch a bad
           # TICKETING_APP_DATABASE_URL.
           psql "$TICKETING_APP_DATABASE_URL" -tAc 'SELECT 1' >/dev/null \
             || { echo "TICKETING_APP_DATABASE_URL does not reach its own database"; exit 1; }
           echo "  connected via TICKETING_APP_DATABASE_URL"
+
+      # The sent-log's claim and its row-level security, checked against the
+      # table. The coverage step above proves the flags are set; this proves the
+      # policy does what the flags promise, and that concurrent claims of one key
+      # produce one row.
+      - name: Assert the notification sent-log claims once per tenant, under RLS
+        run: node scripts/verify-notification-sentlog.mjs
 
   # ===========================================================================
   # The README's headline claim, asserted.

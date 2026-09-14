@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum DeliveryStatus {
+  /// Claimed: the row exists, so no other consumer will send this, and nothing
+  /// has been handed to a provider yet. A row stuck here means a consumer died
+  /// between the claim and the send, which a sweeper re-drives.
+  PENDING
+  SENT
+  /// A terminal failure, with the reason in lastError.
+  FAILED
+  /// Not sent on purpose: the address is on the suppression list.
+  SUPPRESSED
+}
+
+/// The sent-log: one row per notification per channel per recipient, claimed
+/// BEFORE anything is sent.
+///
+/// THE UNIQUE (tenantId, idempotencyKey) IS THE WHOLE DEDUPLICATION MECHANISM.
+/// Kafka delivers at least once, and an email cannot be un-sent, so the claim has
+/// to be one atomic statement: insert this row, or learn from the conflict that
+/// another delivery already claimed it. A read-then-insert lets two concurrent
+/// consumers both pass the read and both send.
+///
+/// The key is derived from the source message id, the channel and the recipient.
+/// The source message id is the outbox row's id, which a relay retry reuses — the
+/// same identity Analytics dedupes on — never a Kafka offset, which a republish
+/// changes.
+///
+/// THE TENANT IS IN THE CONSTRAINT, not only in the key. The same key from two
+/// tenants is two rows, so no tenant's delivery can suppress another's, whatever a
+/// future caller builds its key from. It is also what lets this table carry RLS:
+/// a unique index is not filtered by policy, so a key-only constraint would let one
+/// tenant's claim collide with a row it cannot see.
+///
+/// Rows outlive Kafka's retention rather than being deleted once sent, because
+/// this table is also the answer to "did we send this?".
+model NotificationDelivery {
+  id                String         @id @default(cuid())
+  tenantId          String
+  recipientId       String
+  channel           String
+  category          String
+  templateKey       String
+  idempotencyKey    String
+  sourceMessageId   String
+  status            DeliveryStatus @default(PENDING)
+  attempts          Int            @default(0)
+  providerMessageId String?
+  lastError         String?
+  createdAt         DateTime       @default(now())
+  sentAt            DateTime?
+  failedAt          DateTime?
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, recipientId])
+  /// What a sweeper for rows stuck in PENDING reads.
+  @@index([status, createdAt])
+  /// What retention cleanup reads.
+  @@index([createdAt])
+}

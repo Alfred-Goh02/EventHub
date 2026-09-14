@@ -296,6 +296,43 @@ importers:
         specifier: ^4.19.2
         version: 4.23.1
 
+  services/notification:
+    dependencies:
+      '@eventhub/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@eventhub/logger':
+        specifier: workspace:*
+        version: link:../../packages/logger
+      '@prisma/adapter-pg':
+        specifier: ^7.9.0
+        version: 7.9.0
+      '@prisma/client':
+        specifier: ^7.9.0
+        version: 7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.7.3))(typescript@5.7.3)
+      express:
+        specifier: ^4.21.2
+        version: 4.22.2
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
+    devDependencies:
+      '@eventhub/tsconfig':
+        specifier: workspace:*
+        version: link:../../packages/tsconfig
+      '@types/express':
+        specifier: ^4.17.21
+        version: 4.17.25
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
+      prisma:
+        specifier: ^7.9.0
+        version: 7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.7.3)
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.1
+
   services/relay:
     dependencies:
       '@eventhub/logger':

@@ -29,6 +29,9 @@ CREATE ROLE eventhub_ticketing_app   LOGIN          PASSWORD 'eventhub_ticketing
 CREATE ROLE eventhub_live_owner LOGIN CREATEDB PASSWORD 'eventhub_live_owner';
 CREATE ROLE eventhub_live_app   LOGIN          PASSWORD 'eventhub_live_app';
 
+CREATE ROLE eventhub_notification_owner LOGIN CREATEDB PASSWORD 'eventhub_notification_owner';
+CREATE ROLE eventhub_notification_app   LOGIN          PASSWORD 'eventhub_notification_app';
+
 -- Drains Ticketing's own outbox. Same shape and same reasoning as the Event
 -- relay: it reads by delivery state across every tenant, so it is a separate
 -- role with its own policy rather than a reason to reach for the superuser.
@@ -79,6 +82,7 @@ CREATE DATABASE eventhub_auth  OWNER eventhub_auth_owner;
 CREATE DATABASE eventhub_event OWNER eventhub_event_owner;
 CREATE DATABASE eventhub_ticketing OWNER eventhub_ticketing_owner;
 CREATE DATABASE eventhub_live OWNER eventhub_live_owner;
+CREATE DATABASE eventhub_notification OWNER eventhub_notification_owner;
 
 -- ---------------------------------------------------------------------------
 -- Connection isolation. By default PUBLIC may CONNECT to any database, so the
@@ -98,6 +102,9 @@ GRANT  CONNECT ON DATABASE eventhub_ticketing TO eventhub_ticketing_owner, event
 
 REVOKE CONNECT ON DATABASE eventhub_live FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_live TO eventhub_live_owner, eventhub_live_app;
+
+REVOKE CONNECT ON DATABASE eventhub_notification FROM PUBLIC;
+GRANT  CONNECT ON DATABASE eventhub_notification TO eventhub_notification_owner, eventhub_notification_app;
 
 -- ---------------------------------------------------------------------------
 -- Schema-level access, granted inside each database.
@@ -121,3 +128,6 @@ GRANT USAGE ON SCHEMA public TO eventhub_ticketing_app, eventhub_ticketing_relay
 
 \connect eventhub_live
 GRANT USAGE ON SCHEMA public TO eventhub_live_app;
+
+\connect eventhub_notification
+GRANT USAGE ON SCHEMA public TO eventhub_notification_app;
