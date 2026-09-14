@@ -1,35 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { serviceEnv } from './service-env.mjs';
 
 /**
- * The environment to spawn the Search service with: its own .env.example, the
- * generated public key, and whatever the caller overrides.
- *
- * THREE TIMES a verifier that spawns Search broke because the service gained a
- * required variable and the verifier's hand-written environment did not —
- * SCHEMA_REGISTRY_URL in part 2, JWT_ISSUER, JWT_AUDIENCE and EVENT_SERVICE_URL in
- * part 3, SEARCH_CURSOR_SECRET in part 4. Each was a list maintained by hand, and
- * each fell behind the service the moment it changed.
- *
- * Starting from .env.example means a new variable reaches every verifier as soon
- * as it is documented, and scripts/verify-env-documented.mjs already refuses a
- * variable the code reads that .env.example does not mention. So the chain is
- * closed: read it, and it must be documented; document it, and every verifier
- * that starts Search has it.
- *
- * Parsed the way scripts/verify-env-example.mjs parses it: KEY=value, blank lines
- * and # comments, no quoting, because none of these files use any.
+ * The environment to spawn the Search service with: its own .env.example (see
+ * service-env.mjs for why that is the starting point), the generated public key,
+ * and whatever the caller overrides.
  */
 export function searchServiceEnv(root, overrides = {}) {
-  const env = { PATH: process.env['PATH'], SystemRoot: process.env['SystemRoot'] };
-
-  for (const raw of readFileSync(join(root, 'services', 'search', '.env.example'), 'utf8').split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq === -1) continue;
-    env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-  }
+  const env = serviceEnv(root, 'search');
 
   // Generated, not configured: the example leaves it empty for exactly this.
   if (env['AUTH_PUBLIC_KEY_B64'] === '') {

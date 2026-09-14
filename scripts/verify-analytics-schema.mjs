@@ -43,17 +43,24 @@
  * Run (after pnpm build, with ClickHouse up): node scripts/verify-analytics-schema.mjs
  */
 
-import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  ADMIN,
+  APP,
+  CH_URL,
+  MIGRATOR,
+  ch,
+  createScratchDatabase,
+  denied,
+  dropScratchDatabase,
+  json,
+  migrate,
+  toChTime,
+} from './lib/clickhouse.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const CH_URL = process.env['CLICKHOUSE_URL'] ?? 'http://127.0.0.1:8123';
-
-const ADMIN = { user: process.env['CLICKHOUSE_ADMIN_USER'] ?? 'eventhub', password: process.env['CLICKHOUSE_ADMIN_PASSWORD'] ?? 'eventhub' };
-const APP = { user: 'analytics_app', password: 'analytics_app' };
-const MIGRATOR = { user: 'analytics_migrator', password: 'analytics_migrator' };
 
 let failures = 0;
 function check(ok, msg) {
@@ -68,53 +75,11 @@ const run = randomUUID().replace(/-/g, '').slice(0, 8);
 const DB = `analytics_verify_${run}`;
 const VICTIM = `analytics.verify_victim_${run}`;
 
-/** One statement over HTTP, as one user. Settings go on the URL, which is how ClickHouse takes them per query. */
-async function ch(as, sql, { database, settings = {}, rows } = {}) {
-  const url = new URL(CH_URL);
-  if (database) url.searchParams.set('database', database);
-  for (const [k, v] of Object.entries(settings)) url.searchParams.set(k, String(v));
-  const body = rows ? `${sql} FORMAT JSONEachRow\n${rows.map((r) => JSON.stringify(r)).join('\n')}` : sql;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'X-ClickHouse-User': as.user, 'X-ClickHouse-Key': as.password },
-    body,
-  });
-  return { ok: res.ok, text: await res.text() };
-}
-
-async function json(as, sql, database) {
-  const r = await ch(as, `${sql} FORMAT JSON`, { database });
-  if (!r.ok) throw new Error(`query failed: ${sql}\n${r.text}`);
-  return JSON.parse(r.text).data;
-}
-
-const denied = (r) => !r.ok && /ACCESS_DENIED|Code: 497/.test(r.text);
-
-function migrate(database) {
-  const out = spawnSync(process.execPath, ['dist/scripts/migrate.js'], {
-    cwd: join(ROOT, 'services', 'analytics'),
-    env: {
-      PATH: process.env['PATH'],
-      SystemRoot: process.env['SystemRoot'],
-      CLICKHOUSE_URL: CH_URL,
-      CLICKHOUSE_DATABASE: database,
-      CLICKHOUSE_MIGRATOR_USER: MIGRATOR.user,
-      CLICKHOUSE_MIGRATOR_PASSWORD: MIGRATOR.password,
-    },
-    encoding: 'utf8',
-  });
-  const text = `${out.stdout}${out.stderr}`;
-  const applied = text.match(/"applied":(\d+)/);
-  return { code: out.status, applied: applied ? Number(applied[1]) : null, text };
-}
-
-const nowCh = () => new Date().toISOString().replace('T', ' ').replace('Z', '');
-
 function row(tenant, activity, over = {}) {
   return {
     tenant_id: tenant,
     activity,
-    occurred_at: nowCh(),
+    occurred_at: toChTime(),
     message_id: randomUUID(),
     line: 0,
     event_id: 'evt_1',
@@ -164,17 +129,10 @@ async function main() {
     console.log('');
     console.log('  migrations apply once, re-run as a no-op, into a database given as a parameter');
     // -----------------------------------------------------------------------
-    for (const sql of [
-      `CREATE DATABASE ${DB}`,
-      `GRANT ALL ON ${DB}.* TO ${MIGRATOR.user}`,
-      `GRANT SELECT, INSERT ON ${DB}.* TO ${APP.user}`,
-    ]) {
-      const r = await ch(ADMIN, sql);
-      if (!r.ok) throw new Error(`setup failed: ${sql}\n${r.text}`);
-    }
-    const first = migrate(DB);
+    await createScratchDatabase(DB);
+    const first = migrate(ROOT, DB);
     check(first.code === 0 && first.applied === 2, `first run into ${DB}: exit ${first.code}, applied ${first.applied}`);
-    const second = migrate(DB);
+    const second = migrate(ROOT, DB);
     check(second.code === 0 && second.applied === 0, `second run: exit ${second.code}, applied ${second.applied}`);
 
     // -----------------------------------------------------------------------
@@ -331,19 +289,16 @@ async function main() {
       { database: DB },
     );
     check(tamper.ok, 'CONTROL: the recorded checksum for 002 was changed');
-    const third = migrate(DB);
+    const third = migrate(ROOT, DB);
     check(
       third.code !== 0 && /was changed after it was applied/.test(third.text),
       `the runner refuses: exit ${third.code}${/was changed after it was applied/.test(third.text) ? ', "002_rollups.sql was changed after it was applied"' : ''}`,
     );
   } finally {
-    await ch(ADMIN, `DROP DATABASE IF EXISTS ${DB} SYNC`);
-    await ch(ADMIN, `REVOKE ALL ON ${DB}.* FROM ${MIGRATOR.user}`);
-    await ch(ADMIN, `REVOKE ALL ON ${DB}.* FROM ${APP.user}`);
+    const gone = await dropScratchDatabase(DB);
     await ch(ADMIN, `DROP TABLE IF EXISTS ${VICTIM} SYNC`);
     await ch(ADMIN, `DROP TABLE IF EXISTS analytics.verify_nope_${run} SYNC`);
-    const left = await ch(ADMIN, `SELECT count() FROM system.databases WHERE name = '${DB}'`);
-    console.log(`\n    cleanup: scratch database ${left.text.trim() === '0' ? 'dropped' : 'STILL PRESENT'}, victim table dropped`);
+    console.log(`\n    cleanup: scratch database ${gone ? 'dropped' : 'STILL PRESENT'}, victim table dropped`);
   }
 
   console.log('');

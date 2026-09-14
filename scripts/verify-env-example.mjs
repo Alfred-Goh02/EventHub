@@ -50,6 +50,10 @@ const SERVICES = [
   // /ready for the same reason as Search: it answers 200 only once ClickHouse has
   // been reached as the example's analytics_app user, not merely once listening.
   { name: 'analytics', portVar: 'PORT', port: 3907, path: '/ready' },
+  // The same package's second process, from its own entrypoint and its own port
+  // variable. /ready answers once it has connected to Kafka, subscribed, and
+  // reached ClickHouse, all from the example's addresses and credentials.
+  { name: 'analytics', label: 'analytics ingest', entry: 'dist/consumer.js', portVar: 'INGEST_PORT', port: 3908, path: '/ready' },
 ];
 
 const KEY_PATH = join('services', 'auth', 'keys', 'public.pem');
@@ -120,7 +124,7 @@ async function bootFromExample(svc, publicKeyB64) {
   const suppliedKey = 'AUTH_PUBLIC_KEY_B64' in parsed && parsed['AUTH_PUBLIC_KEY_B64'] === '';
   if (suppliedKey) env['AUTH_PUBLIC_KEY_B64'] = publicKeyB64;
 
-  const child = spawn(process.execPath, ['dist/index.js'], {
+  const child = spawn(process.execPath, [svc.entry ?? 'dist/index.js'], {
     cwd: dir,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -149,9 +153,9 @@ async function bootFromExample(svc, publicKeyB64) {
   check(
     up,
     up
-      ? `${svc.name} booted from .env.example alone` +
+      ? `${svc.label ?? svc.name} booted from .env.example alone` +
         (suppliedKey ? ' (AUTH_PUBLIC_KEY_B64 supplied from the generated keypair)' : '')
-      : `${svc.name} did NOT come up on port ${svc.port}` +
+      : `${svc.label ?? svc.name} did NOT come up on port ${svc.port}` +
         (exited !== null ? ` — it exited with code ${exited}` : ' — still running but not answering') +
         `\n          ${detail.join('\n          ')}`,
   );

@@ -642,6 +642,42 @@ services:
       retries: 6
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # Analytics ingest: the same image and package as the API, from its other
+  # entrypoint. A separate container because the two scale on different things
+  # -- partitions for this one, dashboard traffic for the API -- and a large
+  # flush must not stall an HTTP response on a shared event loop.
+  #
+  # analytics_app, like the API: INSERT is all it needs. The group starts at
+  # 'earliest', so a fresh ClickHouse volume fills from whatever the topics
+  # still retain.
+  # ---------------------------------------------------------------------------
+  analytics-ingest:
+    <<: *app
+    container_name: eventhub-analytics-ingest
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3016:3016"
+    environment:
+      <<: *app-env
+      INGEST_PORT: 3016
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: analytics
+      CLICKHOUSE_USER: analytics_app
+      CLICKHOUSE_PASSWORD: analytics_app
+      KAFKA_CONSUMER_GROUP: analytics-ingest
+      INGEST_START_FROM: earliest
+    working_dir: /app/services/analytics
+    command: ["node", "dist/consumer.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3016/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
 volumes:
   postgres-data:
   kafka-data:
