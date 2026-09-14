@@ -21,6 +21,22 @@
  * this run cannot keep to itself is Kafka: what it produces, a running compose
  * ingest copies into the real analytics database, and the run removes those copies.
  *
+ * WATCHED FAIL: one run with four guards broken, four red, and each red names
+ * exactly one break.
+ *
+ *   the worst partition reported as the total   52 reported where system.parts
+ *                                               says 51
+ *   the delay and refuse thresholds swapped     delayed at 3000, refused at 1000
+ *   the rebuild's TRUNCATE skipped              1017 tickets where the raw table
+ *                                               has 9: the corruption kept, plus a
+ *                                               second copy of everything
+ *   lag ignoring the committed offset           it never drained, stuck at 76
+ *
+ * The first of those needed the fixture changed before it could fail. With every
+ * row in one month, a table's worst partition and its total are the same number,
+ * so a metric reporting the total could not have been told apart. The second
+ * partition was added for that, with a control that the two numbers differ.
+ *
  * Run (after pnpm build and topics, with ClickHouse and Kafka up):
  *   node scripts/verify-analytics-drills.mjs
  */
