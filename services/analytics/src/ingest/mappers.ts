@@ -61,15 +61,60 @@ export function toClickHouseTime(iso: string): string {
   return d.toISOString().replace('T', ' ').replace('Z', '');
 }
 
+/**
+ * Every string that reaches a row must be well-formed Unicode.
+ *
+ * A lone UTF-16 surrogate is a valid JavaScript string and nothing more: any Live
+ * client can put one in an eventId, and JSON.stringify carries it to Kafka as the
+ * escape \ud800. Measured on ClickHouse 25.8, one in a String column refused the
+ * whole insert (CANNOT_PARSE_ESCAPE_SEQUENCE), which stalled the partition until
+ * writer.ts learned to find the refused message, and one in a Map value was stored
+ * without complaint as U+FFFD. Refused here, it is one dead letter naming the field.
+ */
+const id = z
+  .string()
+  .min(1)
+  .refine((s) => s.isWellFormed(), 'not well-formed Unicode (a lone surrogate)');
+
+/**
+ * Column bounds, enforced here because ClickHouse does not enforce them. Measured
+ * on 25.8, each of these was stored without an error: 70000 in a UInt16 as 4464,
+ * 5e9 in a UInt32 as 705032704, 2^64 in a UInt64 as 384.
+ */
+const UINT16_MAX = 65_535;
+const UINT32_MAX = 4_294_967_295;
+const quantity = z.number().int().positive().max(UINT32_MAX);
+const cents = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+/** A line's position becomes its row's `line`, a UInt16. */
+const MAX_LINES = UINT16_MAX + 1;
+
+/**
+ * An instant exactly as Date.prototype.toISOString writes one, which is how every
+ * producer here stamps it: the relay from the outbox row's createdAt, Live from
+ * new Date().
+ *
+ * Measured on 25.8, DateTime64 coerces rather than refuses: 'not a time' was
+ * stored as 1900-01-01, '2026-02-30' as 2 March, year 2500 as 2299-12-31. So the
+ * value must survive a round trip through Date unchanged — which refuses a day
+ * that does not exist, since Date rolls it into the next month — and sit well
+ * inside the column's range.
+ */
+const EARLIEST = Date.parse('1970-01-01T00:00:00.000Z');
+const LATEST = Date.parse('2200-01-01T00:00:00.000Z');
+const instant = z.string().refine((s) => {
+  const t = Date.parse(s);
+  return !Number.isNaN(t) && t >= EARLIEST && t < LATEST && new Date(t).toISOString() === s;
+}, 'not a UTC instant as toISOString writes one, between 1970 and 2200');
+
 const reservation = z.object({
-  messageId: z.string().min(1),
-  occurredAt: z.string(),
-  reservationId: z.string().min(1),
+  messageId: id,
+  occurredAt: instant,
+  reservationId: id,
   tenantId,
-  eventId: z.string().min(1),
-  userId: z.string().min(1),
+  eventId: id,
+  userId: id,
   state: z.enum(['RESERVED', 'RELEASED', 'EXPIRED', 'CANCELLED', 'CONFIRMED']),
-  items: z.array(z.object({ ticketTypeId: z.string().min(1), quantity: z.number().int().positive() })).min(1),
+  items: z.array(z.object({ ticketTypeId: id, quantity })).min(1).max(MAX_LINES),
 });
 
 const RESERVATION_ACTIVITY = {
@@ -81,33 +126,38 @@ const RESERVATION_ACTIVITY = {
 } as const;
 
 const purchase = z.object({
-  messageId: z.string().min(1),
-  occurredAt: z.string(),
-  paymentId: z.string().min(1),
-  reservationId: z.string().min(1),
+  messageId: id,
+  occurredAt: instant,
+  paymentId: id,
+  reservationId: id,
   tenantId,
-  eventId: z.string().min(1),
-  userId: z.string().min(1),
-  amountCents: z.number().int().nonnegative(),
+  eventId: id,
+  userId: id,
+  amountCents: cents,
   currency: z.string().regex(/^[A-Z]{3}$/, 'not an ISO-4217 code'),
   items: z
     .array(
-      z.object({
-        ticketTypeId: z.string().min(1),
-        quantity: z.number().int().positive(),
-        unitPriceCents: z.number().int().nonnegative(),
-      }),
+      z
+        .object({ ticketTypeId: id, quantity, unitPriceCents: cents })
+        // The row's amount is quantity × price, and two in-range factors can still
+        // multiply past 2^53, where a JavaScript number stops being exact — and
+        // past 2^64, which ClickHouse wraps rather than refuses.
+        .refine((l) => Number.isSafeInteger(l.quantity * l.unitPriceCents), {
+          message: 'quantity × unitPriceCents is past 2^53 − 1 cents',
+          path: ['unitPriceCents'],
+        }),
     )
-    .min(1),
+    .min(1)
+    .max(MAX_LINES),
 });
 
 const interaction = z.object({
   kind: z.enum(['question.created', 'question.upvoted']),
   tenantId,
-  eventId: z.string().min(1),
-  userId: z.string().min(1),
-  questionId: z.string().min(1),
-  occurredAt: z.string(),
+  eventId: id,
+  userId: id,
+  questionId: id,
+  occurredAt: instant,
 });
 
 const base = (at: KafkaCoordinates) => ({

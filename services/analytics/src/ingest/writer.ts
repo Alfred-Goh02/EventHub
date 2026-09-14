@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ClickHouseClient } from '@clickhouse/client';
+import { ClickHouseError, type ClickHouseClient } from '@clickhouse/client';
 import type { ActivityRow } from './mappers.js';
 
 export interface WriteOutcome {
@@ -125,4 +125,82 @@ export async function insertRows(ch: ClickHouseClient, rows: ActivityRow[]): Pro
       deduplicate_blocks_in_dependent_materialized_views: 1,
     },
   });
+}
+
+/** One Kafka message's rows, with what the dead-letter table needs if ClickHouse refuses them. */
+export interface MessageRows {
+  offset: string;
+  payload: Buffer | null;
+  rows: ActivityRow[];
+}
+
+export interface Refused {
+  offset: string;
+  payload: Buffer | null;
+  error: string;
+}
+
+export interface BatchOutcome extends WriteOutcome {
+  /** Messages whose rows ClickHouse refused. Everything else in the batch was written. */
+  refused: Refused[];
+}
+
+/**
+ * Whether ClickHouse refused the ROWS, as opposed to being unable to take them.
+ *
+ * Only the CANNOT_PARSE_ family, because that is what bad rows were measured to
+ * produce on 25.8: a lone surrogate (CANNOT_PARSE_ESCAPE_SEQUENCE), a negative
+ * number in an unsigned column (CANNOT_PARSE_NUMBER), a fraction in an integer
+ * column (CANNOT_PARSE_INPUT_ASSERTION_FAILED). A missing table, refused access,
+ * too many parts, a timeout — none of those is the message's fault, and treating
+ * one as a refusal would dead-letter every message in the batch.
+ *
+ * NOT A SUBSTITUTE FOR THE MAPPER. The same measurement found ClickHouse storing
+ * many bad values without complaint — 70000 in a UInt16 as 4464, 2^64 cents as
+ * 384, an impossible date as a real one. Nothing downstream can see those; only
+ * refusing them in mappers.ts keeps them out.
+ */
+export function refusedByClickHouse(err: unknown): err is ClickHouseError {
+  return err instanceof ClickHouseError && /^CANNOT_PARSE_/.test(err.type ?? '');
+}
+
+/**
+ * Writes a batch; if ClickHouse refuses it, finds which messages it refused.
+ *
+ * An insert is all or nothing, so one bad row refuses every row beside it. The
+ * first version rethrew that refusal like an outage: nothing was committed, the
+ * same batch came back, and was refused again — a partition stalled for good by
+ * one message, with every good message behind it (found by review, then measured
+ * in scripts/verify-analytics-ingest.mjs).
+ *
+ * On a refusal, each message is written on its own. That costs a data part per
+ * message, which is what batching exists to avoid, but only for a batch that has
+ * already failed. Deduplication still holds, because each write is writeActivity.
+ * A failure that is not a refusal, at either step, is rethrown: that is an outage,
+ * and redelivery is the right answer to it.
+ */
+export async function writeMessages(ch: ClickHouseClient, messages: MessageRows[]): Promise<BatchOutcome> {
+  try {
+    const written = await writeActivity(ch, messages.flatMap((m) => m.rows));
+    return { ...written, refused: [] };
+  } catch (err) {
+    if (!refusedByClickHouse(err)) throw err;
+  }
+
+  const outcome: BatchOutcome = { inserted: 0, duplicates: 0, refused: [] };
+  for (const message of messages) {
+    try {
+      const written = await writeActivity(ch, message.rows);
+      outcome.inserted += written.inserted;
+      outcome.duplicates += written.duplicates;
+    } catch (err) {
+      if (!refusedByClickHouse(err)) throw err;
+      outcome.refused.push({
+        offset: message.offset,
+        payload: message.payload,
+        error: `refused by ClickHouse (${err.type}): ${err.message}`.slice(0, 2_000),
+      });
+    }
+  }
+  return outcome;
 }

@@ -137,7 +137,7 @@ async function main() {
   if (failures > 0) return;
 
   const { createClickHouse } = await mod('clickhouse.js');
-  const { writeActivity, insertRows, EXISTING_ROWS_QUERY } = await mod('ingest/writer.js');
+  const { writeActivity, insertRows, writeMessages, refusedByClickHouse, EXISTING_ROWS_QUERY } = await mod('ingest/writer.js');
   const { toRows, INGEST_TOPICS } = await mod('ingest/mappers.js');
   const TOPICS = Object.keys(INGEST_TOPICS);
 
@@ -315,6 +315,89 @@ async function main() {
 
     // -----------------------------------------------------------------------
     console.log('');
+    console.log('  what ClickHouse would refuse, or silently store as something else, is refused first');
+    // -----------------------------------------------------------------------
+    // Each case was measured against ClickHouse 25.8 before a rule was written:
+    // the surrogate refused a whole insert, and the rest were STORED, changed —
+    // 2 March for 30 February, a local time read as UTC, a wrapped integer.
+    const TM = `t_ing_m_${run}`;
+    const mapError = (payload) => {
+      try {
+        toRows({ topic: 'tickets.purchased', partition: 0, offset: '0' }, payload);
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message.replace(/\s+/g, ' ') : String(err);
+      }
+    };
+    check(mapError(purchase(TM, EV, 0)) === null, 'CONTROL: the unaltered purchase maps');
+    for (const [label, over, pattern] of [
+      ['a lone surrogate in a ticket type id', { items: [{ ticketTypeId: 'tt_\ud800', quantity: 1, unitPriceCents: 100 }] }, /well-formed/],
+      ['a day that does not exist', { occurredAt: '2026-02-30T00:00:00.000Z' }, /UTC instant/],
+      ['a time with no zone, which Date reads as local', { occurredAt: '2026-09-14 01:00:00' }, /UTC instant/],
+      ['a line amount past 2^53 from in-range factors', { items: [{ ticketTypeId: 'tt_ga', quantity: 4, unitPriceCents: 2 ** 52 }] }, /2\^53/],
+      [
+        '65537 lines, one past what a UInt16 line index holds',
+        { items: Array.from({ length: 65_537 }, () => ({ ticketTypeId: 'tt_ga', quantity: 1, unitPriceCents: 1 })) },
+        /65536/,
+      ],
+    ]) {
+      const message = mapError(purchase(TM, EV, 0, over));
+      check(message !== null && pattern.test(message), `${label} is refused${message ? `: ${message.slice(0, 110)}` : ' — it mapped'}`);
+    }
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  a message ClickHouse refuses is found and kept aside, and the rest of its batch is written');
+    // -----------------------------------------------------------------------
+    // Bypasses the mapper on purpose: this is the net under it, for whatever a
+    // future mapper lets through. A negative quantity is one ClickHouse refuses.
+    const TN = `t_ing_n_${run}`;
+    const messageOf = (n, change = (r) => r) => ({
+      offset: String(n),
+      payload: Buffer.from(`message ${n} ${run}`),
+      rows: rowsFor(TN, n, n).map(change),
+    });
+    const netBatch = [messageOf(0), messageOf(1, (r) => ({ ...r, quantity: -1 })), messageOf(2)];
+
+    let whole = null;
+    try {
+      await writeActivity(app, netBatch.flatMap((m) => m.rows));
+    } catch (err) {
+      whole = err;
+    }
+    check(
+      refusedByClickHouse(whole),
+      `CONTROL: as one insert, ClickHouse refuses the whole batch${whole ? ` (${whole.type ?? whole.message})` : ' — it did not'}`,
+    );
+    check((await totals(TN)).raw === 0, 'CONTROL: and stores none of it, the two good messages included');
+
+    const net = await writeMessages(app, netBatch);
+    check(
+      net.inserted === 4 && net.refused.length === 1 && net.refused[0].offset === '1' && /CANNOT_PARSE_NUMBER/.test(net.refused[0].error),
+      `the refused message is found: inserted ${net.inserted}, refused ${JSON.stringify(net.refused.map((r) => [r.offset, r.error.slice(0, 50)]))}`,
+    );
+    const tn = await totals(TN);
+    check(same(tn, { raw: 4, tickets: 6, gross: 14000 }), `and the good messages around it are stored whole: ${fmt(tn)}`);
+    check(
+      Boolean(net.refused[0]?.payload?.equals(Buffer.from(`message 1 ${run}`))),
+      'and the refused message keeps its bytes for the dead-letter table',
+    );
+
+    const elsewhere = createClickHouse({ url: CH_URL, database: `analytics_missing_${run}`, username: APP.user, password: APP.password });
+    let outage = null;
+    try {
+      await writeMessages(elsewhere, [messageOf(3)]);
+    } catch (err) {
+      outage = err;
+    }
+    await elsewhere.close();
+    check(
+      outage !== null && !refusedByClickHouse(outage),
+      `a failure that is not the rows' fault is thrown for redelivery, never kept aside: ${outage ? (outage.type ?? outage.message).slice(0, 80) : 'nothing was thrown'}`,
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
     console.log('  the consumer, end to end, under a fresh group');
     // -----------------------------------------------------------------------
     await producer.connect();
@@ -465,6 +548,16 @@ async function main() {
     const atGarbage = await send('tickets.purchased', EV2, garbage);
     const atBadTenant = await sendAvro('tickets.reserved', { ...reserved, messageId: `rsv_bad_${run}`, tenantId: 'Not A Tenant' });
     const atBadJson = await send('live.interactions', EV2, `{"kind":"question.created","tenantId":"${TE}"`);
+    // A message the mapper once ACCEPTED and ClickHouse refuses: a lone UTF-16
+    // surrogate, which any Live client can put in an eventId, and which
+    // JSON.stringify carries to Kafka as the escape \ud800. ClickHouse 25.8 rejects
+    // the whole insert over it (CANNOT_PARSE_ESCAPE_SEQUENCE), so it stalled its
+    // partition for good, and every good message behind it with it.
+    const atSurrogate = await send(
+      'live.interactions',
+      EV2,
+      JSON.stringify({ ...asked, kind: 'question.upvoted', userId: 'u_surrogate', eventId: '\ud800' }),
+    );
 
     const behind = {
       'tickets.purchased': await sendAvro('tickets.purchased', purchase(TE, EV2, 1, { messageId: `behind_pur_${run}`, userId: 'u_second' })),
@@ -479,8 +572,8 @@ async function main() {
       Boolean(through),
       `the good messages behind the poison on all three topics became rows (${await rawCount(behindRows)} of 5) — no partition is stuck`,
     );
-    const parked = await waitFor(async () => (await metrics())?.deadLetteredTotal === parkedBefore + 3, 30_000);
-    check(Boolean(parked), `deadLetteredTotal rose by exactly 3 (${parkedBefore} -> ${(await metrics())?.deadLetteredTotal})`);
+    const parked = await waitFor(async () => (await metrics())?.deadLetteredTotal === parkedBefore + 4, 30_000);
+    check(Boolean(parked), `deadLetteredTotal rose by exactly 4 (${parkedBefore} -> ${(await metrics())?.deadLetteredTotal})`);
 
     const dlq = await json(ADMIN, 'SELECT source_topic, kafka_partition, kafka_offset, error, payload FROM ingest_dlq', DB);
     const kept = (topic, at) =>
@@ -498,6 +591,11 @@ async function main() {
     check((await rawCount("tenant_id = 'Not A Tenant'")) === 0, 'and nothing was stored under a tenant no query could name');
     const j = kept('live.interactions', atBadJson);
     check(Boolean(j) && /JSON/i.test(j.error), `truncated JSON on live.interactions kept${j ? `: ${j.error.slice(0, 70)}` : ''}`);
+    const s = kept('live.interactions', atSurrogate);
+    check(
+      Boolean(s) && /well-formed/i.test(s.error),
+      `a lone surrogate in an eventId is refused before ClickHouse sees it${s ? `: ${JSON.stringify(s.error.slice(0, 90))}` : ''}`,
+    );
 
     // -----------------------------------------------------------------------
     console.log('');

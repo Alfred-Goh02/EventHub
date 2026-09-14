@@ -3,8 +3,8 @@ import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import type { ClickHouseClient } from '@clickhouse/client';
 import { ZodError } from 'zod';
 import type { Logger } from '@eventhub/logger';
-import { INGEST_TOPICS, isIngestTopic, toRows, type ActivityRow } from './mappers.js';
-import { writeActivity } from './writer.js';
+import { INGEST_TOPICS, isIngestTopic, toRows } from './mappers.js';
+import { writeMessages, type MessageRows } from './writer.js';
 
 interface DlqRow {
   source_topic: string;
@@ -71,9 +71,10 @@ function describe(err: unknown): string {
  * to repeat. writer.ts is how, and why a token made from offsets was not enough.
  *
  * WHAT CAN NEVER BE A ROW goes to analytics.ingest_dlq with its raw bytes, topic,
- * partition and offset, and the partition moves on. A ClickHouse or registry
- * outage is not that: it throws, nothing is committed, lag grows, and the batch is
- * redelivered when the store is back.
+ * partition and offset, and the partition moves on. A message is found to be one
+ * in two places: the mapper refuses it, or ClickHouse refuses its rows (see
+ * writeMessages). A ClickHouse or registry outage is neither: it throws, nothing
+ * is committed, lag grows, and the batch is redelivered when the store is back.
  */
 export function createIngestor(opts: {
   brokers: string[];
@@ -103,8 +104,17 @@ export function createIngestor(opts: {
     const { batch, resolveOffset, heartbeat, isRunning, isStale, commitOffsetsIfNecessary } = payload;
     if (batch.messages.length === 0) return;
 
-    const rows: ActivityRow[] = [];
+    const mapped: MessageRows[] = [];
     const dead: DlqRow[] = [];
+    const park = (offset: string, payload: Buffer | null, error: string): void => {
+      dead.push({
+        source_topic: batch.topic,
+        kafka_partition: batch.partition,
+        kafka_offset: Number(offset),
+        error,
+        payload: payload?.toString('base64') ?? '',
+      });
+    };
 
     for (const message of batch.messages) {
       // A partition taken away mid-batch: stop without resolving anything, so
@@ -112,16 +122,10 @@ export function createIngestor(opts: {
       if (!isRunning() || isStale()) return;
       const at = { topic: batch.topic, partition: batch.partition, offset: message.offset };
       try {
-        rows.push(...toRows(at, await decode(batch.topic, message.value)));
+        mapped.push({ offset: message.offset, payload: message.value, rows: toRows(at, await decode(batch.topic, message.value)) });
       } catch (err) {
         if (isTransient(err)) throw err;
-        dead.push({
-          source_topic: batch.topic,
-          kafka_partition: batch.partition,
-          kafka_offset: Number(message.offset),
-          error: describe(err),
-          payload: message.value?.toString('base64') ?? '',
-        });
+        park(message.offset, message.value, describe(err));
       }
     }
 
@@ -131,7 +135,8 @@ export function createIngestor(opts: {
     const started = Date.now();
     let written;
     try {
-      written = await writeActivity(opts.ch, rows);
+      written = await writeMessages(opts.ch, mapped);
+      for (const r of written.refused) park(r.offset, r.payload, r.error);
       if (dead.length > 0) {
         // Not deduplicated: a redelivered poison message is parked twice, which
         // costs an operator one extra row to read and changes no rollup.
