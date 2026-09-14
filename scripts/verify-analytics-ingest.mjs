@@ -99,6 +99,13 @@
  *                    parked like poison              with the registry back, the
  *                                                    purchase never came back
  *
+ * Then a measurement no test had made: a backlog-sized batch. Against the writer
+ * as it was, 2 red. 12000 rows whose ids take 216 KiB failed their duplicate
+ * lookup with "Field value too long", because each query parameter is one HTTP
+ * form field and ClickHouse caps those at 128 KiB — not a refusal, so the batch
+ * would have been rethrown forever. And a 257-character message id mapped, which
+ * no lookup budget could have held.
+ *
  * Run (after pnpm build, topics and schemas, with ClickHouse up):
  *   node scripts/verify-analytics-ingest.mjs
  */
@@ -422,6 +429,37 @@ async function main() {
 
     // -----------------------------------------------------------------------
     console.log('');
+    console.log('  a batch too big for one lookup is looked up in parts');
+    // -----------------------------------------------------------------------
+    // Every lookup parameter travels as one HTTP form field, which ClickHouse caps at
+    // http_max_field_value_size. Found by measuring, not by any test: 10000 ids in
+    // one lookup failed with "Field value too long", which is not a refusal, so a
+    // consumer catching up on a backlog would have rethrown the same batch forever.
+    const [{ value: fieldLimit }] = await json(ADMIN, "SELECT value FROM system.settings WHERE name = 'http_max_field_value_size'", DB);
+    const TL = `t_ing_l_${run}`;
+    const large = rowsFor(TL, 0, 5_999);
+    const idBytes = [...new Set(large.map((r) => r.message_id))].reduce((n, id) => n + Buffer.byteLength(id) + 3, 0);
+    check(
+      idBytes > Number(fieldLimit),
+      `CONTROL: the batch's ids alone take ${Math.round(idBytes / 1024)} KiB, past the ${Math.round(Number(fieldLimit) / 1024)} KiB one parameter may hold`,
+    );
+    let largeFirst = null;
+    let largeReplay = null;
+    let largeError = null;
+    try {
+      largeFirst = await writeActivity(app, large);
+      largeReplay = await writeActivity(app, large);
+    } catch (err) {
+      largeError = err;
+    }
+    check(
+      largeFirst?.inserted === large.length && largeReplay?.duplicates === large.length,
+      `and it is written, then recognised on replay: inserted ${largeFirst?.inserted}, skipped ${largeReplay?.duplicates} of ${large.length}` +
+        (largeError ? ` — threw ${largeError.type ?? ''} ${String(largeError.message).slice(0, 80)}` : ''),
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
     console.log('  what ClickHouse would refuse, or silently store as something else, is refused first');
     // -----------------------------------------------------------------------
     // Each case was measured against ClickHouse 25.8 before a rule was written:
@@ -439,6 +477,7 @@ async function main() {
     check(mapError(purchase(TM, EV, 0)) === null, 'CONTROL: the unaltered purchase maps');
     for (const [label, over, pattern] of [
       ['a lone surrogate in a ticket type id', { items: [{ ticketTypeId: 'tt_\ud800', quantity: 1, unitPriceCents: 100 }] }, /well-formed/],
+      ['a message id longer than 256 characters, which no lookup budget could hold', { messageId: 'm'.repeat(257) }, /256/],
       ['a day that does not exist', { occurredAt: '2026-02-30T00:00:00.000Z' }, /UTC instant/],
       ['a time with no zone, which Date reads as local', { occurredAt: '2026-09-14 01:00:00' }, /UTC instant/],
       ['a line amount past 2^53 from in-range factors', { items: [{ ticketTypeId: 'tt_ga', quantity: 4, unitPriceCents: 2 ** 52 }] }, /2\^53/],

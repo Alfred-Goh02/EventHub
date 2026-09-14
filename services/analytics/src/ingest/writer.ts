@@ -33,6 +33,55 @@ export const EXISTING_ROWS_QUERY = `SELECT tenant_id, message_id, line FROM acti
    AND message_id IN {ids:Array(String)}`;
 
 /**
+ * How much of one lookup parameter a chunk may use.
+ *
+ * Each query parameter travels as one HTTP form field, and ClickHouse 25.8 refuses
+ * a field longer than http_max_field_value_size, 128 KiB by default. Measured, not
+ * found by any test: 10000 ids in one lookup failed with "Field value too long".
+ * That is not a refusal of the rows, so the batch was rethrown and would have been
+ * redelivered forever — a consumer catching up on a backlog would never get past
+ * its first large batch. Half the limit, with every character costed as if it
+ * needed escaping.
+ */
+const LOOKUP_PARAMETER_BYTES = 64 * 1024;
+const lookupCost = (value: string): number => 2 * Buffer.byteLength(value) + 4;
+
+/** Candidates split so that no lookup parameter — tenants, events or ids — outgrows LOOKUP_PARAMETER_BYTES. */
+function lookupChunks(candidates: ActivityRow[]): ActivityRow[][] {
+  const chunks: ActivityRow[][] = [];
+  let chunk: ActivityRow[] = [];
+  let seen = { tenants: new Set<string>(), events: new Set<string>(), ids: new Set<string>() };
+  let used = { tenants: 0, events: 0, ids: 0 };
+
+  for (const row of candidates) {
+    const costs = () => ({
+      tenants: seen.tenants.has(row.tenant_id) ? 0 : lookupCost(row.tenant_id),
+      events: seen.events.has(row.event_id) ? 0 : lookupCost(row.event_id),
+      ids: seen.ids.has(row.message_id) ? 0 : lookupCost(row.message_id),
+    });
+    let add = costs();
+    const tooBig =
+      used.tenants + add.tenants > LOOKUP_PARAMETER_BYTES ||
+      used.events + add.events > LOOKUP_PARAMETER_BYTES ||
+      used.ids + add.ids > LOOKUP_PARAMETER_BYTES;
+    if (tooBig && chunk.length > 0) {
+      chunks.push(chunk);
+      chunk = [];
+      seen = { tenants: new Set(), events: new Set(), ids: new Set() };
+      used = { tenants: 0, events: 0, ids: 0 };
+      add = costs();
+    }
+    chunk.push(row);
+    seen.tenants.add(row.tenant_id);
+    seen.events.add(row.event_id);
+    seen.ids.add(row.message_id);
+    used = { tenants: used.tenants + add.tenants, events: used.events + add.events, ids: used.ids + add.ids };
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+
+/**
  * Writes rows to activity_events so that writing the same message twice counts it once.
  *
  * WHY THIS IS NEEDED. Kafka delivers at least once, and the consumer commits only
@@ -78,21 +127,23 @@ export async function writeActivity(ch: ClickHouseClient, rows: ActivityRow[]): 
   for (const row of rows) if (!unique.has(rowKey(row))) unique.set(rowKey(row), row);
   const candidates = [...unique.values()];
 
-  // This time format sorts lexicographically, so the string min and max are the time min and max.
-  const times = candidates.map((r) => r.occurred_at).sort();
-
-  const existing = await ch.query({
-    query: EXISTING_ROWS_QUERY,
-    query_params: {
-      tenants: [...new Set(candidates.map((r) => r.tenant_id))],
-      events: [...new Set(candidates.map((r) => r.event_id))],
-      ids: [...new Set(candidates.map((r) => r.message_id))],
-      from: times[0],
-      to: times[times.length - 1],
-    },
-    format: 'JSONEachRow',
-  });
-  const stored = new Set((await existing.json<{ tenant_id: string; message_id: string; line: number }>()).map(rowKey));
+  const stored = new Set<string>();
+  for (const chunk of lookupChunks(candidates)) {
+    // This time format sorts lexicographically, so the string min and max are the time min and max.
+    const times = chunk.map((r) => r.occurred_at).sort();
+    const existing = await ch.query({
+      query: EXISTING_ROWS_QUERY,
+      query_params: {
+        tenants: [...new Set(chunk.map((r) => r.tenant_id))],
+        events: [...new Set(chunk.map((r) => r.event_id))],
+        ids: [...new Set(chunk.map((r) => r.message_id))],
+        from: times[0],
+        to: times[times.length - 1],
+      },
+      format: 'JSONEachRow',
+    });
+    for (const r of await existing.json<{ tenant_id: string; message_id: string; line: number }>()) stored.add(rowKey(r));
+  }
   const fresh = candidates.filter((r) => !stored.has(rowKey(r)));
 
   if (fresh.length > 0) await insertRows(ch, fresh);

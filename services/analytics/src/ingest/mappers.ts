@@ -70,10 +70,15 @@ export function toClickHouseTime(iso: string): string {
  * whole insert (CANNOT_PARSE_ESCAPE_SEQUENCE), which stalled the partition until
  * writer.ts learned to find the refused message, and one in a Map value was stored
  * without complaint as U+FFFD. Refused here, it is one dead letter naming the field.
+ *
+ * And at most 256 characters, so any one id always fits the duplicate lookup's
+ * parameter budget in writer.ts. With no bound, a single long enough id would fail
+ * every lookup of its batch, forever.
  */
 const id = z
   .string()
   .min(1)
+  .max(256)
   .refine((s) => s.isWellFormed(), 'not well-formed Unicode (a lone surrogate)');
 
 /**
