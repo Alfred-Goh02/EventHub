@@ -24,10 +24,12 @@ app.get('/health', (_req, res) => {
  * Readiness: ClickHouse answers, as the user this service actually runs as.
  *
  * A readiness probe that does not check the dependency is worse than none: it
- * keeps traffic flowing to a process that cannot answer a single query.
+ * keeps traffic flowing to a process that cannot answer a single query. And
+ * ping({ select: true }), because ClickHouse answers a plain GET /ping without
+ * authenticating: with a wrong password, ping() said success (measured).
  */
 app.get('/ready', (_req, res) => {
-  ch.ping()
+  ch.ping({ select: true })
     .then((result) => {
       if (result.success) res.json({ ready: true });
       else res.status(503).json({ ready: false });

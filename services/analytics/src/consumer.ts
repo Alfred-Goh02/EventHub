@@ -3,7 +3,7 @@ import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { ingestEnv as env } from './ingest/env.js';
 import { createClickHouse } from './clickhouse.js';
-import { createIngestor, ingestMetrics } from './ingest/consumer.js';
+import { createIngestor, ingestHealth, ingestMetrics } from './ingest/consumer.js';
 
 /**
  * The ingest process — a separate entrypoint from the read API, and in
@@ -31,6 +31,10 @@ const ingestor = createIngestor({
   startFrom: env.INGEST_START_FROM,
   ch,
   logger,
+  onFatal: (err) => {
+    logger.fatal({ err }, 'the consumer stopped for good; exiting so the process is restarted');
+    void ch.close().finally(() => process.exit(1));
+  },
 });
 
 /**
@@ -45,31 +49,36 @@ app.get('/metrics', (_req, res) => {
   res.json({ ingest: ingestMetrics() });
 });
 
-let ingestStarted = false;
-
 /**
- * Ready once the consumer has connected to Kafka and subscribed, and ClickHouse
- * answers as this process's user.
+ * Ready while the consumer is subscribed and its batches are not failing, and
+ * while ClickHouse accepts this process's credentials.
  *
- * Not "has joined its group". A join can wait out a dead member's session
- * timeout — 30 seconds here, and a hard kill routinely leaves one behind — and a
- * probe that failed for that long would restart a healthy process into the same
- * wait.
+ * Subscribed, not "has joined its group": a join can wait out a dead member's
+ * session timeout — 30 seconds here, and a hard kill routinely leaves one behind —
+ * and a probe that failed for that long would restart a healthy process into the
+ * same wait. (The first version's comment said this while its flag waited for the
+ * join anyway; review caught it.)
+ *
+ * ping({ select: true }) rather than ping(): ClickHouse answers GET /ping without
+ * authenticating. Measured with a wrong password, ping() said success and
+ * ping({ select: true }) said AUTHENTICATION_FAILED.
  */
 app.get('/ready', async (_req, res) => {
   const clickhouse = await ch
-    .ping()
+    .ping({ select: true })
     .then((r) => r.success)
     .catch(() => false);
-  const ready = ingestStarted && clickhouse;
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not ready', consumer: ingestStarted, clickhouse });
+  const { consuming, failing, stopped, lastError } = ingestHealth();
+  const ready = consuming && clickhouse;
+  res
+    .status(ready ? 200 : 503)
+    .json({ status: ready ? 'ready' : 'not ready', consumer: consuming, clickhouse, failing, stopped, lastError });
 });
 
 async function startIngestor(): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await ingestor.start();
-      ingestStarted = true;
       return;
     } catch (err) {
       const waitMs = Math.min(30_000, 1_000 * 2 ** attempt);

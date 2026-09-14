@@ -85,6 +85,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Kafka, logLevel } from 'kafkajs';
@@ -126,6 +127,52 @@ async function waitFor(fn, timeoutMs = 20_000) {
 const run = randomUUID().replace(/-/g, '').slice(0, 8);
 const DB = `analytics_ingest_${run}`;
 const GROUP = `verify_analytics_ingest_${run}`;
+/** The only tenant this run puts on the shared topics. */
+const TE = `t_ing_e2e_${run}`;
+/** The group a running compose analytics-ingest consumes under, from the service's own example. */
+const REAL_GROUP = serviceEnv(ROOT, 'analytics')['KAFKA_CONSUMER_GROUP'];
+
+/**
+ * What this run left in the REAL analytics database, removed.
+ *
+ * The shared topics keep every message this run produced, and a running compose
+ * analytics-ingest copies them into `analytics`: fake purchases under this run's
+ * tenant, and poison in ingest_dlq that an operator cannot tell from the real
+ * thing. Review found thirteen runs' worth there. Kafka cannot be un-produced, so
+ * the copies are deleted once that ingest has caught up past them. A compose
+ * ingest started later on a fresh store would replay them again — said here
+ * rather than left to be found.
+ */
+async function cleanRealAnalytics(admin, produced) {
+  if (produced.length === 0) return 'this run produced nothing';
+  let waited = 'no compose ingest was consuming';
+  try {
+    const { groups } = await admin.describeGroups([REAL_GROUP]);
+    if (groups[0]?.state === 'Stable' && groups[0].members.length > 0) {
+      const topics = [...new Set(produced.map((p) => p.topic))];
+      const caughtUp = await waitFor(async () => {
+        const offsets = await admin.fetchOffsets({ groupId: REAL_GROUP, topics });
+        return produced.every((p) => {
+          const o = offsets.find((t) => t.topic === p.topic)?.partitions.find((x) => x.partition === p.partition)?.offset;
+          return o !== undefined && BigInt(o) > BigInt(p.offset);
+        });
+      }, 30_000);
+      waited = caughtUp ? 'the compose ingest had caught up' : 'the compose ingest had NOT caught up after 30s, so later copies may remain';
+    }
+  } catch (err) {
+    waited = `the compose ingest group could not be read (${err.message})`;
+  }
+  const coordinates = produced.map((p) => `('${p.topic}', ${p.partition}, ${p.offset})`).join(', ');
+  for (const sql of [
+    `DELETE FROM analytics.activity_events WHERE tenant_id = '${TE}'`,
+    `ALTER TABLE analytics.ticket_funnel_daily DELETE WHERE tenant_id = '${TE}' SETTINGS mutations_sync = 2`,
+    `ALTER TABLE analytics.engagement_hourly DELETE WHERE tenant_id = '${TE}' SETTINGS mutations_sync = 2`,
+    `DELETE FROM analytics.ingest_dlq WHERE (source_topic, kafka_partition, kafka_offset) IN (${coordinates})`,
+  ]) {
+    await ch(ADMIN, sql);
+  }
+  return waited;
+}
 
 // A minute ago, fixed for the run: every row written from these payloads must
 // carry exactly this instant.
@@ -169,6 +216,7 @@ async function main() {
   const registry = new SchemaRegistry({ host: REGISTRY });
   let app = null;
   let child = null;
+  const produced = [];
 
   const stopConsumer = async () => {
     if (!child) return;
@@ -314,6 +362,22 @@ async function main() {
       `and each tenant holds exactly its own purchases: ${[...perTenant, twAfter].map(fmt).join(' | ')} (want 2 rows each, 4 for the last)`,
     );
 
+    // Each tenant's copy ALONE in its own batch. The cases above always put an id
+    // beside other rows, and review showed a token hashed WITHOUT the tenant passes
+    // them all: no two of those batches hold identical ids. These two do, so only
+    // the tenant can tell their tokens apart.
+    const TP = `t_ing_p_${run}`;
+    const TQ = `t_ing_q_${run}`;
+    const solo = (tenant) =>
+      toRows({ topic: 'tickets.purchased', partition: 0, offset: '0' }, purchase(tenant, EV, 0, { messageId: `solo_${run}` }));
+    await writeActivity(app, solo(TP));
+    await writeActivity(app, solo(TQ));
+    const [tp, tq] = await Promise.all([totals(TP), totals(TQ)]);
+    check(
+      same(tp, { raw: 2, tickets: 3, gross: 7000 }) && same(tq, { raw: 2, tickets: 3, gross: 7000 }),
+      `one id written by two tenants in separate batches is stored for both: ${fmt(tp)} | ${fmt(tq)}`,
+    );
+
     // -----------------------------------------------------------------------
     console.log('');
     console.log("  the duplicate lookup is narrowed by tenant, the key's first column");
@@ -418,6 +482,108 @@ async function main() {
       `a failure that is not the rows' fault is thrown for redelivery, never kept aside: ${outage ? (outage.type ?? outage.message).slice(0, 80) : 'nothing was thrown'}`,
     );
 
+    // The same, but PARTWAY THROUGH the per-message pass. The check above fails at
+    // the first lookup, before that pass runs, so review found its own rethrow
+    // could be deleted with every check still green — and then an outage mid-pass
+    // would dead-letter each good message after it and commit past them. A client
+    // whose third insert fails as ClickHouse once did mid-run: insert 1 is the
+    // whole batch, refused for real; 2 is the bad message alone; 3 is the outage.
+    const requireFromAnalytics = createRequire(join(ROOT, 'services', 'analytics', 'package.json'));
+    const { ClickHouseError } = await import(pathToFileURL(requireFromAnalytics.resolve('@clickhouse/client')).href);
+    let inserts = 0;
+    const flaky = {
+      query: (params) => app.query(params),
+      insert: async (params) => {
+        inserts += 1;
+        if (inserts === 3) {
+          throw new ClickHouseError({ message: 'simulated: memory limit exceeded', code: '241', type: 'MEMORY_LIMIT_EXCEEDED' });
+        }
+        return app.insert(params);
+      },
+    };
+    const TR = `t_ing_r_${run}`;
+    const messageFor = (tenant, n, change = (r) => r) => ({
+      offset: String(n),
+      payload: Buffer.from(`message ${n} ${run}`),
+      rows: rowsFor(tenant, n, n).map(change),
+    });
+    let midway = null;
+    try {
+      await writeMessages(flaky, [messageFor(TR, 0, (r) => ({ ...r, quantity: -1 })), messageFor(TR, 1), messageFor(TR, 2)]);
+    } catch (err) {
+      midway = err;
+    }
+    check(
+      inserts === 3 && midway?.type === 'MEMORY_LIMIT_EXCEEDED',
+      `an outage partway through the per-message pass is thrown, not taken for a refusal: ${inserts} inserts, ${midway ? (midway.type ?? midway.message) : 'nothing thrown'}`,
+    );
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  a batch commits only what it wrote, and commits nothing when a dependency fails');
+    // -----------------------------------------------------------------------
+    // The batch step itself, handed batches whose dependencies fail on cue. Review
+    // found three changes that passed every check through Kafka: the commit moved
+    // ahead of the write, a write error swallowed, the transient-decode rethrow
+    // deleted. Each loses data only when something fails at the wrong moment.
+    const { createBatchProcessor } = await mod('ingest/consumer.js');
+    const quiet = { info() {}, warn() {}, error() {}, fatal() {}, debug() {} };
+    const batchFor = (offset, onCommit = async () => {}) => {
+      const calls = { resolved: [], committed: [] };
+      return {
+        calls,
+        payload: {
+          batch: { topic: 'tickets.purchased', partition: 0, messages: [{ offset, value: Buffer.from(`batch ${offset} ${run}`) }] },
+          resolveOffset: (o) => calls.resolved.push(o),
+          heartbeat: async () => {},
+          isRunning: () => true,
+          isStale: () => false,
+          commitOffsetsIfNecessary: async (offsets) => {
+            calls.committed.push({ offsets, seen: await onCommit() });
+          },
+        },
+      };
+    };
+    const outcome = async (promise) => promise.then(() => 'resolved', (err) => `threw ${err?.type ?? err?.code ?? err?.message}`);
+
+    const TS = `t_ing_s_${run}`;
+    const ordered = batchFor('41', async () => (await totals(TS)).raw);
+    const writes = createBatchProcessor({ ch: app, decode: async () => purchase(TS, EV, 0, { messageId: `batch_${run}` }), logger: quiet });
+    const orderedResult = await outcome(writes(ordered.payload));
+    const commit = ordered.calls.committed[0];
+    check(
+      orderedResult === 'resolved' && ordered.calls.committed.length === 1 && commit.seen === 2 && commit.offsets.topics[0].partitions[0].offset === '42',
+      `the commit comes after the write: at commit time ${commit?.seen} of 2 rows were stored, committing offset ${commit?.offsets?.topics?.[0]?.partitions?.[0]?.offset} (want 42)`,
+    );
+
+    const unreachable = createClickHouse({ url: 'http://127.0.0.1:1', database: DB, username: APP.user, password: APP.password });
+    const storeDown = batchFor('43');
+    const storeDownResult = await outcome(
+      createBatchProcessor({ ch: unreachable, decode: async () => purchase(TS, EV, 1, { messageId: `down_${run}` }), logger: quiet })(storeDown.payload),
+    );
+    await unreachable.close();
+    check(
+      storeDownResult.startsWith('threw') && storeDown.calls.committed.length === 0 && storeDown.calls.resolved.length === 0,
+      `with ClickHouse unreachable the batch throws and commits nothing: ${storeDownResult}, ${storeDown.calls.committed.length} commit(s)`,
+    );
+
+    const dlqRows = async () => Number((await json(ADMIN, 'SELECT count() AS n FROM ingest_dlq', DB))[0].n);
+    const dlqBeforeDecode = await dlqRows();
+    const registryDown = batchFor('44');
+    const registryDownResult = await outcome(
+      createBatchProcessor({
+        ch: app,
+        decode: async () => {
+          throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { status: 400 });
+        },
+        logger: quiet,
+      })(registryDown.payload),
+    );
+    check(
+      registryDownResult.startsWith('threw') && registryDown.calls.committed.length === 0 && (await dlqRows()) === dlqBeforeDecode,
+      `a registry that cannot be reached is thrown for redelivery, not kept aside as poison: ${registryDownResult}, ${registryDown.calls.committed.length} commit(s), DLQ ${dlqBeforeDecode} -> ${await dlqRows()}`,
+    );
+
     // -----------------------------------------------------------------------
     console.log('');
     console.log('  the consumer, end to end, under a fresh group');
@@ -430,35 +596,49 @@ async function main() {
     };
     const send = async (topic, key, value) => {
       const [meta] = await producer.send({ topic, messages: [{ key, value }] });
+      produced.push({ topic, partition: meta.partition, offset: meta.baseOffset });
       return { partition: meta.partition, offset: meta.baseOffset };
     };
     const sendAvro = async (topic, payload) => send(topic, payload.eventId, await registry.encode(schemaIds[topic], payload));
     const sendJson = async (payload) => send('live.interactions', payload.eventId, JSON.stringify(payload));
     const rawCount = async (where) => Number((await json(ADMIN, `SELECT count() AS n FROM activity_events WHERE ${where}`, DB))[0].n);
 
-    child = spawn(process.execPath, ['dist/consumer.js'], {
-      cwd: join(ROOT, 'services', 'analytics'),
-      // Analytics' own .env.example plus these. See scripts/lib/service-env.mjs.
-      env: serviceEnv(ROOT, 'analytics', {
-        LOG_LEVEL: 'fatal',
-        INGEST_PORT: String(PORT),
-        CLICKHOUSE_URL: CH_URL,
-        CLICKHOUSE_DATABASE: DB,
-        KAFKA_BROKERS: process.env['KAFKA_BROKERS'],
-        SCHEMA_REGISTRY_URL: REGISTRY,
-        KAFKA_CONSUMER_GROUP: GROUP,
-        INGEST_START_FROM: 'latest',
-      }),
-      stdio: ['ignore', 'inherit', 'inherit'],
-    });
+    const startConsumer = (overrides = {}) => {
+      child = spawn(process.execPath, ['dist/consumer.js'], {
+        cwd: join(ROOT, 'services', 'analytics'),
+        // Analytics' own .env.example plus these. See scripts/lib/service-env.mjs.
+        env: serviceEnv(ROOT, 'analytics', {
+          LOG_LEVEL: 'fatal',
+          INGEST_PORT: String(PORT),
+          CLICKHOUSE_URL: CH_URL,
+          CLICKHOUSE_DATABASE: DB,
+          KAFKA_BROKERS: process.env['KAFKA_BROKERS'],
+          SCHEMA_REGISTRY_URL: REGISTRY,
+          KAFKA_CONSUMER_GROUP: GROUP,
+          INGEST_START_FROM: 'latest',
+          ...overrides,
+        }),
+        stdio: ['ignore', 'inherit', 'inherit'],
+      });
+    };
+    startConsumer();
 
-    const metrics = async () => {
+    const probe = async (path) => {
       try {
-        const res = await fetch(`http://127.0.0.1:${PORT}/metrics`);
-        return res.ok ? (await res.json()).ingest : null;
+        const res = await fetch(`http://127.0.0.1:${PORT}${path}`);
+        return { status: res.status, body: await res.json().catch(() => null) };
       } catch {
         return null;
       }
+    };
+    const metrics = async () => {
+      const r = await probe('/metrics');
+      return r?.status === 200 ? r.body.ingest : null;
+    };
+    const committedOffset = async (topic, partition) => {
+      const offsets = await admin.fetchOffsets({ groupId: GROUP, topics: [topic] });
+      const o = offsets.find((t) => t.topic === topic)?.partitions.find((p) => p.partition === partition)?.offset;
+      return o === undefined || o === '-1' ? null : o;
     };
 
     const topicMeta = await admin.fetchTopicMetadata({ topics: TOPICS });
@@ -466,7 +646,6 @@ async function main() {
     const joined = await waitFor(async () => (await metrics())?.assignedPartitions === partitionTotal, 60_000);
     check(Boolean(joined), `the consumer joined its group and holds all ${partitionTotal} partitions of ${TOPICS.join(', ')}`);
 
-    const TE = `t_ing_e2e_${run}`;
     const EV2 = `evt_e2e_${run}`;
     const CANARY_EV = `evt_canary_${run}`;
     let canary = false;
@@ -580,6 +759,11 @@ async function main() {
       EV2,
       JSON.stringify({ ...asked, kind: 'question.upvoted', userId: 'u_surrogate', eventId: '\ud800' }),
     );
+    // Refused by the mapper, and the REFUSAL carried the poison: zod echoes the
+    // value it received, so this kind's error text held a lone surrogate, and
+    // ClickHouse refused the dead-letter row itself — the same stall, one table
+    // over. Found by review, measured by two reviewers independently.
+    const atBadKind = await send('live.interactions', EV2, JSON.stringify({ ...asked, kind: '\ud800', userId: 'u_badkind' }));
 
     const behind = {
       'tickets.purchased': await sendAvro('tickets.purchased', purchase(TE, EV2, 1, { messageId: `behind_pur_${run}`, userId: 'u_second' })),
@@ -594,8 +778,8 @@ async function main() {
       Boolean(through),
       `the good messages behind the poison on all three topics became rows (${await rawCount(behindRows)} of 5) — no partition is stuck`,
     );
-    const parked = await waitFor(async () => (await metrics())?.deadLetteredTotal === parkedBefore + 4, 30_000);
-    check(Boolean(parked), `deadLetteredTotal rose by exactly 4 (${parkedBefore} -> ${(await metrics())?.deadLetteredTotal})`);
+    const parked = await waitFor(async () => (await metrics())?.deadLetteredTotal === parkedBefore + 5, 30_000);
+    check(Boolean(parked), `deadLetteredTotal rose by exactly 5 (${parkedBefore} -> ${(await metrics())?.deadLetteredTotal})`);
 
     const dlq = await json(ADMIN, 'SELECT source_topic, kafka_partition, kafka_offset, error, payload FROM ingest_dlq', DB);
     const kept = (topic, at) =>
@@ -618,11 +802,26 @@ async function main() {
       Boolean(s) && /well-formed/i.test(s.error),
       `a lone surrogate in an eventId is refused before ClickHouse sees it${s ? `: ${JSON.stringify(s.error.slice(0, 90))}` : ''}`,
     );
+    const k = kept('live.interactions', atBadKind);
+    check(
+      Boolean(k) && k.error.isWellFormed() && k.error.includes('�'),
+      `a message whose own error text carries a lone surrogate is still kept, the surrogate replaced${k ? `: ${JSON.stringify(k.error.slice(0, 110))}` : ''}`,
+    );
 
     // -----------------------------------------------------------------------
     console.log('');
     console.log('  offsets are committed after the write, so a restart does not replay it');
     // -----------------------------------------------------------------------
+    // Waited for, not read straight after the kill: the DLQ counter the wait above
+    // watched rises before the commit's round trip, and on Windows the kill is
+    // immediate — review showed a correct consumer could go red on that race.
+    await waitFor(async () => {
+      for (const topic of TOPICS) {
+        const o = await committedOffset(topic, behind[topic].partition);
+        if (o === null || BigInt(o) <= BigInt(behind[topic].offset)) return false;
+      }
+      return true;
+    }, 15_000);
     await stopConsumer();
     const committed = await admin.fetchOffsets({ groupId: GROUP, topics: TOPICS });
     for (const topic of TOPICS) {
@@ -633,8 +832,67 @@ async function main() {
         `${topic} partition ${at.partition}: committed ${offset}, past the last written offset ${at.offset}`,
       );
     }
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  an unreachable schema registry is an outage: nothing kept aside, nothing committed, not ready');
+    // -----------------------------------------------------------------------
+    // Through the real consumer, because review found that nothing had ever made
+    // a dependency fail under it: the rethrow for a transient decode failure could
+    // be deleted, or the commit moved ahead of the write, with every check green.
+    const dlqCount = async () => Number((await json(ADMIN, 'SELECT count() AS n FROM ingest_dlq', DB))[0].n);
+    const dlqBefore = await dlqCount();
+    startConsumer({ SCHEMA_REGISTRY_URL: 'http://127.0.0.1:1' });
+    // Up to 90s: the member killed above is still in the group until its session times out.
+    const outageJoined = await waitFor(async () => (await metrics())?.assignedPartitions === partitionTotal, 90_000);
+    check(Boolean(outageJoined), 'CONTROL: a consumer whose registry is unreachable joined the same group');
+    const atOutage = await sendAvro('tickets.purchased', purchase(TE, EV2, 5, { messageId: `outage_${run}`, userId: 'u_outage' }));
+    const failing = await waitFor(async () => (await metrics())?.batchFailuresTotal > 0, 60_000);
+    check(Boolean(failing), `CONTROL: it read the purchase and failed on it (batchFailuresTotal ${(await metrics())?.batchFailuresTotal})`);
+    const notReady = await waitFor(async () => (await probe('/ready'))?.status === 503, 30_000);
+    check(Boolean(notReady), `/ready says 503 while it cannot make progress (${(await probe('/ready'))?.status})`);
+    const crashed = await waitFor(async () => (await metrics())?.crashesTotal > 0, 60_000);
+    check(Boolean(crashed), `the crash kafkajs restarts it from is counted (crashesTotal ${(await metrics())?.crashesTotal})`);
+    check(
+      (await rawCount(`message_id = 'outage_${run}'`)) === 0 && (await dlqCount()) === dlqBefore,
+      'nothing was written, and nothing was kept aside as if the message were at fault',
+    );
+    const frozen = await committedOffset('tickets.purchased', atOutage.partition);
+    check(
+      frozen !== null && BigInt(frozen) <= BigInt(atOutage.offset),
+      `the group did not commit past it (committed ${frozen}, the purchase is at ${atOutage.offset})`,
+    );
+    await stopConsumer();
+
+    startConsumer();
+    const recovered = await waitFor(async () => (await rawCount(`message_id = 'outage_${run}'`)) === 2, 90_000);
+    check(Boolean(recovered), 'with the registry back, the same group redelivers the purchase and both its lines land');
+    const moved = await waitFor(async () => {
+      const o = await committedOffset('tickets.purchased', atOutage.partition);
+      return o !== null && BigInt(o) > BigInt(atOutage.offset);
+    }, 30_000);
+    check(Boolean(moved), 'and commits past it only then');
+    await stopConsumer();
+
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log("  readiness asks ClickHouse as this process's user, not merely whether it answers");
+    // -----------------------------------------------------------------------
+    // ClickHouse answers GET /ping without authenticating, so a readiness check
+    // built on it said ready with a wrong password (found by review).
+    startConsumer({ CLICKHOUSE_PASSWORD: 'not-the-password', KAFKA_CONSUMER_GROUP: `${GROUP}_badpass` });
+    const subscribed = await waitFor(async () => (await probe('/ready'))?.body?.consumer === true, 60_000);
+    check(Boolean(subscribed), 'CONTROL: a consumer given a wrong ClickHouse password connected to Kafka and subscribed');
+    const badPass = await probe('/ready');
+    check(
+      badPass?.status === 503 && badPass.body?.clickhouse === false,
+      `and /ready is 503 with clickhouse false (${badPass?.status} ${JSON.stringify(badPass?.body)})`,
+    );
+    await stopConsumer();
   } finally {
     await stopConsumer();
+    const realCleanup = await cleanRealAnalytics(admin, produced).catch((err) => `failed: ${err.message}`);
+    console.log(`\n    the real analytics database: this run's copies removed; ${realCleanup}`);
     await producer.disconnect().catch(() => {});
     await admin.disconnect().catch(() => {});
     await app?.close().catch(() => {});
