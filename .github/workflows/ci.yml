@@ -807,6 +807,16 @@ jobs:
           SCHEMA_REGISTRY_URL: http://localhost:8081
         run: node scripts/verify-analytics-ingest.mjs
 
+      # CHAPTER 7, PART 3: the read API. The tenant is the token's claim and nothing
+      # else, and every route the router declares is asked for another tenant's
+      # event -- including an event id both tenants use, which a query filtering
+      # on the event alone answers with the SUM. A route added without a probe
+      # fails this. Also: people counted once across days rather than once per
+      # day, money kept per currency, reads that merge rollup rows no background
+      # merge has collapsed yet, and an unreachable store answered as a 503.
+      - name: Assert the analytics API answers only the token's tenant, with numbers that add up
+        run: node scripts/verify-analytics-api.mjs
+
       # The password reset flow, including the failure that returns success.
       #
       # The highest-value assertion here is the dullest: that the password
