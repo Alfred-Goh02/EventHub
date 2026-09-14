@@ -78,6 +78,27 @@
  * plain count() with MEMORY_LIMIT_EXCEEDED while the stuck compose ingest
  * container retried beside it.
  *
+ * A second review round added the rest, each seen red first. Against the consumer
+ * as it was, 9 red: a poison message whose own zod error echoed a lone surrogate
+ * stalled its partition all over again, because ClickHouse refused the dead-letter
+ * row; a registry outage left /ready at 200 with no failure or crash counted; and
+ * a wrong ClickHouse password answered ready. Then the fixes were broken, in
+ * batches kept apart so that each red names one guard:
+ *
+ *   batch 1, 5 red   the token without the tenant    tenant B's copy stored as nothing
+ *                    any ClickHouse error in the     4 inserts, nothing thrown
+ *                    per-message pass a refusal
+ *                    a commit ahead of the write     0 of 2 rows stored at commit
+ *                    ping() without select           ready on a wrong password
+ *   batch 2, 5 red   dead-letter text not made       the stall, reproduced
+ *                    well-formed
+ *   batch 3, 3 red   a write error swallowed         committed with ClickHouse down
+ *                    health tracking off             /ready 200 through an outage,
+ *                                                    crashesTotal 0
+ *   batch 4, 7 red   a transient decode failure      kept aside and committed past;
+ *                    parked like poison              with the registry back, the
+ *                                                    purchase never came back
+ *
  * Run (after pnpm build, topics and schemas, with ClickHouse up):
  *   node scripts/verify-analytics-ingest.mjs
  */
