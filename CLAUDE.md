@@ -97,6 +97,10 @@ that have both bitten: a regex anchored to `$` must tolerate CRLF, and a file
 fetched for byte-exact comparison is fetched raw — never through `git clone`,
 which rewrites line endings on the way in.
 
+Git Bash also rewrites an absolute path handed to `docker exec`: `/app/...` arrived
+as `C:/Program Files/Git/app/...`, and the command failed as if the file were
+missing. Prefix `MSYS_NO_PATHCONV=1`.
+
 ## A guard that runs after the thing it guards is not a guard
 
 Check the precondition **before** the call that depends on it, not after.
@@ -158,6 +162,11 @@ the exit code of the last thing in the pipe, not of the interesting command — 
 `docker build` that failed 127 on `corepack enable` was reported as exit 0 because
 `tail` succeeded. Print the code you actually mean.
 
+Count what you mean, too. A merge guard counted `FAIL` in a CI log and refused a
+green run: the two matches were ClickHouse's `AUTHENTICATION_FAILED`, from a drill
+where authentication was meant to fail. Count check-result lines, anchored, never a
+substring of the whole log.
+
 ## A failed check sets the exit code where it fails
 
 In a verifier, `check()` sets `process.exitCode = 1` the moment an assertion
@@ -171,7 +180,7 @@ would have reported a run that could not even start the thing under test as gree
 ## A fixture has to be able to show the failure
 
 A negative result is only evidence if the setup could have produced the positive
-one. Chapter 6 found four setups that could not:
+one. Chapters 6 and 7 found five setups that could not:
 
 - Two tenants on **different shards**. A search through tenant A's alias only
   visits A's shard, so it could not have returned B's documents even with the
@@ -184,6 +193,9 @@ one. Chapter 6 found four setups that could not:
   the boost to win.
 - A search loop's control required more than 20 iterations, and passed with 22
   on a quick run. It now requires answers from both sides of the swap it watches.
+- A part-count metric that reported a table's total passed for one that found the
+  worst partition, because every fixture row sat in one month and the two numbers
+  were equal. A row in a second partition made the break visible: 52 against 51.
 
 Ask what the run would look like if the guard were missing. If the answer is
 "the same", the fixture is wrong, not the guard.
@@ -218,3 +230,83 @@ freshly built Ticketing crashed with `EADDRINUSE` on 3003 while `/health` on 300
 answered 200 from the old container, and the DLQ verifier then failed against code
 this branch had already changed. Stop the container a test needs to replace, run
 the fresh build, and start the container again afterwards.
+
+## Watch the effect, not the call
+
+A call whose name promises what you want can do nothing in your configuration.
+
+Analytics' ingest committed its Kafka offsets with kafkajs's
+`commitOffsetsIfNecessary()`. With `autoCommit` off, that call with no argument
+waits for an interval or a threshold, both null, and commits nothing, ever. The code
+read correctly and every row landed. The group's committed offsets sat at -1, so
+every restart would have replayed whatever `earliest` or `latest` chose.
+
+It was found by asserting the effect: reading the committed offsets after the
+write, not trusting that the commit was called.
+
+## Identity comes from the message, and includes the tenant
+
+At-least-once delivery means the same message arrives twice, and a materialized
+view has already aggregated both copies by the time anyone looks. So deduplication
+happens at the write, keyed on what the message is, not where it was read:
+
+- A token built from a batch's offset range double-counted a redelivery that ended
+  later than the first attempt, and could never catch a republish at a new offset.
+- Keyed on the message id alone, one tenant's message silently erased another's
+  under a colliding id. Kafka is not tenant-scoped, and an id is only as unique as
+  its producer makes it.
+
+## Refuse at the edge what the store would silently change
+
+ClickHouse 25.8 refuses few bad values and stores many as something else, without
+an error. Measured:
+
+- 70000 in a UInt16 was stored as 4464, and 2^64 in a UInt64 as 384.
+- `2026-02-30` became 2 March.
+- A garbage time became 1900-01-01.
+
+Nothing downstream can see a value that was changed on the way in. So the mapper
+refuses anything the column cannot hold: ill-formed strings, instants that do not
+round-trip through `toISOString`, and amounts past 2^53.
+
+## Tell the row's fault from the store's
+
+A failed write is the data's fault or the store's, and the two need opposite
+handling. Poison is kept aside and the partition moves on. An outage is thrown,
+nothing is committed, and the batch is redelivered.
+
+Wrong one way, a partition stalls forever. A lone surrogate made ClickHouse refuse
+a whole batch, and rethrowing that as an outage redelivered it indefinitely. That
+happened twice: once in the activity rows, then again in the dead-letter row's own
+error text, which echoed the surrogate.
+
+Wrong the other way, data is lost. A mutation that parked a registry outage as
+poison committed past a purchase that never came back.
+
+Classify by what was measured, here the `CANNOT_PARSE_*` family, and keep
+dead-letter text well-formed.
+
+## Measure at the size production will send
+
+Every check passed on batches of tens of rows. A duplicate lookup over 10000 ids
+failed with `Field value too long`: each ClickHouse query parameter travels as one
+HTTP form field, capped at `http_max_field_value_size` (128 KiB). That is not a
+refusal of the rows, so a consumer catching up on a backlog would have rethrown its
+first large batch forever. No review or test found it. Running the writer once at
+backlog scale did.
+
+## Check the index with EXPLAIN, not by reading the query
+
+`(tenant_id, event_id) IN (...)` looks as if it narrows by the sort key's first two
+columns. On ClickHouse 25.8, `EXPLAIN indexes = 1` shows it using `event_id` only,
+whether the list is a parameter or literals, so it reads every tenant's granules.
+Two separate `IN` lists use both columns.
+
+## Readiness must ask the dependency as this process
+
+ClickHouse answers `GET /ping` without authenticating, so a `/ready` built on
+`ping()` said ready with a wrong password. `ping({ select: true })` runs a query and
+fails with `AUTHENTICATION_FAILED`.
+
+The same probe had also latched true once the consumer started, so a crash-looping
+consumer answered ready. Readiness has to track the failure it exists to report.
