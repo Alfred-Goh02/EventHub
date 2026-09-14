@@ -616,7 +616,8 @@ services:
   # ---------------------------------------------------------------------------
   # Analytics: the read side of ClickHouse. Connects as analytics_app — SELECT
   # and INSERT only — and never holds the migrator credential, which setup uses
-  # and nothing else does.
+  # and nothing else does. Verifies tokens with Auth's public key from the
+  # jwt-keys volume, as Search does: the tenant every query binds is the token's.
   # ---------------------------------------------------------------------------
   analytics:
     <<: *app
@@ -633,6 +634,9 @@ services:
       CLICKHOUSE_DATABASE: analytics
       CLICKHOUSE_USER: analytics_app
       CLICKHOUSE_PASSWORD: analytics_app
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+    volumes:
+      - jwt-keys:/run/eventhub/keys:ro
     working_dir: /app/services/analytics
     command: ["node", "dist/index.js"]
     healthcheck:

@@ -2,6 +2,9 @@ import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { env } from './env.js';
 import { createClickHouse } from './clickhouse.js';
+import { requireAnalyst, requireAuth } from './auth.js';
+import { createAnalyticsRouter } from './routes/analytics.js';
+import { queryMetrics } from './query-metrics.js';
 
 const logger = createLogger('analytics-service');
 const app = express();
@@ -36,6 +39,13 @@ app.get('/ready', (_req, res) => {
     })
     .catch(() => res.status(503).json({ ready: false }));
 });
+
+/** What the read API has been doing, per route. JSON, as elsewhere: nothing scrapes it yet. */
+app.get('/metrics', (_req, res) => {
+  res.json({ queries: queryMetrics() });
+});
+
+app.use(createAnalyticsRouter({ ch, guards: [requireAuth, requireAnalyst] }));
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error({ err }, 'unhandled error');

@@ -81,10 +81,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/ticketing` | Projection consumer, seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
-| `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id. The read API is next |
+| `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Four databases and eleven roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 56 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 57 executable proofs of the invariants above |
 
 Four separate Postgres databases with their own credentials. CI asserts across
 all twelve directions that no service can even open a connection to another's.
@@ -452,10 +452,19 @@ A mapping or analyzer change ships by bumping `INDEX_VERSION` and running
 Chapter 7, analytics, is under way. ClickHouse storage with its rollups is built,
 and so is the Kafka ingest that fills it: one row per ticket line, each message
 counted once by its id however Kafka redelivers it, and poison kept in
-`ingest_dlq` without blocking its partition. The read API is next. Later chapters
+`ingest_dlq` without blocking its partition. So is the read API on 3006: an
+event's ticket funnel and live engagement, and a tenant overview, with the
+tenant taken from the token and every route checked against another tenant's
+event. Failure drills and operational visibility are next. Later chapters
 (notifications, community) are designed and documented but not implemented.
 
 Known gaps, named rather than hidden:
+
+- Analytics answers per tenant, not per organiser. Its rows carry no organiser,
+  so any organiser or admin sees every event in their tenant. And ClickHouse has
+  no equivalent of the non-owner Postgres role behind it: isolation rests on the
+  service binding the token's tenant into every query, which
+  `scripts/verify-analytics-api.mjs` checks route by route.
 
 - No API gateway, so rate limiting exists only inside the Auth service and only
   in process memory.

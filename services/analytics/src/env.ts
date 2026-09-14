@@ -18,6 +18,14 @@ const analyticsEnvSchema = baseEnvSchema.omit({ DATABASE_URL: true }).extend({
   CLICKHOUSE_DATABASE: z.string().regex(DATABASE_NAME).default('analytics'),
   CLICKHOUSE_USER: z.string().min(1),
   CLICKHOUSE_PASSWORD: z.string().min(1),
+
+  /**
+   * Rejected unless a token's `iss` and `aud` match exactly. Auth's public key
+   * arrives separately, as AUTH_PUBLIC_KEY_B64 or AUTH_PUBLIC_KEY_FILE, read by
+   * publicKeyFromEnv in @eventhub/auth-middleware.
+   */
+  JWT_ISSUER: z.string().min(1),
+  JWT_AUDIENCE: z.string().min(1),
 });
 
 export const env = loadEnv(analyticsEnvSchema);
