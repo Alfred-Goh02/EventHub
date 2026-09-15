@@ -58,6 +58,18 @@ const EXPECTED = [
     value: '86400000',
     why: 'a sealed link is dead thirty minutes after issue, so a day covers any outage worth waiting out',
   },
+  {
+    topic: 'notification.dlq',
+    name: 'retention.ms',
+    value: '-1',
+    why: 'a delivery that can never succeed must outlive the week nobody looked at it',
+  },
+  ...['notification.retry.1', 'notification.retry.2', 'notification.retry.3'].map((topic) => ({
+    topic,
+    name: 'retention.ms',
+    value: '86400000',
+    why: 'a retry waits minutes; a day is headroom, not storage',
+  })),
 ];
 
 async function main() {

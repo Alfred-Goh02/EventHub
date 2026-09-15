@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 64 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 65 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -486,8 +486,19 @@ the ingest stopped first: a row that lands mid-rebuild would be counted twice.
 Chapter 8, notifications, is in progress. A password reset now reaches the inbox.
 Auth queues it encrypted to Notification's key and signed with its own, the relay
 publishes it, and Notification opens it, claims the delivery once and sends it. In
-compose it arrives at Mailpit, `http://localhost:8025`. Retries, preferences, rate
-limits and suppression are still to come. Chapter 9, community, is designed and
+compose it arrives at Mailpit, `http://localhost:8025`.
+
+A send that fails for a reason that may pass waits in delayed retry tiers
+(`notification.retry.1` to `.3`) without holding up anyone else on its partition.
+Poison, and a send whose retries run out, go to `notification.dlq`, which is never
+replayed automatically. Once whatever put it there is fixed, replay one by its
+message id; a delivery already sent is not sent again:
+
+```bash
+pnpm --filter @eventhub/notification run dlq:replay -- <message-id>
+```
+
+Preferences, rate limits and suppression are still to come. Chapter 9, community, is designed and
 documented but not implemented.
 
 Known gaps, named rather than hidden:

@@ -40,6 +40,7 @@ import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { CompactEncrypt, SignJWT, calculateJwkThumbprint, exportJWK, importPKCS8, importSPKI } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
+import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -211,11 +212,18 @@ async function main() {
   const realGroup = serviceEnv(ROOT, 'notification').KAFKA_CONSUMER_GROUP;
   const probe = new Kafka({ clientId: `verify-email-delivery-probe-${RUN}`, brokers: relayEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING }).admin();
   await probe.connect();
-  const { groups: [real] } = await probe.describeGroups([realGroup]);
+  // A consumer stopped a moment ago can stay a member until its session times out
+  // (30 s), so the groups get that long to empty before this refuses.
+  let busy = [];
+  const idle = await waitFor(async () => {
+    const { groups } = await probe.describeGroups([realGroup, `${realGroup}-retry`]);
+    busy = groups.filter((g) => g.members.length > 0).map((g) => g.groupId);
+    return busy.length === 0;
+  }, 40_000, 2_000);
   await probe.disconnect();
-  if (real && real.members.length > 0) {
+  if (!idle) {
     console.error(
-      `FAIL: consumer group ${realGroup} has ${real.members.length} active member(s), so another Notification is ` +
+      `FAIL: ${busy.join(' and ')} still ${busy.length === 1 ? 'has' : 'have'} active members, so another Notification is ` +
         'delivering from auth.email-requested. Stop it first (in compose: docker compose stop notification).',
     );
     process.exitCode = 1;
@@ -452,6 +460,15 @@ async function main() {
 
     const caughtUp = await waitFor(async () => (await dispatch()).lag?.total === 0, 20_000, 1_000);
     check(Boolean(caughtUp), '/metrics shows lag 0 once every message is committed');
+  } catch (err) {
+    // Reported, not thrown, so a run that stops says what stopped it. Both children
+    // are named, with the socket error Node keeps under "fetch failed": a POST to Auth
+    // once ended this run with those two words and nothing to say why.
+    const children = [['Notification', notification], ['Auth', auth]];
+    const cause = err?.cause ? ` [${err.cause.code ?? err.cause.message ?? String(err.cause)}]` : '';
+    const exited = children.filter(([, p]) => p.child.exitCode !== null || p.child.signalCode !== null).map(([name, p]) => ` (${name} had exited: ${p.child.exitCode ?? p.child.signalCode})`);
+    check(false, `the run stopped early: ${err instanceof Error ? err.message : String(err)}${cause}${exited.join('')}`);
+    for (const [name, p] of children) console.error(`  ${name}'s output:\n${excerpt(p.log())}`);
   } finally {
     notification.child.kill();
     auth.child.kill();
@@ -469,17 +486,14 @@ async function main() {
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
     await producer.disconnect().catch(() => {});
     // The group empties once the killed consumer's session times out.
-    const groupGone = await waitFor(async () => {
-      await admin.deleteGroups([GROUP]);
-      return true;
-    }, 45_000, 3_000);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`]);
     await admin.disconnect().catch(() => {});
     const left = {
       outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
       deliveries: (await inTenant(notifyOwner, TENANT, 'SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
       inbox: (await inbox(EMAIL).catch(() => [])).length + (await inbox(VICTIM).catch(() => [])).length,
     };
-    check(left.outbox === 0 && left.deliveries === 0 && left.inbox === 0, `cleanup: this run's outbox rows, deliveries and emails are gone (${JSON.stringify(left)}); consumer group ${groupGone ? 'deleted' : 'left to expire'}`);
+    check(left.outbox === 0 && left.deliveries === 0 && left.inbox === 0, `cleanup: this run's outbox rows, deliveries and emails are gone (${JSON.stringify(left)}); consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`);
     await Promise.all([authApp, relayDb, notifyApp, notifyOwner].map((c) => c.end().catch(() => {})));
   }
 

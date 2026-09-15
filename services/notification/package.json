@@ -7,7 +7,8 @@
     "dev": "tsx watch --env-file=.env src/index.ts",
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
-    "generate": "prisma generate"
+    "generate": "prisma generate",
+    "dlq:replay": "node --env-file-if-exists=.env dist/scripts/dlq-replay.js"
   },
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",

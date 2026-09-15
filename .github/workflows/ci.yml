@@ -934,6 +934,13 @@ jobs:
       - name: Assert a reset email is delivered once, and nothing refused is sent
         run: node scripts/verify-email-delivery.mjs
 
+      # When a send cannot be completed now. Against a fake SMTP server this run
+      # stops and starts: an outage waits in a retry tier and arrives once; one
+      # troubled address does not hold up a user on its partition; retries run out
+      # into notification.dlq, and a replay from there sends once.
+      - name: Assert failed sends are retried without blocking, and run out into the DLQ
+        run: node scripts/verify-email-retries.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

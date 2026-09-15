@@ -40,12 +40,13 @@ const bounded = <T>(work: Promise<T>): Promise<T | { error: string }> =>
  * brokers, so it is cached for five seconds and bounded at two, as Analytics'
  * ingest does: a /metrics request must never be the thing that hangs when Kafka does.
  */
-let slow: { at: number; lag: unknown } | null = null;
+let slow: { at: number; lag: unknown; retryLag: unknown } | null = null;
 app.get('/metrics', async (_req, res) => {
   if (dispatcher && (slow === null || Date.now() - slow.at > 5_000)) {
-    slow = { at: Date.now(), lag: await bounded(dispatcher.lag()) };
+    const [lag, retryLag] = await Promise.all([bounded(dispatcher.lag()), bounded(dispatcher.retryLag())]);
+    slow = { at: Date.now(), lag, retryLag };
   }
-  res.json({ dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null } });
+  res.json({ dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null } });
 });
 
 /**
@@ -102,11 +103,16 @@ async function startDispatcher(d: NonNullable<typeof dispatcher>): Promise<void>
 }
 
 async function shutdown(signal: string): Promise<void> {
+  const started = Date.now();
   logger.info({ signal }, 'shutting down');
-  // The consumer first, so an email being sent can record its outcome before the
-  // database connection goes.
+  // The consumers first, so an email being sent can record its outcome before the
+  // database connection goes. Each step is timed: compose kills the container after
+  // its grace period, and a consumer killed that way stays in its group until its
+  // session times out.
   await dispatcher?.stop();
+  logger.info({ ms: Date.now() - started }, 'dispatch consumers stopped');
   await prisma.$disconnect().catch(() => {});
+  logger.info({ ms: Date.now() - started }, 'shut down');
   process.exit(0);
 }
 
@@ -126,6 +132,7 @@ async function main(): Promise<void> {
     registryUrl: env.SCHEMA_REGISTRY_URL,
     groupId: env.KAFKA_CONSUMER_GROUP,
     startFrom: env.DISPATCH_START_FROM,
+    retryDelaysMs: env.DISPATCH_RETRY_DELAYS_MS,
     logger,
     open: createSealOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
     channel,
