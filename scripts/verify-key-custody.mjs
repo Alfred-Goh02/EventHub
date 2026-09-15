@@ -27,6 +27,8 @@ const APP_IMAGE = 'eventhub/app:local';
 /** The private keys each service alone may read. Every other service may read none. */
 const HOLDERS = {
   auth: ['/app/services/auth/keys/private.pem'],
+  // Opens sealed email requests. Nothing else may be able to.
+  notification: ['/app/services/notification/keys/private.pem'],
 };
 
 /**

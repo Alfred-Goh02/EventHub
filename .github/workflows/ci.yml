@@ -174,7 +174,7 @@ jobs:
       # minutes (start_period 30s, then 20 retries 10s apart) and fail the job,
       # blaming OpenSearch for doing exactly what a single node has to do.
       - name: Start infrastructure
-        run: docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse
+        run: docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse mailpit
 
       - name: Show what came up
         run: docker compose ps
@@ -926,6 +926,13 @@ jobs:
       # password. Starts its own Auth with the dev sink on, to learn that token.
       - name: Assert a reset email is queued sealed, and its link still works
         run: node scripts/verify-email-request.mjs
+
+      # And then delivered. Notification opens the seal, checks Auth's signature,
+      # claims the delivery once and sends it to Mailpit, where this reads it back.
+      # A redelivery, a forged seal and an expired request must send nothing, and a
+      # real request queued behind them must still arrive.
+      - name: Assert a reset email is delivered once, and nothing refused is sent
+        run: node scripts/verify-email-delivery.mjs
 
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.

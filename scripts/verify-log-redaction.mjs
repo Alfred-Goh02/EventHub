@@ -54,6 +54,7 @@ const KEYS = [
   'authorization',
   'secret',
   'privateKey',
+  'link',
 ];
 
 function main() {

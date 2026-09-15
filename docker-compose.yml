@@ -305,6 +305,25 @@ services:
       start_period: 20s
 
   # ---------------------------------------------------------------------------
+  # Mailpit: the local email inbox. Accepts any SMTP message on 1025 and shows it,
+  # rendered, at http://localhost:8025, with no provider account and no sandbox
+  # limits. Notification sends here in compose. Pinned, like every other image.
+  # ---------------------------------------------------------------------------
+  mailpit:
+    image: axllent/mailpit:v1.31.1
+    container_name: eventhub-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
   # Everything that has to happen once before any service can serve a request.
   #
   # This exists because "docker compose up" was previously only half of a start.
@@ -772,9 +791,13 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
-  # Notification: its own database and nothing else yet. No Kafka consumer and no
-  # email provider until the parts that send. Connects as eventhub_notification_app,
-  # which owns nothing, and refuses to start as a role that could bypass RLS.
+  # Notification: consumes auth.email-requested, opens each sealed request with its
+  # own private key, checks Auth's signature, claims the delivery in its sent-log,
+  # and sends through Mailpit.
+  #
+  # The only container that mounts notification-keys, because it is the only one
+  # that decrypts. It connects as eventhub_notification_app, which owns nothing,
+  # and refuses to start as a role that could bypass RLS.
   # ---------------------------------------------------------------------------
   notification:
     <<: *app
@@ -782,6 +805,8 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
     ports:
       - "3007:3007"
     environment:
@@ -789,6 +814,16 @@ services:
       PORT: 3007
       DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
       APP_DATABASE_URL: postgresql://eventhub_notification_app:eventhub_notification_app@postgres:5432/eventhub_notification
+      KAFKA_CONSUMER_GROUP: notification-dispatch
+      # Verifies Auth's signature inside each seal. The public half only.
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      EMAIL_FROM: no-reply@eventhub.local
+    volumes:
+      - jwt-public:/run/eventhub/keys:ro
+      # keys/ resolves beside dist/, so the layout fixes this mount point.
+      - notification-keys:/app/services/notification/keys:ro
     working_dir: /app/services/notification
     command: ["node", "dist/index.js"]
     healthcheck:
