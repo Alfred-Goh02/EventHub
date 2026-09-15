@@ -92,7 +92,8 @@ function token(tenantId) {
 
 async function main() {
   const { os } = await mod('opensearch.js');
-  const { consumerLag } = await mod('indexer/lag.js');
+  // The same function the indexer's /metrics calls, now shared by every consumer.
+  const { consumerLag } = await import(pathToFileURL(join(ROOT, 'packages', 'kafka', 'dist', 'index.js')).href);
   const { INDEX_NAME, tenantAlias } = await mod('index-definition.js');
 
   const kafka = new Kafka({ clientId: 'verify-search-observability', brokers: process.env['KAFKA_BROKERS'].split(','), logLevel: logLevel.NOTHING });
@@ -213,7 +214,7 @@ async function main() {
     await stop();
     for (let n = 0; n < MISSED; n++) await send(n, 1);
     const whileDown = await waitFor(async () => {
-      const lag = await consumerLag(admin, GROUP, TOPIC);
+      const lag = await consumerLag(admin, GROUP, [TOPIC]);
       return lag.total !== null && lag.total >= MISSED ? lag : null;
     }, 15_000);
     check(
