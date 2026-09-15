@@ -10,11 +10,17 @@
     "generate": "prisma generate"
   },
   "dependencies": {
+    "@eventhub/auth-middleware": "workspace:*",
     "@eventhub/config": "workspace:*",
+    "@eventhub/kafka": "workspace:*",
     "@eventhub/logger": "workspace:*",
+    "@kafkajs/confluent-schema-registry": "^4.1.0",
     "@prisma/adapter-pg": "^7.9.0",
     "@prisma/client": "^7.9.0",
     "express": "^4.21.2",
+    "jose": "^6.2.4",
+    "kafkajs": "^2.2.4",
+    "nodemailer": "^10.0.10",
     "zod": "^3.24.1"
   },
   "devDependencies": {

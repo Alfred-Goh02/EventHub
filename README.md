@@ -82,10 +82,10 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |
-| `services/notification` | The start of the one service that will send email: its own database, and a sent-log under row-level security whose claim is unique per tenant. Nothing sends yet |
+| `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 63 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 64 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -222,7 +222,7 @@ docker compose up -d --wait
 
 That builds one image, shared by every application service, and then:
 
-1. waits for Postgres, Redis, Kafka, the Schema Registry, OpenSearch and ClickHouse to pass their healthchecks
+1. waits for Postgres, Redis, Kafka, the Schema Registry, OpenSearch, ClickHouse and Mailpit to pass their healthchecks
 2. runs a `setup` container that migrates all five databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
    migrates ClickHouse, and generates a signing keypair into a volume
@@ -254,6 +254,7 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Analytics | `http://localhost:3006/ready` |
 | Analytics ingest | `http://localhost:3016/metrics` |
 | Notification | `http://localhost:3007/ready` |
+| Mailpit, the local email inbox | `http://localhost:8025` |
 | Event relay | `http://localhost:3010/metrics` |
 | Ticketing relay | `http://localhost:3011/metrics` |
 | Auth relay | `http://localhost:3012/metrics` |
@@ -307,7 +308,7 @@ services stay down and the ports stay free for the ones you run yourself.
 half-started broker:
 
 ```bash
-docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse
+docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse mailpit
 ```
 
 The Postgres container creates all five databases and their roles on first boot
@@ -482,10 +483,12 @@ route is checked against another tenant's event. The failure drills run in CI:
 
 A rollup rebuild is `pnpm --filter @eventhub/analytics run rebuild-rollups`, with
 the ingest stopped first: a row that lands mid-rebuild would be counted twice.
-Chapter 8, notifications, has its foundation: its own database, reachable only by
-its own roles, and a sent-log under row-level security whose claim is unique per
-tenant. Nothing sends yet. Chapter 9, community, is designed and documented but
-not implemented.
+Chapter 8, notifications, is in progress. A password reset now reaches the inbox.
+Auth queues it encrypted to Notification's key and signed with its own, the relay
+publishes it, and Notification opens it, claims the delivery once and sends it. In
+compose it arrives at Mailpit, `http://localhost:8025`. Retries, preferences, rate
+limits and suppression are still to come. Chapter 9, community, is designed and
+documented but not implemented.
 
 Known gaps, named rather than hidden:
 

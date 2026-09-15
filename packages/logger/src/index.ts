@@ -47,6 +47,9 @@ const REDACT = [
   'authorization',
   'secret',
   'privateKey',
+  // A reset link carries its token. Notification holds one in memory for every
+  // email it sends, which is exactly the object an error path dumps to the log.
+  'link',
   '*.token',
   '*.tokenHash',
   '*.password',
@@ -56,6 +59,7 @@ const REDACT = [
   '*.authorization',
   '*.secret',
   '*.privateKey',
+  '*.link',
   'req.headers.authorization',
   'req.body.password',
   'headers.authorization',
