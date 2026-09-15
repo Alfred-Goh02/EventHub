@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The start of the one service that will send email: its own database, and a sent-log under row-level security whose claim is unique per tenant. Nothing sends yet |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and thirteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 60 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 61 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a

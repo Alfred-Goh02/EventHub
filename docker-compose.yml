@@ -354,6 +354,7 @@ services:
       NOTIFICATION_DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
     volumes:
       - jwt-keys:/app/services/auth/keys
+      - jwt-public:/app/public-keys
     command:
       - sh
       - -c
@@ -369,6 +370,14 @@ services:
           echo "setup: generating the JWT signing keypair"
           cd /app/services/auth && node scripts/generate-keys.mjs && cd /app
         fi
+
+        # ONLY THE PUBLIC HALF LEAVES jwt-keys. Every service that verifies a token
+        # mounts jwt-public instead. They used to mount jwt-keys itself, read-only,
+        # with private.pem at 0600 -- which kept out nobody, because every container
+        # runs as the same `node` user that owns the file. scripts/verify-key-custody.mjs
+        # asserts it from inside each container. Copied on every run, so a
+        # regenerated keypair cannot leave a stale public key behind.
+        cp /app/services/auth/keys/public.pem /app/public-keys/public.pem
 
         echo "setup: migrating auth"
         DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma migrate deploy
@@ -451,7 +460,7 @@ services:
       # only thing both can see. publicKeyFromEnv takes either form.
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
     volumes:
-      - jwt-keys:/run/eventhub/keys:ro
+      - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/event
     command: ["node", "dist/index.js"]
     healthcheck:
@@ -484,7 +493,7 @@ services:
       # would come from the environment, never from a committed file.
       PAYMENT_WEBHOOK_SECRET: dev_webhook_secret
     volumes:
-      - jwt-keys:/run/eventhub/keys:ro
+      - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/ticketing
     command: ["node", "dist/index.js"]
     healthcheck:
@@ -534,7 +543,7 @@ services:
       # only irritating. Production wants the real delay.
       LIVE_DRAIN_DELAY_MS: 0
     volumes:
-      - jwt-keys:/run/eventhub/keys:ro
+      - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/live
     command: ["node", "dist/index.js"]
     healthcheck:
@@ -606,7 +615,7 @@ services:
       # carries; a real deployment generates its own and never commits it.
       SEARCH_CURSOR_SECRET: local-development-cursor-secret-0123456789
     volumes:
-      - jwt-keys:/run/eventhub/keys:ro
+      - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/search
     command: ["node", "dist/index.js"]
     healthcheck:
@@ -620,7 +629,7 @@ services:
   # Analytics: the read side of ClickHouse. Connects as analytics_app — SELECT
   # and INSERT only — and never holds the migrator credential, which setup uses
   # and nothing else does. Verifies tokens with Auth's public key from the
-  # jwt-keys volume, as Search does: the tenant every query binds is the token's.
+  # jwt-public volume, as Search does: the tenant every query binds is the token's.
   # ---------------------------------------------------------------------------
   analytics:
     <<: *app
@@ -639,7 +648,7 @@ services:
       CLICKHOUSE_PASSWORD: analytics_app
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
     volumes:
-      - jwt-keys:/run/eventhub/keys:ro
+      - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/analytics
     command: ["node", "dist/index.js"]
     healthcheck:
@@ -720,5 +729,9 @@ volumes:
   opensearch-data:
   clickhouse-data:
   # The JWT keypair, generated once by setup. A volume rather than a bind mount
-  # so it never lands in the working tree, and never in an image layer.
+  # so it never lands in the working tree, and never in an image layer. Mounted by
+  # setup and Auth ONLY: it holds the private key, which can mint any token.
   jwt-keys:
+  # The public half alone, copied out of jwt-keys by setup on every run. This is
+  # the volume every service that verifies a token mounts.
+  jwt-public:
