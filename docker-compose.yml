@@ -589,6 +589,43 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
+  # The same relay, draining Ticketing's outbox: seat holds and purchases.
+  #
+  # One relay drains one database, so Ticketing's outbox needs an instance of its
+  # own. Until this was added compose ran only the Event relay, and Ticketing's
+  # messages committed and were never sent -- 290 were waiting on one local stack,
+  # the oldest for eleven days. scripts/verify-outbox-relays.mjs now requires a
+  # relay here for every service whose schema has an OutboxMessage table.
+  # ---------------------------------------------------------------------------
+  relay-ticketing:
+    <<: *app
+    container_name: eventhub-relay-ticketing
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3011:3011"
+    environment:
+      <<: *app-env
+      RELAY_DATABASE_URL: postgresql://eventhub_ticketing_relay:eventhub_ticketing_relay@postgres:5432/eventhub_ticketing
+      # A table that exists in THIS database and that the relay role must not read.
+      # The default, Event, is not in Ticketing's database, and the relay refuses to
+      # start rather than pass its privilege check against a missing table.
+      RELAY_FORBIDDEN_TABLE: Reservation
+      RELAY_METRICS_PORT: 3011
+      RELAY_BATCH_SIZE: 100
+      RELAY_POLL_INTERVAL_MS: 1000
+      RELAY_MAX_ATTEMPTS: 5
+    working_dir: /app/services/relay
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3011/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
   # Search: the indexer consuming events.activity into OpenSearch, and the
   # service that will answer queries.
   #

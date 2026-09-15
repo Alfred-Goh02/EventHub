@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The start of the one service that will send email: its own database, and a sent-log under row-level security whose claim is unique per tenant. Nothing sends yet |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and thirteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 61 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 62 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -226,7 +226,7 @@ That builds one image, shared by every application service, and then:
 2. runs a `setup` container that migrates all five databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
    migrates ClickHouse, and generates a signing keypair into a volume
-3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relay
+3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relays for Event and Ticketing
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
@@ -254,7 +254,8 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Analytics | `http://localhost:3006/ready` |
 | Analytics ingest | `http://localhost:3016/metrics` |
 | Notification | `http://localhost:3007/ready` |
-| Relay     | `http://localhost:3010/metrics` |
+| Event relay | `http://localhost:3010/metrics` |
+| Ticketing relay | `http://localhost:3011/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
 seeded admin, create an event through one service, and read it back out of
