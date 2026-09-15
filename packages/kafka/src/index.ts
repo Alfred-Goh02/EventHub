@@ -16,25 +16,28 @@ export interface ConsumerLag {
 }
 
 /**
- * How far ingest is behind, in MESSAGES: each partition's high-water mark minus
- * the group's committed offset, across every topic ingest reads. It is the one
- * number that says the analytics pipeline is broken — dashboards go stale exactly
- * as fast as it grows.
+ * How far a consumer group is behind, in MESSAGES: each partition's high-water
+ * mark minus the group's committed offset, across every topic the group reads.
  *
- * Offsets, not wall-clock time, for the reason Search's indexer measures them
- * (services/search/src/indexer/lag.ts): an idle topic and a dead consumer look
- * identical by "time since the last message", and Ticketing once reported 12329
- * seconds of lag on a healthy idle system that way. Adapted here rather than
- * shared, because that one reads a single topic and no shared Kafka package exists
- * yet; a third consumer needing it is the moment to move it into packages/.
+ * OFFSETS, NOT WALL-CLOCK TIME. Ticketing once reported "lag" as now minus the last
+ * message's timestamp, and read 12329 seconds on a healthy, caught-up, idle system.
+ * By that measure an idle topic and a dead consumer look the same. Offsets tell
+ * them apart: an idle topic has nothing past the committed offset, while a dead
+ * consumer's high-water mark keeps moving away from it.
  *
- * A partition the group has never committed on has no position, reported as null
- * rather than guessed.
+ * A partition the group has never committed on has no position, and it is reported
+ * as null rather than guessed. Under 'earliest' everything retained there is
+ * unread; under 'latest' none of it ever will be. Which is true is not something
+ * this function can know.
+ *
+ * SHARED, because three consumers need it: Search's indexer, Analytics' ingest and
+ * Notification's dispatch. It was copied once, from Search into Analytics, and the
+ * copy's own comment said a third consumer would be the moment to share it.
  */
-export async function consumerLag(admin: Admin, groupId: string, topics: string[]): Promise<ConsumerLag> {
+export async function consumerLag(admin: Admin, groupId: string, topics: readonly string[]): Promise<ConsumerLag> {
   const [topicOffsets, groupOffsets] = await Promise.all([
     Promise.all(topics.map(async (topic) => ({ topic, partitions: await admin.fetchTopicOffsets(topic) }))),
-    admin.fetchOffsets({ groupId, topics }),
+    admin.fetchOffsets({ groupId, topics: [...topics] }),
   ]);
 
   const committedBy = new Map<string, number>();

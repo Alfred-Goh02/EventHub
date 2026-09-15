@@ -66,6 +66,7 @@ COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.jso
 COPY --chown=node:node contracts/package.json ./contracts/
 COPY --chown=node:node packages/auth-middleware/package.json ./packages/auth-middleware/
 COPY --chown=node:node packages/config/package.json ./packages/config/
+COPY --chown=node:node packages/kafka/package.json ./packages/kafka/
 COPY --chown=node:node packages/logger/package.json ./packages/logger/
 COPY --chown=node:node packages/tsconfig/package.json ./packages/tsconfig/
 COPY --chown=node:node packages/types/package.json ./packages/types/

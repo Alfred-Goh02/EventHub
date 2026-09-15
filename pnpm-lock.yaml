@@ -79,6 +79,16 @@ importers:
         specifier: workspace:*
         version: link:../tsconfig
 
+  packages/kafka:
+    dependencies:
+      kafkajs:
+        specifier: ^2.2.4
+        version: 2.2.4
+    devDependencies:
+      '@eventhub/tsconfig':
+        specifier: workspace:*
+        version: link:../tsconfig
+
   packages/logger:
     dependencies:
       pino:
@@ -108,6 +118,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/kafka':
+        specifier: workspace:*
+        version: link:../../packages/kafka
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger
@@ -372,6 +385,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/kafka':
+        specifier: workspace:*
+        version: link:../../packages/kafka
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger

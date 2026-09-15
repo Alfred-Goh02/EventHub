@@ -5,7 +5,7 @@ import { ZodError } from 'zod';
 import type { Logger } from '@eventhub/logger';
 import { INGEST_TOPICS, isIngestTopic, toRows } from './mappers.js';
 import { writeMessages, type MessageRows } from './writer.js';
-import { consumerLag, type ConsumerLag } from './lag.js';
+import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
 
 interface DlqRow {
   source_topic: string;
@@ -286,7 +286,7 @@ export function createIngestor(opts: {
       opts.logger.info({ group: opts.groupId, topics: Object.keys(INGEST_TOPICS), startFrom: opts.startFrom }, 'ingest running');
     },
 
-    /** Messages behind, per partition of every ingest topic. See lag.ts. */
+    /** Messages behind, per partition of every ingest topic. See @eventhub/kafka. */
     lag(): Promise<ConsumerLag> {
       return consumerLag(admin, opts.groupId, Object.keys(INGEST_TOPICS));
     },

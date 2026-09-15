@@ -13,6 +13,7 @@
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
     "@eventhub/config": "workspace:*",
+    "@eventhub/kafka": "workspace:*",
     "@eventhub/logger": "workspace:*",
     "@eventhub/types": "workspace:*",
     "@kafkajs/confluent-schema-registry": "^4.1.0",

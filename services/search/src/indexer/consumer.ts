@@ -5,7 +5,7 @@ import type { Logger } from '@eventhub/logger';
 import { eventSnapshot } from './contract.js';
 import { toIndexAction, type IndexAction } from './to-document.js';
 import { bulkIndex, type ItemOutcome } from './bulk.js';
-import { consumerLag, type ConsumerLag } from './lag.js';
+import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
 
 const TOPIC = 'events.activity';
 const DLQ = 'events.activity.dlq';
@@ -245,9 +245,9 @@ export function createIndexer(opts: {
       opts.logger.info({ topic: TOPIC, group: opts.groupId, startFrom: opts.startFrom }, 'indexer running');
     },
 
-    /** Messages behind, per partition. See lag.ts. */
+    /** Messages behind, per partition. See @eventhub/kafka. */
     lag(): Promise<ConsumerLag> {
-      return consumerLag(admin, opts.groupId, TOPIC);
+      return consumerLag(admin, opts.groupId, [TOPIC]);
     },
 
     async stop(): Promise<void> {
