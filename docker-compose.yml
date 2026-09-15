@@ -351,6 +351,7 @@ services:
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
       TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
+      NOTIFICATION_DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
     volumes:
       - jwt-keys:/app/services/auth/keys
     command:
@@ -377,6 +378,8 @@ services:
         DATABASE_URL="$$TICKETING_DATABASE_URL" pnpm --filter @eventhub/ticketing exec prisma migrate deploy
         echo "setup: migrating live"
         DATABASE_URL="$$LIVE_DATABASE_URL" pnpm --filter @eventhub/live exec prisma migrate deploy
+        echo "setup: migrating notification"
+        DATABASE_URL="$$NOTIFICATION_DATABASE_URL" pnpm --filter @eventhub/notification exec prisma migrate deploy
 
         # Auth only. Every service's prisma.config.ts declares the same seed
         # command and only Auth has the file, so running this against the others
@@ -677,6 +680,35 @@ services:
     command: ["node", "dist/consumer.js"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3016/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Notification: its own database and nothing else yet. No Kafka consumer and no
+  # email provider until the parts that send. Connects as eventhub_notification_app,
+  # which owns nothing, and refuses to start as a role that could bypass RLS.
+  # ---------------------------------------------------------------------------
+  notification:
+    <<: *app
+    container_name: eventhub-notification
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3007:3007"
+    environment:
+      <<: *app-env
+      PORT: 3007
+      DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
+      APP_DATABASE_URL: postgresql://eventhub_notification_app:eventhub_notification_app@postgres:5432/eventhub_notification
+    working_dir: /app/services/notification
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      # /ready, not /health: it queries Postgres as the app role, and nothing else
+      # here would notice the database being unreachable.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3007/ready >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6

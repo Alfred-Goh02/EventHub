@@ -70,6 +70,7 @@ COPY --chown=node:node services/analytics/package.json ./services/analytics/
 COPY --chown=node:node services/auth/package.json ./services/auth/
 COPY --chown=node:node services/event/package.json ./services/event/
 COPY --chown=node:node services/live/package.json ./services/live/
+COPY --chown=node:node services/notification/package.json ./services/notification/
 COPY --chown=node:node services/relay/package.json ./services/relay/
 COPY --chown=node:node services/search/package.json ./services/search/
 COPY --chown=node:node services/ticketing/package.json ./services/ticketing/
