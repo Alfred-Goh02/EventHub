@@ -48,6 +48,38 @@ export async function signAccessToken(
     .sign(privateKey);
 }
 
+/** Who a sealed email request is for, and what kind of token it is. */
+export const EMAIL_REQUEST_AUDIENCE = 'eventhub-notification';
+export const EMAIL_REQUEST_TYPE = 'auth-email+jwt';
+
+/**
+ * Signs the claims sealed inside an email request to Notification.
+ *
+ * With the access-token key, told apart by audience and type. Notification is to
+ * accept only aud `eventhub-notification` with typ `auth-email+jwt`. Every API
+ * verifier requires aud JWT_AUDIENCE and a role claim, which this token has
+ * neither of. So neither kind of token is accepted as the other.
+ *
+ * Here rather than in email-request.ts so that the private key never leaves this
+ * module.
+ */
+export async function signEmailRequest(params: {
+  subject: string;
+  jti: string;
+  expiresAt: Date;
+  claims: Record<string, string>;
+}): Promise<string> {
+  return new SignJWT(params.claims)
+    .setProtectedHeader({ alg: ALG, typ: EMAIL_REQUEST_TYPE })
+    .setSubject(params.subject)
+    .setJti(params.jti)
+    .setIssuer(ISSUER!)
+    .setAudience(EMAIL_REQUEST_AUDIENCE)
+    .setIssuedAt()
+    .setExpirationTime(params.expiresAt)
+    .sign(privateKey);
+}
+
 /**
  * There is no verifyAccessToken here, and that is deliberate.
  *

@@ -85,6 +85,17 @@ const TOPICS = [
     note: 'Live Q&A activity, for durable analytics. Real-time fan-out is Redis, not this.',
   },
   {
+    topic: 'auth.email-requested',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // A day, not the broker's week. What travels here is sealed, so retention is not
+    // what protects the link. But the link inside dies thirty minutes after it is
+    // issued, so a day-old request can only ever be dropped, and keeping ciphertext
+    // of dead credentials longer buys nothing.
+    configEntries: [{ name: 'retention.ms', value: '86400000' }],
+    note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
+  },
+  {
     topic: 'community.feed',
     numPartitions: 3,
     replicationFactor: 1,

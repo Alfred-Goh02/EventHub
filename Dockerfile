@@ -51,8 +51,10 @@ RUN npm install -g pnpm@9.15.0
 # deliberately -- a signing key must never be in a layer), so without this the
 # volume would be created root-owned and the setup container could not write
 # the keypair into it. /app/public-keys is the same, for the volume setup copies
-# ONLY the public half into -- the one every verifying service mounts.
-RUN mkdir -p /app/services/auth/keys /app/public-keys && chown -R node:node /app
+# ONLY the public half into -- the one every verifying service mounts. And
+# /app/services/notification/keys, for the volume Notification's keypair lives in.
+RUN mkdir -p /app/services/auth/keys /app/public-keys /app/services/notification/keys \
+ && chown -R node:node /app
 USER node
 
 WORKDIR /app
