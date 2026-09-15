@@ -1880,6 +1880,13 @@ jobs:
             || { echo "only $examples .env.example files in the image — this check is looking at the wrong place"; exit 1; }
           echo "  no secrets, and $examples committed examples present"
 
+      # A private key is readable only where it belongs. Every verifying service
+      # used to mount the whole jwt-keys volume, private.pem included, and they all
+      # run as the user that owns it -- so any of them could mint an admin token.
+      # Asserted from inside each running container, not from the compose file.
+      - name: Assert only Auth can read Auth's private key
+        run: node scripts/verify-key-custody.mjs
+
       # Healthy is not the same as working. Every assertion below crosses a
       # container boundary that a healthcheck cannot see.
       - name: Prove it works end to end
@@ -1896,7 +1903,7 @@ jobs:
           echo "  signed in as the seeded admin"
 
           # THE CROSS-SERVICE ASSERTION. Event holds no private key; it verifies
-          # this token with the PUBLIC half, read from the shared volume via
+          # this token with the PUBLIC half, read from the jwt-public volume via
           # AUTH_PUBLIC_KEY_FILE. A 201 here is the only proof that path works,
           # and it is a path the native CI job never takes -- it passes the key as
           # a base64 environment value instead.
