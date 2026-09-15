@@ -613,6 +613,13 @@ jobs:
       - name: Assert the image installs every workspace package
         run: node scripts/verify-dockerfile-workspaces.mjs
 
+      # An outbox nothing drains is a queue of messages that committed and are
+      # never sent, and nothing errors. Compose ran a relay for Event only, while
+      # Ticketing's seat holds and purchases waited for one. Every service whose
+      # schema has an OutboxMessage table must have a relay in compose.
+      - name: Assert every outbox has a relay in compose
+        run: node scripts/verify-outbox-relays.mjs
+
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
       # `authorization` carried no `*.authorization` while all six of its
@@ -1949,7 +1956,8 @@ jobs:
           curl -sf http://localhost:3002/health >/dev/null
           curl -sf http://localhost:3003/health >/dev/null
           curl -sf http://localhost:3010/metrics >/dev/null
-          echo "  all four services still answering"
+          curl -sf http://localhost:3011/metrics >/dev/null
+          echo "  all five services still answering"
 
       - name: Logs
         if: failure()
