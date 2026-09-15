@@ -12,6 +12,12 @@ x-app: &app
   build:
     context: .
   restart: unless-stopped
+  # Time after SIGTERM to leave consumer groups and close connections before Docker
+  # kills the process. Set rather than left to a default: every container on the
+  # machine this was written on had been created with a one-second stop timeout, so
+  # Notification was killed mid-disconnect (exit 137), and its consumers stayed in
+  # their groups until the 30 s session timeout.
+  stop_grace_period: 15s
   environment: &app-env
     NODE_ENV: development
     LOG_LEVEL: info

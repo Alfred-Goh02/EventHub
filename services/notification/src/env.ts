@@ -25,6 +25,16 @@ const notificationEnvSchema = z.object({
    * before the service first ran is still delivered if its link has not expired.
    */
   DISPATCH_START_FROM: z.enum(['earliest', 'latest']).default('earliest'),
+  /**
+   * How long each retry tier waits, in milliseconds: one per tier topic, in order.
+   * The defaults are spent inside the thirty minutes a reset link lives. A verifier
+   * shortens them to seconds.
+   */
+  DISPATCH_RETRY_DELAYS_MS: z
+    .string()
+    .default('30000,300000,900000')
+    .transform((list) => list.split(',').map((part) => Number(part.trim())))
+    .pipe(z.array(z.number().int().positive()).length(3)),
 
   SMTP_HOST: z.string().min(1),
   SMTP_PORT: z.coerce.number().int().positive(),

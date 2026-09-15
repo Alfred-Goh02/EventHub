@@ -95,6 +95,27 @@ const TOPICS = [
     configEntries: [{ name: 'retention.ms', value: '86400000' }],
     note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
   },
+  // Notification's delayed retries. Kafka has no delayed delivery, so each delay is
+  // a topic: a send that failed for a reason that may pass waits in the next tier,
+  // and its source partition moves on. A day's retention is far past any tier's
+  // delay; nothing is meant to sit in these for long.
+  ...['notification.retry.1', 'notification.retry.2', 'notification.retry.3'].map((topic, i) => ({
+    topic,
+    numPartitions: 3,
+    replicationFactor: 1,
+    configEntries: [{ name: 'retention.ms', value: '86400000' }],
+    note: `Notification retry tier ${i + 1}. Keyed by user id, like the message it holds.`,
+  })),
+  {
+    topic: 'notification.dlq',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // Kept forever, for the reason events.activity.dlq is: only deliveries that can
+    // never succeed, or ran out of retries, land here, so its size is bounded by
+    // failures rather than traffic, and each one is for a person to look at.
+    configEntries: [{ name: 'retention.ms', value: '-1' }],
+    note: 'Deliveries that are poison or ran out of retries. Inspect, then replay deliberately.',
+  },
   {
     topic: 'community.feed',
     numPartitions: 3,
