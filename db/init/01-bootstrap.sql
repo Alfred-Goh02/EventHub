@@ -74,6 +74,14 @@ CREATE ROLE eventhub_event_relay LOGIN          PASSWORD 'eventhub_event_relay';
 ALTER ROLE eventhub_event_relay SET idle_in_transaction_session_timeout = '30s';
 ALTER ROLE eventhub_event_relay SET statement_timeout = '15s';
 
+-- Drains Auth's outbox. Same shape as the Event and Ticketing relays. What it
+-- publishes is sealed email requests, which are ciphertext, but it still reads by
+-- delivery state across every tenant, so it is a role that can read the outbox and
+-- nothing else.
+CREATE ROLE eventhub_auth_relay LOGIN PASSWORD 'eventhub_auth_relay';
+ALTER ROLE eventhub_auth_relay SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_auth_relay SET statement_timeout = '15s';
+
 -- ---------------------------------------------------------------------------
 -- One database per service. No cross-database joins exist in Postgres, so the
 -- service boundary is enforced by the engine rather than by discipline.
@@ -91,7 +99,7 @@ CREATE DATABASE eventhub_notification OWNER eventhub_notification_owner;
 -- reads, but the boundary should hold at the connection, not one layer in.
 -- ---------------------------------------------------------------------------
 REVOKE CONNECT ON DATABASE eventhub_auth  FROM PUBLIC;
-GRANT  CONNECT ON DATABASE eventhub_auth  TO eventhub_auth_owner, eventhub_auth_app;
+GRANT  CONNECT ON DATABASE eventhub_auth  TO eventhub_auth_owner, eventhub_auth_app, eventhub_auth_relay;
 
 REVOKE CONNECT ON DATABASE eventhub_event FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_event TO eventhub_event_owner, eventhub_event_app, eventhub_event_relay;
@@ -118,7 +126,7 @@ GRANT  CONNECT ON DATABASE eventhub_notification TO eventhub_notification_owner,
 -- denied" instead of quietly serving another tenant's rows. Fail closed.
 -- ---------------------------------------------------------------------------
 \connect eventhub_auth
-GRANT USAGE ON SCHEMA public TO eventhub_auth_app;
+GRANT USAGE ON SCHEMA public TO eventhub_auth_app, eventhub_auth_relay;
 
 \connect eventhub_event
 GRANT USAGE ON SCHEMA public TO eventhub_event_app, eventhub_event_relay;

@@ -393,6 +393,12 @@ jobs:
         working-directory: services/auth
         run: node scripts/generate-keys.mjs
 
+      # Notification's keypair, whose public half the script copies into
+      # services/auth/keys. Auth refuses to start without it, because a reset it
+      # issued could never be delivered, so this runs before anything boots Auth.
+      - name: Generate Notification's keypair
+        run: node services/notification/scripts/generate-keys.mjs
+
       # Can a fresh clone actually START these services?
       #
       # Every service ships a .env.example whose first line says "Copy to .env
@@ -913,6 +919,13 @@ jobs:
       # as two different clients.
       - name: Assert /login stops a guesser without locking out the account's owner
         run: node scripts/verify-login-rate-limit.mjs
+
+      # A password-reset email leaves Auth sealed: encrypted to Notification's key,
+      # signed by Auth's. Searched for the real token in the outbox row and in the
+      # bytes on the topic, and the link from inside the seal must still reset the
+      # password. Starts its own Auth with the dev sink on, to learn that token.
+      - name: Assert a reset email is queued sealed, and its link still works
+        run: node scripts/verify-email-request.mjs
 
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
@@ -1957,7 +1970,8 @@ jobs:
           curl -sf http://localhost:3003/health >/dev/null
           curl -sf http://localhost:3010/metrics >/dev/null
           curl -sf http://localhost:3011/metrics >/dev/null
-          echo "  all five services still answering"
+          curl -sf http://localhost:3012/metrics >/dev/null
+          echo "  all six services still answering"
 
       - name: Logs
         if: failure()

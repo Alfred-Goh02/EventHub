@@ -11,6 +11,7 @@
     "@kafkajs/confluent-schema-registry": "^4.1.0",
     "@types/node": "^26.2.0",
     "avsc": "^5.7.9",
+    "jose": "^6.2.4",
     "kafkajs": "^2.2.4",
     "pg": "^8.22.0",
     "turbo": "^2.10.7",

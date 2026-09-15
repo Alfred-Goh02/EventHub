@@ -133,3 +133,39 @@ model PasswordResetToken {
   @@index([userId])
   @@index([tenantId])
 }
+
+/// Auth's outbox: messages that commit with the change that caused them, and are
+/// published to Kafka by a relay afterwards.
+///
+/// The same shape as Event's and Ticketing's, because the relay reads `topic` off
+/// the row and is otherwise routing-free: draining this table takes a different
+/// connection string and nothing else.
+///
+/// Today it carries one kind of message, a sealed email request, and its payload
+/// is ciphertext (see src/email-request.ts). A dump of this table yields neither a
+/// link nor an address.
+model OutboxMessage {
+  id       String @id @default(cuid())
+  tenantId String
+
+  seq BigInt @default(autoincrement())
+
+  topic         String
+  eventType     String
+  schemaVersion Int    @default(1)
+  aggregateId   String
+
+  payload     Json
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  attempts       Int       @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deadLetteredAt DateTime?
+
+  /// NOTE: the drain, prune and backoff indexes are partial, so they are raw SQL
+  /// in the migration; Prisma cannot express a partial index. Ticketing's schema
+  /// explains why a plain (publishedAt, seq) index degrades as the backlog grows.
+  @@index([tenantId])
+}

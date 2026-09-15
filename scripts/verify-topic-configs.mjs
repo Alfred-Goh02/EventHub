@@ -52,6 +52,12 @@ const EXPECTED = [
     value: 'compact',
     why: 'the projection is rebuilt by replaying this topic from the beginning',
   },
+  {
+    topic: 'auth.email-requested',
+    name: 'retention.ms',
+    value: '86400000',
+    why: 'a sealed link is dead thirty minutes after issue, so a day covers any outage worth waiting out',
+  },
 ];
 
 async function main() {

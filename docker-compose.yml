@@ -355,6 +355,7 @@ services:
     volumes:
       - jwt-keys:/app/services/auth/keys
       - jwt-public:/app/public-keys
+      - notification-keys:/app/services/notification/keys
     command:
       - sh
       - -c
@@ -378,6 +379,13 @@ services:
         # asserts it from inside each container. Copied on every run, so a
         # regenerated keypair cannot leave a stale public key behind.
         cp /app/services/auth/keys/public.pem /app/public-keys/public.pem
+
+        # Notification's keypair, which Auth seals email requests to. The script
+        # keeps an existing keypair, and on every run copies ONLY the public half
+        # into jwt-keys, where Auth reads it. The private half stays in
+        # notification-keys, which nothing but Notification will mount.
+        echo "setup: Notification's keypair"
+        node /app/services/notification/scripts/generate-keys.mjs
 
         echo "setup: migrating auth"
         DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma migrate deploy
@@ -626,6 +634,38 @@ services:
       start_period: 10s
 
   # ---------------------------------------------------------------------------
+  # The same relay, draining Auth's outbox: sealed email requests.
+  #
+  # What it publishes is ciphertext (see services/auth/src/email-request.ts), but it
+  # still reads every tenant's rows, so it gets what the others get: a role that can
+  # read the outbox and nothing else, checked at boot against User.
+  # ---------------------------------------------------------------------------
+  relay-auth:
+    <<: *app
+    container_name: eventhub-relay-auth
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3012:3012"
+    environment:
+      <<: *app-env
+      RELAY_DATABASE_URL: postgresql://eventhub_auth_relay:eventhub_auth_relay@postgres:5432/eventhub_auth
+      RELAY_FORBIDDEN_TABLE: User
+      RELAY_METRICS_PORT: 3012
+      RELAY_BATCH_SIZE: 100
+      RELAY_POLL_INTERVAL_MS: 1000
+      RELAY_MAX_ATTEMPTS: 5
+    working_dir: /app/services/relay
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3012/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
   # Search: the indexer consuming events.activity into OpenSearch, and the
   # service that will answer queries.
   #
@@ -772,3 +812,6 @@ volumes:
   # The public half alone, copied out of jwt-keys by setup on every run. This is
   # the volume every service that verifies a token mounts.
   jwt-public:
+  # Notification's keypair, generated once by setup. Its public half is copied into
+  # jwt-keys for Auth to seal to; the private half never leaves this volume.
+  notification-keys:

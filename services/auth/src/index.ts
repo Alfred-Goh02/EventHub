@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
@@ -13,6 +13,8 @@ import { issueRefreshToken, rotateRefreshToken, revokeFamily } from './tokens.js
 import { issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
 import { issueResetToken, lookupResetToken } from './password-reset.js';
 import { emitDevToken } from './dev-sink.js';
+import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
+import { emit } from './outbox.js';
 import { createRateLimiter } from './rate-limit.js';
 
 const env = loadBaseEnv();
@@ -611,23 +613,53 @@ app.post('/forgot-password', ah(async (req, res) => {
   const issued = await withTenant(tenantId, async (tx) => {
     const user = await tx.user.findUnique({
       where: { tenantId_email: { tenantId, email } },
-      select: { id: true },
+      select: { id: true, email: true },
     });
 
     // No such user in this tenant. Write nothing, and say the same thing.
     if (!user) return null;
 
-    // Revoking siblings and creating the new token share this transaction, so a
-    // crash between them cannot leave two live resets — or none.
-    return issueResetToken(tx, { userId: user.id, tenantId });
+    // Revoking siblings, creating the new token and queueing the email all share
+    // this transaction. A crash cannot leave two live resets, or none, or a live
+    // token that nobody was ever sent.
+    const reset = await issueResetToken(tx, { userId: user.id, tenantId });
+    const link = `${RESET_URL_BASE}/reset-password?token=${reset.token}`;
+
+    // The id is chosen here rather than by the database, because the seal carries
+    // it as its jti and the seal is made before the row exists.
+    const messageId = randomUUID();
+    const sealed = await sealEmailRequest({
+      messageId,
+      tenantId,
+      userId: user.id,
+      email: user.email,
+      link,
+      kind: 'PASSWORD_RESET',
+      expiresAt: reset.expiresAt,
+    });
+
+    // Only ciphertext and identifiers reach the outbox, and so the topic. The link
+    // and the address are inside `sealed`.
+    await emit(tx, {
+      id: messageId,
+      tenantId,
+      topic: AUTH_EMAIL_TOPIC,
+      eventType: 'PasswordResetRequested',
+      aggregateId: user.id,
+      payload: {
+        tenantId,
+        userId: user.id,
+        kind: 'PASSWORD_RESET',
+        expiresAt: reset.expiresAt.toISOString(),
+        sealed,
+      },
+    });
+
+    return { link };
   });
 
   if (issued) {
-    emitDevToken(logger, 'password-reset', {
-      email,
-      tenantId,
-      url: `${RESET_URL_BASE}/reset-password?token=${issued.token}`,
-    });
+    emitDevToken(logger, 'password-reset', { email, tenantId, url: issued.link });
   }
 
   return res.status(202).json(accepted);
