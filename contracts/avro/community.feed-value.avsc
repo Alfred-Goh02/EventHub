@@ -1,0 +1,65 @@
+{
+  "type": "record",
+  "name": "CommunityActivity",
+  "namespace": "eventhub.community",
+  "doc": "Something a person did in a space: a post, a comment, a reaction. ONE RECORD WITH A DISCRIMINATOR rather than a record per kind, because a Schema Registry subject holds one schema — registering a second record name against community.feed-value is rejected with 409 NAME_MISMATCH. events.activity-value carries the same shape for the same reason.",
+  "fields": [
+    {
+      "name": "messageId",
+      "type": "string",
+      "doc": "The OutboxMessage id. Stable across relay retries, so a consumer can recognise a redelivery — (topic, partition, offset) cannot, because a redelivered message gets a new offset. Delivery is at-least-once, so every consumer dedupes on this."
+    },
+    {
+      "name": "occurredAt",
+      "type": "string",
+      "doc": "ISO-8601. When the change was committed, taken from the outbox row, NOT when it was published — which can be much later after a backlog."
+    },
+    {
+      "name": "tenantId",
+      "type": "string",
+      "doc": "Required, and deliberately in the payload as well as derivable elsewhere. A Kafka topic is NOT tenant-scoped: Postgres enforces isolation with FORCE RLS, Kafka enforces nothing, and anything holding the consumer group's credentials reads every tenant. A consumer must pass this to its own tenant scoping rather than trusting a wide-open role."
+    },
+    {
+      "name": "spaceId",
+      "type": "string",
+      "doc": "Also the Kafka message key, so everything about one space shares a partition and stays ordered: a comment can never be read before the post it answers."
+    },
+    {
+      "name": "kind",
+      "type": {
+        "type": "enum",
+        "name": "ActivityKind",
+        "symbols": ["POST_CREATED", "COMMENT_CREATED", "REACTION_ADDED", "REACTION_REMOVED"]
+      },
+      "doc": "What happened. Adding a symbol later is backward-compatible for readers that have it; a reader on the older schema rejects the unknown symbol, which is why consumers are written to skip kinds they do not know."
+    },
+    {
+      "name": "actorId",
+      "type": "string",
+      "doc": "Who did it. A User id from Auth's database; there is no foreign key, because that table is in another database this service cannot open."
+    },
+    {
+      "name": "postId",
+      "type": "string",
+      "doc": "The post this is about. A comment and a reaction both carry the post they belong to, so a consumer counting a post's activity never has to look one up."
+    },
+    {
+      "name": "commentId",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Set for COMMENT_CREATED, and for a reaction to a comment."
+    },
+    {
+      "name": "parentCommentId",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "The comment being replied to, when there is one. What a notification consumer needs to tell someone their comment was answered."
+    },
+    {
+      "name": "body",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "The text, for consumers that index or render it. Nullable because a reaction has none."
+    }
+  ]
+}

@@ -984,6 +984,18 @@ jobs:
       - name: Assert space roles and the rate limiter hold
         run: node scripts/verify-community-membership.mjs
 
+      # A post and its event are ONE COMMIT: the outbox row is read back beside the
+      # post, then the relay publishes it and this reads it off community.feed,
+      # decoded against the registered schema and keyed by the space. A thread's
+      # shape is the database's job — paths and depths come back a, a.b, a.b.c, a
+      # parent on another post is refused by the NOT NULL on path rather than by a
+      # separate SELECT, and the ninth level by the CHECK. Reacting twice counts
+      # once, and the rank score is recomputed here from the counters every time,
+      # because a score drifting from its counters is invisible until the feed order
+      # is wrong.
+      - name: Assert a post, its thread and its reactions, and the event they commit with
+        run: node scripts/verify-community-posts.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

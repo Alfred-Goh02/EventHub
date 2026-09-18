@@ -64,6 +64,12 @@ const EXPECTED = [
     value: '-1',
     why: 'a delivery that can never succeed must outlive the week nobody looked at it',
   },
+  {
+    topic: 'community.feed',
+    name: 'retention.ms',
+    value: '604800000',
+    why: 'the sequence is the information here, so a week of it survives a consumer being down for a weekend',
+  },
   ...['notification.retry.1', 'notification.retry.2', 'notification.retry.3'].map((topic) => ({
     topic,
     name: 'retention.ms',

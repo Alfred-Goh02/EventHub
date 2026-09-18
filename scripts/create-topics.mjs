@@ -95,6 +95,17 @@ const TOPICS = [
     configEntries: [{ name: 'retention.ms', value: '86400000' }],
     note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
   },
+  {
+    topic: 'community.feed',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // A week, on `delete` rather than compact. The SEQUENCE is the information here —
+    // a post, then its comments, then the reactions — so keeping only the latest
+    // message per key would throw away the thing consumers are reading. Long enough
+    // for a consumer to be down for a weekend and catch up.
+    configEntries: [{ name: 'retention.ms', value: '604800000' }],
+    note: 'Community activity: posts, comments and reactions. Keyed by space id, so one space stays ordered.',
+  },
   // Notification's delayed retries. Kafka has no delayed delivery, so each delay is
   // a topic: a send that failed for a reason that may pass waits in the next tier,
   // and its source partition moves on. A day's retention is far past any tier's
