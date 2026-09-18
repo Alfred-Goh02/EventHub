@@ -3,7 +3,7 @@ import { Router, type RequestHandler } from 'express';
 import { z } from 'zod';
 import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { withTenant } from '../db.js';
 import { forgetMembership, readMembership, requireMembership, type SpaceRole } from '../middleware/space.js';
 

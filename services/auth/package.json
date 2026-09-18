@@ -12,6 +12,7 @@
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
     "@eventhub/config": "workspace:*",
+    "@eventhub/http": "workspace:*",
     "@eventhub/logger": "workspace:*",
     "@eventhub/types": "workspace:*",
     "@node-rs/argon2": "^2.0.2",

@@ -3,7 +3,7 @@ import { Router, type Request } from 'express';
 import pg from 'pg';
 import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { settleAttempt } from '../payments/settle.js';
 import { attachPoolErrorHandler } from '../pool.js';
 

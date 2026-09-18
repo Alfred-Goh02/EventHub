@@ -79,6 +79,18 @@ importers:
         specifier: workspace:*
         version: link:../tsconfig
 
+  packages/http:
+    devDependencies:
+      '@eventhub/tsconfig':
+        specifier: workspace:*
+        version: link:../tsconfig
+      '@types/express':
+        specifier: ^4.17.21
+        version: 4.17.25
+      express:
+        specifier: ^4.21.2
+        version: 4.22.2
+
   packages/kafka:
     dependencies:
       kafkajs:
@@ -155,6 +167,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/http':
+        specifier: workspace:*
+        version: link:../../packages/http
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger
@@ -210,6 +225,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/http':
+        specifier: workspace:*
+        version: link:../../packages/http
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger
@@ -253,6 +271,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/http':
+        specifier: workspace:*
+        version: link:../../packages/http
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger
@@ -498,6 +519,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/http':
+        specifier: workspace:*
+        version: link:../../packages/http
       '@eventhub/logger':
         specifier: workspace:*
         version: link:../../packages/logger

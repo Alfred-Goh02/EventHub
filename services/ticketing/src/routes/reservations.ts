@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { withTenantRetry } from '../db.js';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { requireAuth } from '../auth.js';
 import { emit } from '../outbox.js';
 import { projectionIsCurrent, secondsSinceHeartbeat } from '../consumer.js';

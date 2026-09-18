@@ -1,7 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { withTenant } from '../db.js';
 import { env } from '../env.js';
 import { redis } from '../redis.js';

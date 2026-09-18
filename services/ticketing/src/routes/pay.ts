@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { createLogger } from '@eventhub/logger';
 import { withTenantRetry } from '../db.js';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { requireAuth } from '../auth.js';
 import { emit } from '../outbox.js';
 import { FakePaymentProvider, withTimeout, type PaymentProvider } from '../payments/provider.js';
