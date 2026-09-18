@@ -1,5 +1,6 @@
 import pg from 'pg';
 import type { Logger } from '@eventhub/logger';
+import { attachPoolErrorHandler } from '../pool.js';
 import { assertSweeperIsLeastPrivilege, sweepOnce } from './sweep.js';
 
 /**
@@ -20,16 +21,19 @@ export function createSweeper(opts: {
   batchSize: number;
   logger: Logger;
 }) {
-  const pool = new pg.Pool({
-    connectionString: opts.databaseUrl,
-    // Named, so pg_stat_activity says which pool a connection belongs to rather than
-    // leaving an operator to guess at a stuck backend.
-    application_name: 'notification-sweeper',
-    max: 2,
-    connectionTimeoutMillis: 10_000,
-    idleTimeoutMillis: 30_000,
-  });
-  pool.on('error', (err) => opts.logger.error({ err }, 'sweeper pool error'));
+  const pool = attachPoolErrorHandler(
+    new pg.Pool({
+      connectionString: opts.databaseUrl,
+      // Named, so pg_stat_activity says which pool a connection belongs to rather than
+      // leaving an operator to guess at a stuck backend.
+      application_name: 'notification-sweeper',
+      max: 2,
+      connectionTimeoutMillis: 10_000,
+      idleTimeoutMillis: 30_000,
+    }),
+    opts.logger,
+    'notification-sweeper',
+  );
 
   const counters = { abandoned: 0, passes: 0, failures: 0 };
   let last: { at: number; oldestPendingMs: number | null } | null = null;

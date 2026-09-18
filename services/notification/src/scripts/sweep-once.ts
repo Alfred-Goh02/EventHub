@@ -1,5 +1,7 @@
 import pg from 'pg';
 import { z } from 'zod';
+import { createLogger } from '@eventhub/logger';
+import { attachPoolErrorHandler } from '../pool.js';
 import { assertSweeperIsLeastPrivilege, sweepOnce } from '../sweeper/sweep.js';
 
 /**
@@ -24,7 +26,11 @@ const env = z
   .parse(process.env);
 
 async function main(): Promise<void> {
-  const pool = new pg.Pool({ connectionString: env.SWEEPER_DATABASE_URL, application_name: 'notification-sweep-once', max: 1 });
+  const pool = attachPoolErrorHandler(
+    new pg.Pool({ connectionString: env.SWEEPER_DATABASE_URL, application_name: 'notification-sweep-once', max: 1 }),
+    createLogger('notification-sweep-once'),
+    'notification-sweep-once',
+  );
   try {
     await assertSweeperIsLeastPrivilege(pool);
     const result = await sweepOnce(pool, { stuckAfterMs: env.SWEEP_STUCK_AFTER_MS, batchSize: env.SWEEP_BATCH_SIZE });
