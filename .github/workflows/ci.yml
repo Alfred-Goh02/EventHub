@@ -54,6 +54,8 @@ jobs:
       LIVE_APP_DATABASE_URL: postgresql://eventhub_live_app:eventhub_live_app@localhost:5432/eventhub_live
       NOTIFICATION_DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@localhost:5432/eventhub_notification
       NOTIFICATION_APP_DATABASE_URL: postgresql://eventhub_notification_app:eventhub_notification_app@localhost:5432/eventhub_notification
+      COMMUNITY_DATABASE_URL: postgresql://eventhub_community_owner:eventhub_community_owner@localhost:5432/eventhub_community
+      COMMUNITY_APP_DATABASE_URL: postgresql://eventhub_community_app:eventhub_community_app@localhost:5432/eventhub_community
       # The sweeper credential. The reconciler runs on it, and the payment
       # webhook uses it for ONE statement: resolving which tenant a payment
       # belongs to. A webhook arrives with no tenant, and every table here is
@@ -218,6 +220,12 @@ jobs:
         working-directory: services/notification
         env:
           DATABASE_URL: ${{ env.NOTIFICATION_DATABASE_URL }}
+        run: pnpm exec prisma migrate deploy
+
+      - name: Apply migrations (community)
+        working-directory: services/community
+        env:
+          DATABASE_URL: ${{ env.COMMUNITY_DATABASE_URL }}
         run: pnpm exec prisma migrate deploy
 
       - name: Seed
@@ -957,6 +965,14 @@ jobs:
       # refuses to start if it can. A young PENDING row beside them must survive.
       - name: Assert deliveries claimed and never finished are ended, and nothing else is
         run: node scripts/verify-notification-sweeper.mjs
+
+      # Community's database, before a single route exists. Every tenant-scoped table
+      # isolates — with the table list READ FROM THE DATABASE, so one added later
+      # without a policy fails here — the moderation trail cannot be rewritten, a
+      # thread cannot nest past its cap, the outbox's two readers reach exactly as far
+      # as they should, and every unique key leads with the tenant.
+      - name: Assert Community's tables isolate, and its audit trail cannot be rewritten
+        run: node scripts/verify-community-foundation.mjs
 
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
@@ -1828,6 +1844,12 @@ jobs:
           # the reason is written out in the RLS migration.
           control "$NOTIFICATION_DATABASE_URL" notification
           check "$NOTIFICATION_DATABASE_URL" notification "'_prisma_migrations'"
+
+          # Community has NO exemptions either. Every table here belongs to a tenant,
+          # including the audit trail and the outbox, which carries the relay's own
+          # policy rather than an exemption.
+          control "$COMMUNITY_DATABASE_URL" community
+          check "$COMMUNITY_DATABASE_URL" community "'_prisma_migrations'"
 
       # Database-per-service must hold at the CONNECTION boundary, not merely at
       # the table grants: a credential that can open a session can still

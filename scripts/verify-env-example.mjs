@@ -43,6 +43,7 @@ const SERVICES = [
   { name: 'ticketing', portVar: 'PORT', port: 3903, path: '/health' },
   { name: 'relay', portVar: 'RELAY_METRICS_PORT', port: 3904, path: '/metrics' },
   { name: 'live', portVar: 'PORT', port: 3905, path: '/health' },
+  { name: 'community', portVar: 'PORT', port: 3910, path: '/ready' },
   // /ready: it answers 200 only once the example's APP_DATABASE_URL has reached
   // Postgres, and the process only listens after refusing a role that bypasses RLS.
   { name: 'notification', portVar: 'PORT', port: 3909, path: '/ready' },
