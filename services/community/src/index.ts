@@ -1,7 +1,11 @@
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
+import { redis } from './redis.js';
+import { createRateLimiter } from './ratelimit.js';
+import { spaceRoutes } from './routes/spaces.js';
 
 /**
  * The Community service: spaces, posts, threaded comments, reactions and moderation.
@@ -25,11 +29,25 @@ app.get('/health', (_req, res) => {
  * is refused.
  */
 app.get('/ready', async (_req, res) => {
-  const database = await prisma.$queryRaw`SELECT 1`.then(
-    () => true,
-    () => false,
-  );
-  res.status(database ? 200 : 503).json({ ready: database, database });
+  const [database, cache] = await Promise.all([
+    prisma.$queryRaw`SELECT 1`.then(
+      () => true,
+      () => false,
+    ),
+    redis.ping().then(
+      () => true,
+      () => false,
+    ),
+  ]);
+  /**
+   * REDIS IS REPORTED, NOT REQUIRED.
+   *
+   * Without it the membership cache falls through to Postgres and the rate limiter
+   * opens: slower and less bounded, but every route still answers correctly. Refusing
+   * traffic would turn a cache outage into an outage, which is the wrong trade for the
+   * thing the cache is for.
+   */
+  res.status(database ? 200 : 503).json({ ready: database, database, cache });
 });
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -40,6 +58,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');
   await prisma.$disconnect().catch(() => {});
+  await redis.quit().catch(() => {});
   process.exit(0);
 }
 
@@ -49,6 +68,18 @@ process.on('SIGINT', () => void shutdown('SIGINT'));
 async function main(): Promise<void> {
   // Refuse to start rather than run with tenant isolation silently disabled.
   await assertRuntimeRoleCannotBypassRls();
+
+  // The PUBLIC half only: this service verifies tokens and mints none.
+  const requireAuth = createRequireAuth({
+    publicKey: await publicKeyFromEnv(),
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
+  });
+  const limiter = createRateLimiter(logger);
+
+  // Mounted behind requireAuth as a group, so a route added later cannot be reachable
+  // unauthenticated by forgetting one middleware argument.
+  app.use(requireAuth, spaceRoutes(logger, limiter, env.RATE_LIMIT_JOIN_PER_MINUTE));
 
   app.listen(env.PORT, () => {
     logger.info(`community-service listening on port ${env.PORT}`);

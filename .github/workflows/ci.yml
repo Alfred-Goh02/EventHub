@@ -974,6 +974,16 @@ jobs:
       - name: Assert Community's tables isolate, and its audit trail cannot be rewritten
         run: node scripts/verify-community-foundation.mjs
 
+      # Who may act in a space, and how often. A private space answers 404 rather than
+      # 403, so its existence is not confirmed to a stranger; space roles are read per
+      # request and the cache is dropped by whatever changes them, so a promotion takes
+      # effect on the next call; and the token bucket is per user, per tenant and
+      # ATOMIC — the burst check fires more requests at once than the bucket holds and
+      # requires exactly the bucket's worth to pass, which a read-then-write limiter
+      # cannot do.
+      - name: Assert space roles and the rate limiter hold
+        run: node scripts/verify-community-membership.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

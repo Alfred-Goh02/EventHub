@@ -16,6 +16,30 @@ const communityEnvSchema = z.object({
   /** A token is acted on only if Auth issued it, for this issuer and audience. */
   JWT_ISSUER: z.string().min(1),
   JWT_AUDIENCE: z.string().min(1),
+
+  /** Where the membership cache and the rate limiter's buckets live. */
+  REDIS_URL: z.string().url(),
+
+  /**
+   * How long a membership lookup is cached.
+   *
+   * Space roles are mutable authorisation, so they cannot live in a 15-minute access
+   * token: demoting a moderator has to take effect now. The cache is invalidated
+   * explicitly whenever a role or status changes, and this is only the ceiling for a
+   * change made some other way — straight in psql, say.
+   */
+  MEMBERSHIP_CACHE_TTL_S: z.coerce.number().int().positive().default(60),
+
+  /**
+   * Per user, per action, per minute. Community is the one service where an ordinary
+   * user creates unbounded rows, and a per-IP limit at a gateway cannot express "five
+   * posts but sixty reactions" because it does not know what the endpoint means.
+   */
+  RATE_LIMIT_JOIN_PER_MINUTE: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_POST_PER_MINUTE: z.coerce.number().int().positive().default(5),
+  RATE_LIMIT_COMMENT_PER_MINUTE: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_REACTION_PER_MINUTE: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_REPORT_PER_MINUTE: z.coerce.number().int().positive().default(10),
 });
 
 const base = loadBaseEnv();
