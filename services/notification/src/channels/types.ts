@@ -21,7 +21,8 @@ export interface SendResult {
 
 /**
  * The provider refused this message for a reason repeating will not fix, such as an
- * address it rejects outright. Recorded as FAILED, and the partition moves on.
+ * address it rejects outright. Recorded as FAILED, and the partition moves on; when
+ * the refusal proves the address does not exist, the address is suppressed as well.
  *
  * Anything else a send throws is taken as transient: the offset is not committed
  * and the message comes back. Getting that wrong one way stalls the partition
@@ -29,6 +30,20 @@ export interface SendResult {
  */
 export class PermanentSendError extends Error {
   override name = 'PermanentSendError';
+
+  constructor(
+    message: string,
+    /**
+     * The provider said the ADDRESS does not exist, not merely that it refused this
+     * message. Only then is the address suppressed; channels/smtp.ts says which
+     * replies count, and why so few do.
+     */
+    readonly addressDoesNotExist = false,
+    /** The enhanced status code, such as 5.1.1, when the reply had one. Never the reply's text, which can repeat the address. */
+    readonly status: string | null = null,
+  ) {
+    super(message);
+  }
 }
 
 export interface EmailChannel {

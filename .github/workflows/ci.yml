@@ -941,6 +941,15 @@ jobs:
       - name: Assert failed sends are retried without blocking, and run out into the DLQ
         run: node scripts/verify-email-retries.mjs
 
+      # When the recipient's server says the address does not exist. A 550 5.1.1
+      # suppresses it for that tenant, and the next reset is recorded SUPPRESSED
+      # without a single RCPT TO, even once the server would accept it. A 5.7.1 or a
+      # bare 550 suppresses nothing, another tenant with the same address still gets
+      # its email, suppression:remove lifts it, and reply text repeating the address
+      # reaches no row or Kafka header.
+      - name: Assert an address that does not exist is suppressed, and only such an address
+        run: node scripts/verify-email-suppression.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

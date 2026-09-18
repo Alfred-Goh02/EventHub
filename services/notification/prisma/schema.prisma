@@ -65,3 +65,31 @@ model NotificationDelivery {
   /// What retention cleanup reads.
   @@index([createdAt])
 }
+
+/// Addresses not to send to again, per tenant, because the recipient's own mail
+/// server said they do not exist. channels/smtp.ts decides which refusals count, and
+/// dispatch/suppression.ts says why the address is kept only as a hash.
+///
+/// Under the same RLS as the sent-log. The process that sends may read, add, and
+/// extend, and never remove: lifting a suppression is `suppression:remove`, run as
+/// the owner.
+model EmailSuppression {
+  id               String   @id @default(cuid())
+  tenantId         String
+  /// sha256 of the trimmed, lower-cased address. Never the address.
+  addressHash      String
+  /// HARD_BOUNCE. A COMPLAINT reason arrives with the SES webhook.
+  reason           String
+  /// The enhanced status code, such as 5.1.1. Never the reply's text, which can repeat the address.
+  smtpStatus       String?
+  /// The delivery whose refusal recorded it last.
+  sourceDeliveryId String?
+  /// When it stops applying, so a relay that was wrong about a live mailbox cannot
+  /// lock its owner out for good. Each new hard bounce moves it out again.
+  expiresAt        DateTime
+  /// How many hard bounces this address has produced.
+  bounces          Int      @default(1)
+  createdAt        DateTime @default(now())
+
+  @@unique([tenantId, addressHash])
+}
