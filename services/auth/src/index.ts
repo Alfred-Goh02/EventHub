@@ -4,7 +4,7 @@ import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
-import { ah } from './async.js';
+import { ah } from '@eventhub/http';
 import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
