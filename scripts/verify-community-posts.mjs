@@ -238,12 +238,38 @@ async function main() {
     const outbox = await inTenant(
       owner,
       TENANT,
-      `SELECT id, topic, "eventType", "aggregateId", payload FROM "OutboxMessage" WHERE payload->>'postId' = $1 ORDER BY seq`,
+      /**
+       * The timestamps are compared IN SQL, deliberately.
+       *
+       * OutboxMessage.createdAt is `timestamp without time zone` holding UTC, and node-
+       * postgres parses such a column as LOCAL time. Read into JS on this machine the
+       * row came back eight hours off — the local offset, to the millisecond — and
+       * comparing it to the payload would have failed on a correct service and passed
+       * on CI, which runs in UTC. Postgres comparing its own column to its own rendering
+       * has no timezone to get wrong.
+       */
+      `SELECT id, topic, "eventType", "aggregateId", payload,
+              to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAtIso",
+              payload->>'occurredAt' = to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "clockMatches"
+         FROM "OutboxMessage" WHERE payload->>'postId' = $1 ORDER BY seq`,
       [postId],
     );
     const row = outbox.rows[0];
     check(outbox.rows.length === 1 && row.topic === TOPIC && row.aggregateId === spaceId, `and one outbox row for ${TOPIC}, keyed by the space (${outbox.rows.length}, ${row?.topic}, key ${row?.aggregateId === spaceId ? 'matches' : row?.aggregateId})`);
     check(row?.payload?.messageId === row?.id, 'whose payload carries the row id, so a redelivery is recognisable');
+    /**
+     * occurredAt IS THE ROW'S OWN TIMESTAMP, TO THE MILLISECOND.
+     *
+     * The schema says it is when the change was committed and consumers order on it.
+     * Built from the app's `new Date()` it was really this process's clock, which
+     * drifts from the database's — invisible on one machine, and exactly the kind of
+     * skew that reorders a merged feed in production. Compared as instants, so a
+     * rendering difference is not read as agreement.
+     */
+    check(
+      row?.clockMatches === true,
+      `and a timestamp from the database, not this process's clock (${row?.payload?.occurredAt} vs row ${row?.createdAtIso})`,
+    );
     check(row?.payload?.kind === 'POST_CREATED' && row?.payload?.body === `hello ${RUN}`, `and the post itself (${row?.payload?.kind})`);
     // Without a row there is nothing to publish and nothing below can mean anything, so
     // this ends here rather than throwing halfway through the next section.

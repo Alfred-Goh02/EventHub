@@ -91,7 +91,9 @@ function activity(
     // The outbox row's own id: stable across relay retries, which is what lets a
     // consumer recognise a redelivery. A Kafka offset changes on republish.
     messageId: id,
-    occurredAt: new Date().toISOString(),
+    // Overwritten below from the DATABASE clock. This placeholder only fixes the key's
+    // position in the object; nothing reads it.
+    occurredAt: null as string | null,
     tenantId: message.tenantId,
     spaceId: message.spaceId,
     kind: message.kind,
@@ -101,10 +103,28 @@ function activity(
     parentCommentId: message.parentCommentId ?? null,
     body: message.body ?? null,
   };
+  /**
+   * occurredAt COMES FROM THE DATABASE, not from this process.
+   *
+   * The schema says it is when the change was committed, and consumers order on it.
+   * Built from `new Date()` it was really the app's clock, which disagrees with the
+   * row's own createdAt by whatever the two clocks disagree by — and Community is one
+   * of several services writing to topics a consumer merges. Stamping it in the same
+   * statement, from the same now() the row's createdAt defaults to, makes the payload
+   * and the row agree and removes app-to-database skew from the ordering field.
+   *
+   * to_char rather than to_jsonb(now()): Postgres renders a timestamptz as
+   * "2026-09-18 19:42:01.123+00", which is not ISO-8601 and not what the schema
+   * promises.
+   */
   return tx.$executeRaw`
-    INSERT INTO "OutboxMessage" (id, "tenantId", topic, "eventType", "schemaVersion", "aggregateId", payload)
-    VALUES (${id}, ${message.tenantId}, ${TOPIC}, ${`community.${message.kind.toLowerCase()}`}, ${SCHEMA_VERSION},
-            ${message.spaceId}, ${JSON.stringify(payload)}::jsonb)`;
+    INSERT INTO "OutboxMessage" (id, "tenantId", topic, "eventType", "schemaVersion", "aggregateId", payload, "createdAt")
+    SELECT ${id}, ${message.tenantId}, ${TOPIC}, ${`community.${message.kind.toLowerCase()}`}, ${SCHEMA_VERSION},
+           ${message.spaceId},
+           jsonb_set(${JSON.stringify(payload)}::jsonb, '{occurredAt}',
+                     to_jsonb(to_char(t.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))),
+           t.at
+      FROM (SELECT date_trunc('milliseconds', now()) AS at) t`;
 }
 
 export function postRoutes(

@@ -317,6 +317,31 @@ The fix is to assert the effect on the row — `publishedAt` is set for THIS mes
 id — rather than the behaviour of the process the verifier happens to have started.
 Same family as checking what owns a port before trusting its answer.
 
+## Timestamps come from the database, and are compared there
+
+Prisma maps `DateTime` to `timestamp WITHOUT time zone`, and node-postgres reads
+such a column as LOCAL time and writes a JS `Date` into it as local wall time.
+Containers run UTC, so this is invisible in compose and in CI — and a verifier
+spawns services on the HOST, which here is UTC+8.
+
+Community's outbox payload carried `occurredAt: new Date().toISOString()` while
+the schema said it was the row's commit time and consumers order on it. It was
+really the app's clock: measured 2 ms from the row's own `createdAt` on one
+machine with both clocks correct, and the gap across services is whatever their
+clocks disagree by. It is stamped in the same statement now, from the same
+`now()` the row defaults to.
+
+Then the *assertion* for it made the mirror-image mistake — reading `createdAt`
+into JS and comparing `Date.parse()` — and reported an eight-hour difference, to
+the millisecond, on a correct service. It would have failed here and passed on
+CI. The comparison happens in SQL now; Postgres comparing its own column to its
+own rendering has no timezone to get wrong.
+
+The rest of the repository is already safe because it does all of this in SQL:
+`now()`, `now() + ($4 || ' seconds')::interval`, `extract(epoch from now() - ...)`.
+Keep it that way — never pass a JS `Date` into one of these columns, and never
+compare one in JS.
+
 ## The right value for the wrong reason is not a passing test
 
 `community.feed` was added to `create-topics.mjs` asking for
