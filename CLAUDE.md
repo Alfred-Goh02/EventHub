@@ -302,6 +302,30 @@ columns. On ClickHouse 25.8, `EXPLAIN indexes = 1` shows it using `event_id` onl
 whether the list is a parameter or literals, so it reads every tenant's granules.
 Two separate `IN` lists use both columns.
 
+## A cleanup filtered by the policy it ignores deletes nothing, quietly
+
+`verify-community-foundation.mjs` ended with a DELETE per tenant per table as the
+owner, and then counted what was left. Both ran with **no `app.tenant_id` set**.
+FORCE row security binds the owner, so the DELETE matched zero rows — and the
+count asked through the same filter, saw an empty table, and reported "0 left".
+A cleanup that works and a cleanup that deletes nothing were indistinguishable,
+and the error was swallowed by `.catch(() => {})`.
+
+It ran that way for several chapters. Every run left two `OutboxMessage` rows on
+community.feed with a payload of `{}`, which no relay can ever encode. Eight rows
+and four abandoned runs later, a relay pass in a *different* verifier claimed one,
+dead-lettered it, exited 1, and failed CI — which is the only reason anyone
+looked. Locally it stayed hidden, because compose's relay-community had already
+dead-lettered them; CI starts infrastructure only, so there they were still
+waiting.
+
+Measured, with the delete reverted: `0 deleted, 22 left`. Fixed: `22 deleted,
+0 left`.
+
+Two rules fall out. A cleanup runs in the same context the writes ran in. And it
+reports what it **deleted**, not only what remains — `0 deleted, 0 left` passing
+is exactly the bug, so the delete count is the positive control.
+
 ## The compose stack may be doing your verifier's work for it
 
 A verifier ran the relay itself with `--once` and asserted the pass exited 0. That
