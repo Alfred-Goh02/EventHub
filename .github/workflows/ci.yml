@@ -994,7 +994,10 @@ jobs:
       # the unique key and an open set let one account invent a kind per request and
       # run a post's rank up. The score is recomputed here from the counters every
       # time, since a score drifting from its counters is invisible until the feed
-      # order is wrong.
+      # order is wrong. Every symbol in ActivityKind is drained and decoded against
+      # the registered schema, not just the one the first section publishes: this job
+      # starts infrastructure only, so relay-community is not here to drain what the
+      # run leaves behind, and three of the four kinds had no coverage at all.
       - name: Assert a post, its thread and its reactions, and the event they commit with
         run: node scripts/verify-community-posts.mjs
 

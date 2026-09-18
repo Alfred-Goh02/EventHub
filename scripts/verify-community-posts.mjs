@@ -20,6 +20,10 @@
  *   - A reaction kind the server did not name is refused. kind is part of the unique
  *     key, so without a closed set one account can invent a kind per request and run a
  *     post's rank up as far as the limiter allows.
+ *   - EVERY symbol in ActivityKind encodes and decodes against the registered schema,
+ *     with the nullable fields its kind implies. Only POST_CREATED was read off the
+ *     topic at first; the comment and reaction rows sat in the outbox, and CI starts
+ *     infrastructure only, so nothing else would have drained them.
  *   - Another tenant's token finds none of it.
  *
  * Scoped to two tenants created for this run.
@@ -390,6 +394,52 @@ async function main() {
     const removedAgain = await api(`/posts/${postId}/reactions/LIKE`, { method: 'DELETE', bearer: asReader });
     const afterRemoval = await inTenant(owner, TENANT, `SELECT "reactionCount" FROM "Post" WHERE id = $1`, [postId]);
     check(removed.status === 204 && removedAgain.status === 404 && afterRemoval.rows[0].reactionCount === 0, `removing it reverses both, once (${removed.status}, ${removedAgain.status}, count ${afterRemoval.rows[0].reactionCount})`);
+
+    console.log('');
+    console.log('  every kind this service emits encodes and decodes');
+    /**
+     * ALL FOUR SYMBOLS, NOT JUST THE ONE THE FIRST SECTION HAPPENED TO PUBLISH.
+     *
+     * Only POST_CREATED was ever read off the topic. The comment and reaction rows sat
+     * in the outbox unread, so three of the four symbols in ActivityKind had never been
+     * encoded against the registered schema by anything — and CI would not have caught
+     * it, because `build and verify` starts infrastructure only. relay-community is not
+     * running there, so nothing else drains what this leaves behind. A field this
+     * service writes that the schema does not declare would have reached a consumer
+     * before it reached a test.
+     *
+     * One row per event type, so this stays four messages however many the run made.
+     */
+    const kinds = await inTenant(
+      owner,
+      TENANT,
+      `SELECT DISTINCT ON ("eventType") id, "eventType" FROM "OutboxMessage"
+        WHERE "tenantId" = $1 ORDER BY "eventType", seq`,
+      [TENANT],
+    );
+    const EXPECTED_KINDS = ['POST_CREATED', 'COMMENT_CREATED', 'REACTION_ADDED', 'REACTION_REMOVED'];
+    check(
+      kinds.rows.length === EXPECTED_KINDS.length,
+      `CONTROL: the run emitted all ${EXPECTED_KINDS.length} event types (${kinds.rows.map((r) => r.eventType).join(', ')})`,
+    );
+    const secondPass = await relayOnce();
+    check(secondPass.code === 0, `a second relay pass did not error (${secondPass.code})${secondPass.code === 0 ? '' : `:\n${excerpt(secondPass.log)}`}`);
+    const everyKind = await readFeed(kinds.rows.map((r) => r.id));
+    const decoded = [...everyKind.values()].map((m) => m.value?.kind).sort();
+    check(
+      decoded.length === EXPECTED_KINDS.length && EXPECTED_KINDS.every((k) => decoded.includes(k)),
+      `each one decodes against the registered schema (${decoded.join(', ') || 'none'})`,
+    );
+    // The nullable fields are what a record-with-a-discriminator gets wrong: a reaction
+    // has no body and no comment, a reply has both a comment and a parent.
+    const byKind = Object.fromEntries([...everyKind.values()].map((m) => [m.value?.kind, m.value]));
+    check(
+      byKind['REACTION_ADDED']?.body === null &&
+        byKind['REACTION_ADDED']?.commentId === null &&
+        byKind['COMMENT_CREATED']?.commentId !== null &&
+        byKind['COMMENT_CREATED']?.body !== null,
+      `and carries the fields its kind implies, null where it has none (reaction body ${String(byKind['REACTION_ADDED']?.body)}, comment id ${byKind['COMMENT_CREATED']?.commentId ? 'set' : 'null'})`,
+    );
 
     console.log('');
     console.log('  the limiter covers posting too');
