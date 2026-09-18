@@ -1983,6 +1983,19 @@ jobs:
           docker compose logs relay ticketing --tail 60
           exit 1
 
+      # The notification chain, in the containers rather than natively. Every other
+      # email verifier runs the services from the working tree, with keys from it and
+      # a fake SMTP server, so none of them touches what this does: Auth sealing with
+      # the keypair the setup container generated, Notification opening it with the
+      # private half from the notification-keys volume that only it mounts, relay-auth
+      # draining Auth's outbox inside the network, and Mailpit receiving the mail.
+      #
+      # It adds its own user to the seeded tenant and takes it away again, because a
+      # verifier that resets a seeded account's password leaves the README's own
+      # sign-in example broken for the next reader.
+      - name: Prove a password reset crosses the whole stack
+        run: node scripts/verify-compose-password-reset.mjs
+
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
       # issued, and the symptom is a 401 with no explanation.
