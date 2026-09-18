@@ -85,7 +85,13 @@ async function main(): Promise<void> {
 
   // Mounted behind requireAuth as a group, so a route added later cannot be reachable
   // unauthenticated by forgetting one middleware argument.
-  app.use(requireAuth, spaceRoutes(logger, limiter, env.RATE_LIMIT_JOIN_PER_MINUTE));
+  app.use(
+    requireAuth,
+    spaceRoutes(logger, limiter, {
+      space: env.RATE_LIMIT_SPACE_PER_MINUTE,
+      join: env.RATE_LIMIT_JOIN_PER_MINUTE,
+    }),
+  );
   app.use(
     requireAuth,
     postRoutes(logger, limiter, {

@@ -38,7 +38,11 @@ const memberSchema = z
     message: 'give a role, a status, or both',
   });
 
-export function spaceRoutes(logger: Logger, limit: { middleware: (action: string, perMinute: number) => RequestHandler }, joinsPerMinute: number): Router {
+export function spaceRoutes(
+  logger: Logger,
+  limit: { middleware: (action: string, perMinute: number) => RequestHandler },
+  limits: { space: number; join: number },
+): Router {
   const router = Router();
 
   /**
@@ -47,7 +51,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
    * Two statements would leave a space nobody can moderate if the second failed — and
    * the only route that could fix it is one that requires a moderator.
    */
-  router.post('/spaces', ah(async (req, res) => {
+  router.post('/spaces', limit.middleware('space', limits.space), ah(async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     const { tenantId, userId } = getAuth(req);
@@ -81,7 +85,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
    * Idempotent: joining twice is the same as joining once, because a retry after a
    * dropped response must not be an error.
    */
-  router.post('/spaces/:spaceId/join', limit.middleware('join', joinsPerMinute), ah(async (req, res) => {
+  router.post('/spaces/:spaceId/join', limit.middleware('join', limits.join), ah(async (req, res) => {
     const { tenantId, userId } = getAuth(req);
     const spaceId = req.params['spaceId']!;
 

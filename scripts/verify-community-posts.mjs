@@ -57,12 +57,15 @@ const POSTS_PER_MINUTE = 3;
 const COMMENTS_PER_MINUTE = 40;
 /** Low, so the truncation boundary is four comments away rather than five hundred. */
 const THREAD_PAGE_LIMIT = 3;
+/** This run makes one space, so the space limiter can be met in three requests. */
+const SPACES_PER_MINUTE = 2;
 
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
   RATE_LIMIT_COMMENT_PER_MINUTE: String(COMMENTS_PER_MINUTE),
   RATE_LIMIT_POST_PER_MINUTE: String(POSTS_PER_MINUTE),
   THREAD_PAGE_LIMIT: String(THREAD_PAGE_LIMIT),
+  RATE_LIMIT_SPACE_PER_MINUTE: String(SPACES_PER_MINUTE),
   AUTH_PUBLIC_KEY_B64: Buffer.from(readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem'), 'utf8')).toString('base64'),
 });
 const relayEnv = serviceEnv(ROOT, 'relay', {
@@ -400,6 +403,25 @@ async function main() {
     const made = burst.filter((r) => r.status === 201).length;
     const refused = burst.filter((r) => r.status === 429).length;
     check(made === POSTS_PER_MINUTE && refused === 2, `past ${POSTS_PER_MINUTE} a minute the rest are refused (${made} written, ${refused} refused)`);
+
+    /**
+     * AND CREATING A SPACE, WHICH NOTHING METERED.
+     *
+     * It was the only write in this service without a limiter, in the service whose own
+     * env comment calls it out for unbounded rows — and the heaviest, since a space is
+     * a container other people join. Its own user, for a whole budget.
+     */
+    const asFounder = token(TENANT, `u_founder_${RUN}`);
+    const founded = [];
+    for (let i = 0; i < SPACES_PER_MINUTE + 1; i++) {
+      founded.push(await api('/spaces', { method: 'POST', bearer: asFounder, body: { slug: `sp-${i}-${RUN}`, name: `Space ${i}` } }));
+    }
+    const built = founded.filter((r) => r.status === 201).length;
+    const stopped = founded.filter((r) => r.status === 429).length;
+    check(
+      built === SPACES_PER_MINUTE && stopped === 1,
+      `and creating spaces is metered too (${built} created, ${stopped} refused)`,
+    );
 
     console.log('');
     console.log("  another tenant's post is not there");
