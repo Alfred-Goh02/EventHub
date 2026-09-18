@@ -820,6 +820,10 @@ services:
       PORT: 3007
       DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
       APP_DATABASE_URL: postgresql://eventhub_notification_app:eventhub_notification_app@postgres:5432/eventhub_notification
+      # A third role for the sweep that ends deliveries claimed and never finished:
+      # it crosses tenants, so it is not the API's credential. SELECT and a
+      # three-column UPDATE, and the service refuses to sweep on anything wider.
+      SWEEPER_DATABASE_URL: postgresql://eventhub_notification_sweeper:eventhub_notification_sweeper@postgres:5432/eventhub_notification
       KAFKA_CONSUMER_GROUP: notification-dispatch
       # Verifies Auth's signature inside each seal. The public half only.
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
