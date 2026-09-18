@@ -17,6 +17,9 @@
  *   - Reacting twice counts once, and the rank score always equals the formula
  *     recomputed here from the counters. A counter and its derived score drifting apart
  *     is invisible until the feed order is wrong, so it is asserted every time.
+ *   - A reaction kind the server did not name is refused. kind is part of the unique
+ *     key, so without a closed set one account can invent a kind per request and run a
+ *     post's rank up as far as the limiter allows.
  *   - Another tenant's token finds none of it.
  *
  * Scoped to two tenants created for this run.
@@ -176,8 +179,13 @@ async function main() {
     await consumer.connect();
     await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
     const found = new Map();
+    // Every message this consumer saw, this run's or not. Without it, "nothing arrived"
+    // cannot be told from "the consumer never fetched at all" — which is the difference
+    // between a broken relay and a consumer that had not finished joining its group.
+    let seen = 0;
     await consumer.run({
       eachMessage: async ({ message }) => {
+        seen += 1;
         const id = message.headers?.['message-id']?.toString();
         if (!id || !messageIds.includes(id)) return;
         found.set(id, {
@@ -191,6 +199,7 @@ async function main() {
     await waitFor(async () => found.size >= messageIds.length, timeoutMs, 250);
     await sleep(300);
     await consumer.disconnect();
+    found.seen = seen;
     return found;
   }
 
@@ -245,10 +254,38 @@ async function main() {
     console.log('');
     console.log('  the relay publishes what the transaction left behind');
     const drained = await relayOnce();
-    check(drained.code === 0, `CONTROL: a relay pass over Community's outbox exited 0 (${drained.code})${drained.code === 0 ? '' : `:\n${excerpt(drained.log)}`}`);
+    check(drained.code === 0, `a relay pass over Community's outbox did not error (${drained.code})${drained.code === 0 ? '' : `:\n${excerpt(drained.log)}`}`);
+    /**
+     * AN EXIT CODE OF 0 IS TRUE OF A RELAY THAT PUBLISHED NOTHING — AND SOMEONE ELSE
+     * MAY HAVE DONE THE PUBLISHING.
+     *
+     * This line was labelled CONTROL and carried the whole section on `code === 0`.
+     * Two things were wrong with that. It is true of a pass that found nothing to do;
+     * and compose runs relay-community against this same outbox, so with the stack up
+     * the row is published whether this pass runs or not. Deleting the call to
+     * relayOnce() left every assertion below green, which is what a control must never
+     * do.
+     *
+     * publishedAt is the relay's own record of having handed THIS row to Kafka,
+     * whichever relay did it. Asserting it makes the section fail when nothing was
+     * published, and separates a relay that never published from a consumer that never
+     * read.
+     */
+    const published = await inTenant(owner, TENANT, `SELECT "publishedAt", "lastError" FROM "OutboxMessage" WHERE id = $1`, [row.id]);
+    // `rows[0]?.publishedAt !== null` was the first version of this, and it is true of
+    // NO ROW as well as of a published one — the assertion would have held most
+    // strongly in the case it exists to rule out. The row has to be there and the
+    // column has to be set.
+    const publishedAt = published.rows.length === 1 ? published.rows[0].publishedAt : undefined;
+    check(
+      publishedAt instanceof Date,
+      `CONTROL: and marked the row published, so a missing message below is the read's fault${
+        publishedAt instanceof Date ? ` (${publishedAt.toISOString()})` : ` — it did not (${published.rows.length} row(s), publishedAt ${String(publishedAt)}, lastError ${published.rows[0]?.lastError ?? 'none'})\n${excerpt(drained.log)}`
+      }`,
+    );
     const feed = await readFeed([row.id]);
     const message = feed.get(row.id);
-    check(Boolean(message), message ? 'the message is on community.feed' : `nothing arrived on ${TOPIC} for that row`);
+    check(Boolean(message), message ? 'the message is on community.feed' : `nothing arrived on ${TOPIC} for that row (the consumer read ${feed.seen} message(s) in all)`);
     check(message?.key === spaceId, `keyed by the space, so one space stays ordered (${message?.key === spaceId ? 'yes' : message?.key})`);
     check(message?.value?.kind === 'POST_CREATED' && message?.value?.postId === postId, `and decodes against the registered schema (${message?.value?.kind})`);
     check(message?.tenant === TENANT, `carrying its tenant in a header for consumers that scope by it (${message?.tenant === TENANT ? 'yes' : message?.tenant})`);
@@ -311,6 +348,23 @@ async function main() {
       Math.abs(Number(counted.rows[0].rankScore) - Number(counted.rows[0].expected)) < 1e-9,
       `and the score still equals the formula over the counters (${counted.rows[0].rankScore} vs ${counted.rows[0].expected})`,
     );
+    /**
+     * A KIND THE SERVER DID NOT NAME IS NOT A REACTION.
+     *
+     * kind is part of the unique key, so two different kinds from the same user are two
+     * rows and two increments. With any upper-case string accepted, one account could
+     * invent a kind per request and run a post's reactionCount — and therefore its rank
+     * — as high as the limiter allows, forever. The count below is asserted to stay at
+     * one: without the allow-list it reaches three.
+     */
+    const invented = await api(`/posts/${postId}/reactions`, { method: 'POST', bearer: asReader, body: { kind: 'AAAA' } });
+    const invented2 = await api(`/posts/${postId}/reactions`, { method: 'POST', bearer: asReader, body: { kind: 'AAAB' } });
+    const afterInvented = await inTenant(owner, TENANT, `SELECT "reactionCount" FROM "Post" WHERE id = $1`, [postId]);
+    check(
+      invented.status === 400 && invented2.status === 400 && afterInvented.rows[0].reactionCount === 1,
+      `an invented kind is refused, so one account cannot inflate a rank (${invented.status}, ${invented2.status}, count ${afterInvented.rows[0].reactionCount})`,
+    );
+
     const removed = await api(`/posts/${postId}/reactions/LIKE`, { method: 'DELETE', bearer: asReader });
     const removedAgain = await api(`/posts/${postId}/reactions/LIKE`, { method: 'DELETE', bearer: asReader });
     const afterRemoval = await inTenant(owner, TENANT, `SELECT "reactionCount" FROM "Post" WHERE id = $1`, [postId]);

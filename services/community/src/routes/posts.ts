@@ -37,9 +37,25 @@ const SCHEMA_VERSION = 1;
 const rankScore = (reactions: Prisma.Sql, comments: Prisma.Sql, createdAt: Prisma.Sql) =>
   Prisma.sql`ln(greatest(${reactions} + 2 * ${comments}, 1) + 1) + extract(epoch from ${createdAt}) / 45000.0`;
 
+/**
+ * THE REACTION KINDS ARE A CLOSED SET, and that is a ranking control, not tidiness.
+ *
+ * `kind` is part of the Reaction unique key, so two different kinds from the same user
+ * are two rows and two increments of reactionCount — which feeds rankScore. Accepting
+ * any upper-case string, as the first version did, let one account invent a kind per
+ * request and push a post's rank as far as the rate limiter allowed. The verifier
+ * measured it: one user, two invented kinds, the count went from one to three.
+ *
+ * A closed set makes the unique key do what it looks like it does — one reaction per
+ * person per post.
+ */
+const REACTION_KINDS = ['LIKE', 'LOVE', 'LAUGH', 'INSIGHTFUL', 'CELEBRATE', 'SAD'] as const;
+
 const postSchema = z.object({ body: z.string().min(1).max(10_000) });
 const commentSchema = z.object({ body: z.string().min(1).max(10_000), parentId: z.string().min(1).optional() });
-const reactionSchema = z.object({ kind: z.string().min(1).max(32).regex(/^[A-Z_]+$/, 'a reaction kind is upper-case letters') });
+const reactionSchema = z.object({
+  kind: z.enum(REACTION_KINDS, { errorMap: () => ({ message: `a reaction kind is one of ${REACTION_KINDS.join(', ')}` }) }),
+});
 
 interface CommentRow {
   id: string;

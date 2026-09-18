@@ -302,6 +302,35 @@ columns. On ClickHouse 25.8, `EXPLAIN indexes = 1` shows it using `event_id` onl
 whether the list is a parameter or literals, so it reads every tenant's granules.
 Two separate `IN` lists use both columns.
 
+## The compose stack may be doing your verifier's work for it
+
+A verifier ran the relay itself with `--once` and asserted the pass exited 0. That
+control was worth nothing twice over: the exit code is 0 for a pass that found
+nothing to do, and `relay-community` is a compose service draining the *same*
+outbox, so with the stack up the row is published whether the verifier's pass runs
+or not.
+
+Deleting the call to `relayOnce()` entirely left every assertion below it green.
+A control that survives the removal of the thing it controls for is decoration.
+
+The fix is to assert the effect on the row — `publishedAt` is set for THIS message
+id — rather than the behaviour of the process the verifier happens to have started.
+Same family as checking what owns a port before trusting its answer.
+
+## A closed set is a ranking control, not tidiness
+
+Community's reactions accepted any upper-case string as a `kind`. `kind` is part of
+the Reaction unique key, so two different kinds from the same user are two rows and
+two increments of the counter that feeds `rankScore`. One account could invent a
+kind per request and push a post's rank as far as the rate limiter allowed.
+
+Measured before it was fixed: one user, two invented kinds, the post's count went
+from one to three. The unique key looked like "one reaction per person per post"
+and enforced nothing of the sort.
+
+Where a value is part of a key, the set of values it may take is part of the
+constraint.
+
 ## Readiness must ask the dependency as this process
 
 ClickHouse answers `GET /ping` without authenticating, so a `/ready` built on

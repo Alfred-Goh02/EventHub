@@ -990,9 +990,11 @@ jobs:
       # shape is the database's job — paths and depths come back a, a.b, a.b.c, a
       # parent on another post is refused by the NOT NULL on path rather than by a
       # separate SELECT, and the ninth level by the CHECK. Reacting twice counts
-      # once, and the rank score is recomputed here from the counters every time,
-      # because a score drifting from its counters is invisible until the feed order
-      # is wrong.
+      # once — and a kind the server did not name is refused, because kind is part of
+      # the unique key and an open set let one account invent a kind per request and
+      # run a post's rank up. The score is recomputed here from the counters every
+      # time, since a score drifting from its counters is invisible until the feed
+      # order is wrong.
       - name: Assert a post, its thread and its reactions, and the event they commit with
         run: node scripts/verify-community-posts.mjs
 
