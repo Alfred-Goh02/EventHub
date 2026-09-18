@@ -222,6 +222,9 @@ importers:
       express:
         specifier: ^4.21.2
         version: 4.22.2
+      ioredis:
+        specifier: ^5.4.1
+        version: 5.11.1
       zod:
         specifier: ^3.24.1
         version: 3.25.76

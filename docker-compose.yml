@@ -740,6 +740,8 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     ports:
       - "3008:3008"
     environment:
@@ -747,6 +749,9 @@ services:
       PORT: 3008
       DATABASE_URL: postgresql://eventhub_community_owner:eventhub_community_owner@postgres:5432/eventhub_community
       APP_DATABASE_URL: postgresql://eventhub_community_app:eventhub_community_app@postgres:5432/eventhub_community
+      # The membership cache and the rate limiter's buckets. redis, not 127.0.0.1:
+      # inside the network the host mapping does not exist.
+      REDIS_URL: redis://redis:6379
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
     volumes:
       - jwt-public:/run/eventhub/keys:ro
