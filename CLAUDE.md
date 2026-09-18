@@ -310,3 +310,81 @@ fails with `AUTHENTICATION_FAILED`.
 
 The same probe had also latched true once the consumer started, so a crash-looping
 consumer answered ready. Readiness has to track the failure it exists to report.
+
+## A probe that can match nothing proves nothing
+
+Notification refuses to start if its sweeper credential can mark a delivery SENT. The
+probe was `UPDATE "NotificationDelivery" SET status = 'SENT' WHERE status = 'PENDING'`,
+and row security refuses that PER ROW. On a database with nothing in flight it matched
+no rows, raised nothing, and reported that the credential could do the one thing it
+must not — so every email verifier's Notification refused to start, on a system that
+was merely idle.
+
+Probe something that cannot be empty: ask the catalog whether the rule exists, or hold
+a row and act on it. Same shape as `relayB.length >= 0`, which held most strongly of
+nothing.
+
+## An RLS test of WITH CHECK must not use RETURNING or WHERE
+
+Either one makes Postgres apply the USING clause to the new row, so a policy with
+`WITH CHECK (true)` stayed green. Roll such statements back rather than committing
+them: with RLS broken, an unscoped UPDATE moves every visible row.
+
+## A refusal from your relay is not a verdict from the recipient
+
+Suppression reacts to a 5.1.x reply to RCPT TO. That reply comes from the SMTP host
+this system relays through — a smarthost with a stale recipient table, a half-finished
+MX migration — not from the recipient's own server. The design note claimed otherwise,
+and with no expiry that would have been a permanent password-reset lockout for every
+user of a misconfigured domain. Every suppression now ends, and each new bounce extends
+it.
+
+Addresses are less regular than a pattern assumes, too: `mary.o'connor@corp.example` is
+one Auth accepts, and a redaction pattern treating `'` as a delimiter published the
+name into logs, rows and Kafka headers.
+
+## `pnpm run <script> -- a b` hands the script the `--`
+
+On every shell except PowerShell, where pnpm.ps1 swallows it first. The documented
+`suppression:remove -- <tenant> <address>` therefore read the tenant as `--` and told
+the operator the address was not suppressed — the one answer that must not be wrong
+while a user is locked out. `dlq:replay` had it too. Strip a leading `--` before
+reading arguments, and have a verifier run the DOCUMENTED form, not just the file.
+
+## Count check results with an anchor and a control
+
+A merge guard counted `FAIL` lines in a CI log with a pattern built for the wrong
+format. It found 0 failures, and also 0 passes: zero failures out of zero lines is not
+a green run. Anchor on the timestamp (`\dZ\s+ok {4}\S`), and print the ok count as the
+control every time — 972 on #109, 1043 on #112.
+
+## Retrying a partial batch API never succeeds
+
+kafkajs's `admin.deleteGroups(list)` deletes what it can and throws for the rest.
+Retried with the same list, it then fails on the groups it already deleted, for ever,
+so a verifier's cleanup reported "left to expire" on every run. Delete one at a time,
+and judge by the effect: whether the cluster still lists the group.
+
+## Measure the container before blaming the process
+
+Notification exited 137 on `docker compose stop`, and the conclusion written down was
+"shutdown outlives the grace period". It did not: every container on that machine had
+been created with `Config.StopTimeout=1`, and the stop took 1.7 s. An explicit
+`stop_grace_period` fixed it, and the shutdown then took 4.6 s and exited 0. The
+measurement — `docker inspect` and a timed stop — cost two minutes and pointed
+somewhere else entirely.
+
+## Searches that quietly look at nothing
+
+Each of these returned "no matches" from a search that was not running:
+
+- a `*/src/**` or brace glob matches nothing; use `**/src/**`, or pass the path
+- ripgrep skips `node_modules` when handed a directory, because .gitignore excludes it:
+  pass the exact file, or use `Select-String`
+- PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, which Prisma rejects as
+  an invalid schema
+- a here-string can stop being one on a stray trailing space, and the shell then splits
+  a commit message into pathspecs. `git commit -F <file>` has no quoting to get wrong.
+
+Treat "no matches" from a narrow search as no evidence at all, and prove the search
+works by making it match something.
