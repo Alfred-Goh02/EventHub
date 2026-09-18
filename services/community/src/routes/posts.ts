@@ -5,6 +5,7 @@ import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
 import { ah } from '../async.js';
 import { withTenant } from '../db.js';
+import { env } from '../env.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { sortableId } from '../ids.js';
 import { readMembership } from '../middleware/space.js';
@@ -20,6 +21,9 @@ import { readMembership } from '../middleware/space.js';
 
 const TOPIC = 'community.feed';
 const SCHEMA_VERSION = 1;
+
+/** The most comments one request returns. Overflow is reported, never silently dropped. */
+const THREAD_LIMIT = env.THREAD_PAGE_LIMIT;
 
 /**
  * ONE FORMULA, IN ONE PLACE.
@@ -270,26 +274,46 @@ export function postRoutes(
     const allowed = await reach(tenantId, spaceId, userId, 'read');
     if (allowed.status !== 200) return res.status(allowed.status).json({ error: allowed.error ?? 'not found' });
 
+    /**
+     * ONE MORE THAN THE CAP, SO TRUNCATION IS VISIBLE.
+     *
+     * Reading exactly THREAD_LIMIT and returning `count: rows.length` reports 500 for
+     * a thread of 500 and for a thread of fifty thousand, and the caller cannot tell
+     * which it got. Asking for one extra row makes the overflow a fact the response
+     * carries rather than a cap it silently hits.
+     */
     const rows = await withTenant(tenantId, (tx) =>
       tx.$queryRaw<CommentRow[]>`
         SELECT id, "parentId", "authorId", body, depth, path::text AS path, "reactionCount", "createdAt"
           FROM "Comment"
          WHERE "postId" = ${postId} AND status = 'VISIBLE'::"ContentStatus"
          ORDER BY path
-         LIMIT 500`,
+         LIMIT ${THREAD_LIMIT + 1}`,
     );
+    const truncated = rows.length > THREAD_LIMIT;
+    if (truncated) rows.length = THREAD_LIMIT;
 
     const nodes = new Map<string, CommentRow & { replies: unknown[] }>();
     const thread: unknown[] = [];
     for (const row of rows) {
       const node = { ...row, replies: [] as unknown[] };
       nodes.set(row.id, node);
-      // A parent always precedes its children in path order, so one pass is enough.
+      /**
+       * A parent always precedes its children in path order, so one pass is enough.
+       *
+       * A node whose parent is not in this map is attached at the top. Today that only
+       * happens at the truncation boundary. Once a moderator can HIDE a comment it will
+       * also happen to the replies of a hidden parent, and attaching them at the top
+       * would promote them to standalone comments — the opposite of hiding a thread.
+       * The moderation part has to filter by hidden ANCESTOR, not by the row's own
+       * status; this comment is here so that arrives as a decision rather than a
+       * surprise.
+       */
       const parent = row.parentId ? nodes.get(row.parentId) : undefined;
       if (parent) parent.replies.push(node);
       else thread.push(node);
     }
-    return res.json({ comments: thread, count: rows.length });
+    return res.json({ comments: thread, count: rows.length, truncated });
   }));
 
   /**
@@ -330,7 +354,11 @@ export function postRoutes(
     return res.status(added ? 201 : 200).json({ postId, kind: parsed.data.kind, added });
   }));
 
-  router.delete('/posts/:postId/reactions/:kind', ah(async (req, res) => {
+  // Metered like every other write here. It was the one that was not, and un-reacting
+  // is a write: a valid token could run spaceOfPost, reach and a DELETE in a loop for
+  // free. That it can only remove the caller's own reactions bounds the damage, not the
+  // load.
+  router.delete('/posts/:postId/reactions/:kind', limit.middleware('reaction', limits.reaction), ah(async (req, res) => {
     const { tenantId, userId } = getAuth(req);
     const postId = req.params['postId']!;
     const kind = req.params['kind']!;

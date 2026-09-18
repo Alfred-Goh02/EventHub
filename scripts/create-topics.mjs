@@ -128,12 +128,6 @@ const TOPICS = [
     note: 'Deliveries that are poison or ran out of retries. Inspect, then replay deliberately.',
   },
   {
-    topic: 'community.feed',
-    numPartitions: 3,
-    replicationFactor: 1,
-    note: 'Community posts and reactions.',
-  },
-  {
     topic: 'events.activity.dlq',
     numPartitions: 3,
     replicationFactor: 1,
@@ -262,11 +256,23 @@ async function main() {
       const live = current.resources.find((r) => r.resourceName === t.topic);
       for (const want of t.configEntries) {
         const have = live?.configEntries.find((c) => c.configName === want.name);
-        if (have?.configValue !== String(want.value)) {
+        /**
+         * DRIFT IS ALSO "THE RIGHT VALUE, FROM THE BROKER".
+         *
+         * Comparing configValue alone misses the case where what this file asks
+         * for happens to equal the broker default: the value already reads
+         * correct, so nothing is applied, and the topic goes on following the
+         * broker instead of this file. community.feed wanted retention.ms=
+         * 604800000 and log.retention.hours is 168 — the same number — so it was
+         * never set, and a later change to the broker default would have moved it
+         * silently. isDefault=false is the difference between a value we chose and
+         * a value we were given.
+         */
+        if (have?.configValue !== String(want.value) || have?.isDefault !== false) {
           drifted.push({
             topic: t.topic,
             name: want.name,
-            from: have?.configValue ?? '(unset)',
+            from: have === undefined ? '(unset)' : have.isDefault ? `${have.configValue} (broker default)` : have.configValue,
             to: String(want.value),
           });
         }

@@ -40,6 +40,13 @@ const communityEnvSchema = z.object({
   RATE_LIMIT_COMMENT_PER_MINUTE: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_REACTION_PER_MINUTE: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_REPORT_PER_MINUTE: z.coerce.number().int().positive().default(10),
+
+  /**
+   * The most comments one thread request returns. Configurable so the verifier can set
+   * it low enough to reach the boundary in a few requests: a cap that can only be hit
+   * by creating five hundred rows is a cap nothing ever tests.
+   */
+  THREAD_PAGE_LIMIT: z.coerce.number().int().positive().default(500),
 });
 
 const base = loadBaseEnv();

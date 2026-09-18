@@ -55,11 +55,14 @@ const TOPIC = 'community.feed';
  */
 const POSTS_PER_MINUTE = 3;
 const COMMENTS_PER_MINUTE = 40;
+/** Low, so the truncation boundary is four comments away rather than five hundred. */
+const THREAD_PAGE_LIMIT = 3;
 
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
   RATE_LIMIT_COMMENT_PER_MINUTE: String(COMMENTS_PER_MINUTE),
   RATE_LIMIT_POST_PER_MINUTE: String(POSTS_PER_MINUTE),
+  THREAD_PAGE_LIMIT: String(THREAD_PAGE_LIMIT),
   AUTH_PUBLIC_KEY_B64: Buffer.from(readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem'), 'utf8')).toString('base64'),
 });
 const relayEnv = serviceEnv(ROOT, 'relay', {
@@ -308,8 +311,8 @@ async function main() {
     const thread = await api(`/posts/${postId}/comments`, { bearer: asReader });
     const top = thread.body?.comments?.[0];
     check(
-      thread.body?.count === 3 && top?.replies?.length === 1 && top?.replies?.[0]?.replies?.length === 1,
-      `the API nests them in one pass over path order (${thread.body?.count} rows, ${top?.replies?.length ?? 0} reply, ${top?.replies?.[0]?.replies?.length ?? 0} deeper)`,
+      thread.body?.count === 3 && top?.replies?.length === 1 && top?.replies?.[0]?.replies?.length === 1 && thread.body?.truncated === false,
+      `the API nests them in one pass over path order (${thread.body?.count} rows, ${top?.replies?.length ?? 0} reply, ${top?.replies?.[0]?.replies?.length ?? 0} deeper, truncated ${thread.body?.truncated})`,
     );
 
     const otherPost = await api(`/spaces/${spaceId}/posts`, { method: 'POST', bearer: asAuthor, body: { body: 'another' } });
@@ -328,6 +331,21 @@ async function main() {
       parent = made.body?.id ?? parent;
     }
     check(deepStatus === 422, `and nine levels is refused by the depth cap (${deepStatus})`);
+
+    /**
+     * A CAP THE CALLER CANNOT SEE IS A LIE ABOUT THE THREAD.
+     *
+     * The depth loop above left this post with more comments than the page limit. Read
+     * back, the response must say it was cut: returning `count: <limit>` for a thread
+     * of any size above the limit reads exactly like a complete thread of that size.
+     * Asserted against the same field reading false a few lines up, so the flag has to
+     * move rather than just be present.
+     */
+    const capped = await api(`/posts/${postId}/comments`, { bearer: asReader });
+    check(
+      capped.body?.truncated === true && capped.body?.count === THREAD_PAGE_LIMIT,
+      `past the page limit the thread says it was cut (count ${capped.body?.count} of limit ${THREAD_PAGE_LIMIT}, truncated ${capped.body?.truncated})`,
+    );
 
     console.log('');
     console.log('  a reaction counts once, however many times it is sent');

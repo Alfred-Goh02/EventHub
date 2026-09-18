@@ -317,6 +317,32 @@ The fix is to assert the effect on the row — `publishedAt` is set for THIS mes
 id — rather than the behaviour of the process the verifier happens to have started.
 Same family as checking what owns a port before trusting its answer.
 
+## The right value for the wrong reason is not a passing test
+
+`community.feed` was added to `create-topics.mjs` asking for
+`retention.ms=604800000`, and to `verify-topic-configs.mjs` asserting the same
+number. It went green immediately. Nothing had been applied: Kafka's
+`log.retention.hours=168` **is** 604800000, so the check was reading the broker
+default back and agreeing with itself.
+
+Both halves had the same blindness, and both were written by the events.activity.dlq
+bug at the top of that file:
+
+- the verifier compared `configValue` only, so it could not tell a value we set
+  from one we were given;
+- `create-topics.mjs` measured drift the same way, so the config was never
+  counted as drifted and `alterConfigs` was never called. It printed
+  "topic configs already match this file".
+
+`describeConfigs` answers this directly — `isDefault: false` means the value is
+set on the topic. Measured across every expectation in that file: all
+`isDefault=false` except the one that was wrong. After the fix the script printed
+`reconciled community.feed: retention.ms 604800000 (broker default) -> 604800000`,
+which is the whole bug in one line.
+
+When an expected value coincides with a default, equality proves nothing. Assert
+the provenance, not just the number.
+
 ## A closed set is a ranking control, not tidiness
 
 Community's reactions accepted any upper-case string as a `kind`. `kind` is part of
