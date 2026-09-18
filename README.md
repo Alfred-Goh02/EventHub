@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 67 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 68 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -521,6 +521,13 @@ long is too long; one pass by hand is:
 ```bash
 pnpm --filter @eventhub/notification run sweep:once
 ```
+
+The whole chain is proved in the compose stack itself, not only against natively run
+services: `node scripts/verify-compose-password-reset.mjs` adds a user to the seeded
+tenant, asks for a reset, reads the mail out of Mailpit, and checks that the link
+works, that the old password stops working and that the session issued before the
+reset is revoked — then removes what it made. Locally the mail arrives about a second
+after the request.
 
 Preferences and rate limits are still to come, and arrive with the first email
 anyone could opt out of. Chapter 9, community, is designed and documented but not
