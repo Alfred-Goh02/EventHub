@@ -1,6 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
+import { ah } from '../async.js';
 import { withTenant } from '../db.js';
 import { env } from '../env.js';
 import { redis } from '../redis.js';
@@ -84,7 +85,9 @@ export async function readMembership(
 }
 
 export function requireMembership(minRole: SpaceRole, logger: Logger): RequestHandler {
-  return async (req: Request, res: Response, next: NextFunction) => {
+  // Wrapped, like every async handler here: Express 4 does not await middleware, so a
+  // database error inside this would be an unhandled rejection rather than a 500.
+  return ah(async (req: Request, res: Response, next: NextFunction) => {
     const { tenantId, userId } = getAuth(req);
     const spaceId = req.params['spaceId'];
     if (!spaceId) return res.status(400).json({ error: 'a space id is required' });
@@ -97,5 +100,5 @@ export function requireMembership(minRole: SpaceRole, logger: Logger): RequestHa
 
     req.membership = membership;
     next();
-  };
+  });
 }

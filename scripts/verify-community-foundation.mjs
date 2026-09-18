@@ -272,20 +272,41 @@ async function main() {
     service.child.kill();
     // As the owner, which FORCE row security binds too, so each tenant is cleared
     // with its own context — the same way the service would.
+    /**
+     * THE CLEANUP HAS TO SET THE TENANT, AND HAS TO PROVE IT DELETED SOMETHING.
+     *
+     * This deleted nothing for several chapters and said so was fine. FORCE row
+     * security binds the owner too, so a DELETE with no app.tenant_id matches zero
+     * rows — and the count below asked through the SAME filter, so it saw an empty
+     * table and reported "0 left". A cleanup that deletes nothing and a cleanup that
+     * works looked identical.
+     *
+     * What it cost: every run left two OutboxMessage rows on community.feed with a
+     * payload of '{}', which no relay can ever encode. A later verifier's relay pass
+     * claimed one, dead-lettered it and exited 1 — and that is how this was found,
+     * eight rows and four abandoned runs later. Locally it hid because compose's
+     * relay-community had already dead-lettered them; CI runs infrastructure only,
+     * so there the leftovers were still waiting.
+     *
+     * `deleted > 0` is the positive control. Without it "0 deleted, 0 left" passes,
+     * which is precisely the bug.
+     */
     const tables = ['CommunitySpace', 'Membership', 'Post', 'Comment', 'Reaction', 'Report', 'ModerationAction', 'FeedEntry', 'OutboxMessage'];
+    let deleted = 0;
     for (const tenant of [TENANT, OTHER_TENANT]) {
       for (const table of tables) {
-        await owner.query(`DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]).catch(() => {});
+        const gone = await asTenant(owner, tenant, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]);
+        deleted += gone.rowCount ?? 0;
       }
     }
     let left = 0;
-    for (const table of tables) {
-      const count = await owner
-        .query(`SELECT count(*)::int AS n FROM "${table}" WHERE "tenantId" = ANY($1)`, [[TENANT, OTHER_TENANT]])
-        .catch(() => ({ rows: [{ n: -1 }] }));
-      left += count.rows[0].n;
+    for (const tenant of [TENANT, OTHER_TENANT]) {
+      for (const table of tables) {
+        const count = await asTenant(owner, tenant, `SELECT count(*)::int AS n FROM "${table}" WHERE "tenantId" = $1`, [tenant]);
+        left += count.rows[0]?.n ?? 0;
+      }
     }
-    check(left === 0, `cleanup: this run's rows are gone (${left} left)`);
+    check(deleted > 0 && left === 0, `cleanup: this run's rows are gone (${deleted} deleted, ${left} left)`);
     await Promise.all([app.end().catch(() => {}), owner.end().catch(() => {}), relay.end().catch(() => {})]);
   }
 

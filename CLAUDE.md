@@ -302,6 +302,110 @@ columns. On ClickHouse 25.8, `EXPLAIN indexes = 1` shows it using `event_id` onl
 whether the list is a parameter or literals, so it reads every tenant's granules.
 Two separate `IN` lists use both columns.
 
+## A cleanup filtered by the policy it ignores deletes nothing, quietly
+
+`verify-community-foundation.mjs` ended with a DELETE per tenant per table as the
+owner, and then counted what was left. Both ran with **no `app.tenant_id` set**.
+FORCE row security binds the owner, so the DELETE matched zero rows — and the
+count asked through the same filter, saw an empty table, and reported "0 left".
+A cleanup that works and a cleanup that deletes nothing were indistinguishable,
+and the error was swallowed by `.catch(() => {})`.
+
+It ran that way for several chapters. Every run left two `OutboxMessage` rows on
+community.feed with a payload of `{}`, which no relay can ever encode. Eight rows
+and four abandoned runs later, a relay pass in a *different* verifier claimed one,
+dead-lettered it, exited 1, and failed CI — which is the only reason anyone
+looked. Locally it stayed hidden, because compose's relay-community had already
+dead-lettered them; CI starts infrastructure only, so there they were still
+waiting.
+
+Measured, with the delete reverted: `0 deleted, 22 left`. Fixed: `22 deleted,
+0 left`.
+
+Two rules fall out. A cleanup runs in the same context the writes ran in. And it
+reports what it **deleted**, not only what remains — `0 deleted, 0 left` passing
+is exactly the bug, so the delete count is the positive control.
+
+## The compose stack may be doing your verifier's work for it
+
+A verifier ran the relay itself with `--once` and asserted the pass exited 0. That
+control was worth nothing twice over: the exit code is 0 for a pass that found
+nothing to do, and `relay-community` is a compose service draining the *same*
+outbox, so with the stack up the row is published whether the verifier's pass runs
+or not.
+
+Deleting the call to `relayOnce()` entirely left every assertion below it green.
+A control that survives the removal of the thing it controls for is decoration.
+
+The fix is to assert the effect on the row — `publishedAt` is set for THIS message
+id — rather than the behaviour of the process the verifier happens to have started.
+Same family as checking what owns a port before trusting its answer.
+
+## Timestamps come from the database, and are compared there
+
+Prisma maps `DateTime` to `timestamp WITHOUT time zone`, and node-postgres reads
+such a column as LOCAL time and writes a JS `Date` into it as local wall time.
+Containers run UTC, so this is invisible in compose and in CI — and a verifier
+spawns services on the HOST, which here is UTC+8.
+
+Community's outbox payload carried `occurredAt: new Date().toISOString()` while
+the schema said it was the row's commit time and consumers order on it. It was
+really the app's clock: measured 2 ms from the row's own `createdAt` on one
+machine with both clocks correct, and the gap across services is whatever their
+clocks disagree by. It is stamped in the same statement now, from the same
+`now()` the row defaults to.
+
+Then the *assertion* for it made the mirror-image mistake — reading `createdAt`
+into JS and comparing `Date.parse()` — and reported an eight-hour difference, to
+the millisecond, on a correct service. It would have failed here and passed on
+CI. The comparison happens in SQL now; Postgres comparing its own column to its
+own rendering has no timezone to get wrong.
+
+The rest of the repository is already safe because it does all of this in SQL:
+`now()`, `now() + ($4 || ' seconds')::interval`, `extract(epoch from now() - ...)`.
+Keep it that way — never pass a JS `Date` into one of these columns, and never
+compare one in JS.
+
+## The right value for the wrong reason is not a passing test
+
+`community.feed` was added to `create-topics.mjs` asking for
+`retention.ms=604800000`, and to `verify-topic-configs.mjs` asserting the same
+number. It went green immediately. Nothing had been applied: Kafka's
+`log.retention.hours=168` **is** 604800000, so the check was reading the broker
+default back and agreeing with itself.
+
+Both halves had the same blindness, and both were written by the events.activity.dlq
+bug at the top of that file:
+
+- the verifier compared `configValue` only, so it could not tell a value we set
+  from one we were given;
+- `create-topics.mjs` measured drift the same way, so the config was never
+  counted as drifted and `alterConfigs` was never called. It printed
+  "topic configs already match this file".
+
+`describeConfigs` answers this directly — `isDefault: false` means the value is
+set on the topic. Measured across every expectation in that file: all
+`isDefault=false` except the one that was wrong. After the fix the script printed
+`reconciled community.feed: retention.ms 604800000 (broker default) -> 604800000`,
+which is the whole bug in one line.
+
+When an expected value coincides with a default, equality proves nothing. Assert
+the provenance, not just the number.
+
+## A closed set is a ranking control, not tidiness
+
+Community's reactions accepted any upper-case string as a `kind`. `kind` is part of
+the Reaction unique key, so two different kinds from the same user are two rows and
+two increments of the counter that feeds `rankScore`. One account could invent a
+kind per request and push a post's rank as far as the rate limiter allowed.
+
+Measured before it was fixed: one user, two invented kinds, the post's count went
+from one to three. The unique key looked like "one reaction per person per post"
+and enforced nothing of the sort.
+
+Where a value is part of a key, the set of values it may take is part of the
+constraint.
+
 ## Readiness must ask the dependency as this process
 
 ClickHouse answers `GET /ping` without authenticating, so a `/ready` built on

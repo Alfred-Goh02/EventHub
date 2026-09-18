@@ -3,6 +3,7 @@ import { Router, type RequestHandler } from 'express';
 import { z } from 'zod';
 import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
+import { ah } from '../async.js';
 import { withTenant } from '../db.js';
 import { forgetMembership, readMembership, requireMembership, type SpaceRole } from '../middleware/space.js';
 
@@ -37,7 +38,11 @@ const memberSchema = z
     message: 'give a role, a status, or both',
   });
 
-export function spaceRoutes(logger: Logger, limit: { middleware: (action: string, perMinute: number) => RequestHandler }, joinsPerMinute: number): Router {
+export function spaceRoutes(
+  logger: Logger,
+  limit: { middleware: (action: string, perMinute: number) => RequestHandler },
+  limits: { space: number; join: number },
+): Router {
   const router = Router();
 
   /**
@@ -46,7 +51,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
    * Two statements would leave a space nobody can moderate if the second failed — and
    * the only route that could fix it is one that requires a moderator.
    */
-  router.post('/spaces', async (req, res) => {
+  router.post('/spaces', limit.middleware('space', limits.space), ah(async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     const { tenantId, userId } = getAuth(req);
@@ -71,7 +76,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
 
     await forgetMembership(spaceId, userId);
     return res.status(201).json({ id: spaceId, slug: parsed.data.slug, visibility: parsed.data.visibility });
-  });
+  }));
 
   /**
    * A public space can be joined; a private one answers 404 rather than 403, so its
@@ -80,7 +85,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
    * Idempotent: joining twice is the same as joining once, because a retry after a
    * dropped response must not be an error.
    */
-  router.post('/spaces/:spaceId/join', limit.middleware('join', joinsPerMinute), async (req, res) => {
+  router.post('/spaces/:spaceId/join', limit.middleware('join', limits.join), ah(async (req, res) => {
     const { tenantId, userId } = getAuth(req);
     const spaceId = req.params['spaceId']!;
 
@@ -105,10 +110,10 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
     if (!joined) return res.status(404).json({ error: 'not found' });
     await forgetMembership(spaceId, userId);
     return res.status(200).json({ spaceId, role: 'MEMBER', joined: joined.added });
-  });
+  }));
 
   /** A public space is readable by anyone in the tenant; a private one, by its members. */
-  router.get('/spaces/:spaceId', async (req, res) => {
+  router.get('/spaces/:spaceId', ah(async (req, res) => {
     const { tenantId, userId } = getAuth(req);
     const spaceId = req.params['spaceId']!;
 
@@ -127,7 +132,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
       if (membership.status === 'BANNED') return res.status(403).json({ error: 'banned from this space' });
     }
     return res.json(space);
-  });
+  }));
 
   /**
    * A moderator may ban or restore a member; only an OWNER may change roles.
@@ -135,7 +140,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
    * The cache is dropped for the user whose membership changed, so the next request
    * sees it — not up to MEMBERSHIP_CACHE_TTL_S later.
    */
-  router.patch('/spaces/:spaceId/members/:userId', requireMembership('MODERATOR', logger), async (req, res) => {
+  router.patch('/spaces/:spaceId/members/:userId', requireMembership('MODERATOR', logger), ah(async (req, res) => {
     const parsed = memberSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     const { tenantId } = getAuth(req);
@@ -175,10 +180,10 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
 
     await forgetMembership(spaceId, target);
     return res.json({ spaceId, userId: target, ...parsed.data });
-  });
+  }));
 
   /** Leaving, except for the last owner: a space nobody can moderate is worse than a space nobody left. */
-  router.delete('/spaces/:spaceId/members/me', requireMembership('MEMBER', logger), async (req, res) => {
+  router.delete('/spaces/:spaceId/members/me', requireMembership('MEMBER', logger), ah(async (req, res) => {
     const { tenantId, userId } = getAuth(req);
     const spaceId = req.params['spaceId']!;
 
@@ -202,7 +207,7 @@ export function spaceRoutes(logger: Logger, limit: { middleware: (action: string
     if (left.lastOwner) return res.status(409).json({ error: 'the last owner cannot leave' });
     await forgetMembership(spaceId, userId);
     return res.status(204).end();
-  });
+  }));
 
   return router;
 }

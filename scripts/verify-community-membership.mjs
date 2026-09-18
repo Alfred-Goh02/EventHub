@@ -49,6 +49,14 @@ const JOINS_PER_MINUTE = 3;
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
   RATE_LIMIT_JOIN_PER_MINUTE: String(JOINS_PER_MINUTE),
+  /**
+   * Generous, because the fixture below creates ten spaces with one owner to have
+   * something to join. The space limiter is exercised in verify-community-posts.mjs,
+   * which makes one space and can therefore afford a small budget. Sharing a tight
+   * budget between a fixture and the assertion is how the depth-cap check once read a
+   * 429 as the depth cap refusing.
+   */
+  RATE_LIMIT_SPACE_PER_MINUTE: '50',
   AUTH_PUBLIC_KEY_B64: Buffer.from(readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem'), 'utf8')).toString('base64'),
 });
 

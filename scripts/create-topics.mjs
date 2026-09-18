@@ -95,6 +95,17 @@ const TOPICS = [
     configEntries: [{ name: 'retention.ms', value: '86400000' }],
     note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
   },
+  {
+    topic: 'community.feed',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // A week, on `delete` rather than compact. The SEQUENCE is the information here —
+    // a post, then its comments, then the reactions — so keeping only the latest
+    // message per key would throw away the thing consumers are reading. Long enough
+    // for a consumer to be down for a weekend and catch up.
+    configEntries: [{ name: 'retention.ms', value: '604800000' }],
+    note: 'Community activity: posts, comments and reactions. Keyed by space id, so one space stays ordered.',
+  },
   // Notification's delayed retries. Kafka has no delayed delivery, so each delay is
   // a topic: a send that failed for a reason that may pass waits in the next tier,
   // and its source partition moves on. A day's retention is far past any tier's
@@ -115,12 +126,6 @@ const TOPICS = [
     // failures rather than traffic, and each one is for a person to look at.
     configEntries: [{ name: 'retention.ms', value: '-1' }],
     note: 'Deliveries that are poison or ran out of retries. Inspect, then replay deliberately.',
-  },
-  {
-    topic: 'community.feed',
-    numPartitions: 3,
-    replicationFactor: 1,
-    note: 'Community posts and reactions.',
   },
   {
     topic: 'events.activity.dlq',
@@ -251,11 +256,23 @@ async function main() {
       const live = current.resources.find((r) => r.resourceName === t.topic);
       for (const want of t.configEntries) {
         const have = live?.configEntries.find((c) => c.configName === want.name);
-        if (have?.configValue !== String(want.value)) {
+        /**
+         * DRIFT IS ALSO "THE RIGHT VALUE, FROM THE BROKER".
+         *
+         * Comparing configValue alone misses the case where what this file asks
+         * for happens to equal the broker default: the value already reads
+         * correct, so nothing is applied, and the topic goes on following the
+         * broker instead of this file. community.feed wanted retention.ms=
+         * 604800000 and log.retention.hours is 168 — the same number — so it was
+         * never set, and a later change to the broker default would have moved it
+         * silently. isDefault=false is the difference between a value we chose and
+         * a value we were given.
+         */
+        if (have?.configValue !== String(want.value) || have?.isDefault !== false) {
           drifted.push({
             topic: t.topic,
             name: want.name,
-            from: have?.configValue ?? '(unset)',
+            from: have === undefined ? '(unset)' : have.isDefault ? `${have.configValue} (broker default)` : have.configValue,
             to: String(want.value),
           });
         }

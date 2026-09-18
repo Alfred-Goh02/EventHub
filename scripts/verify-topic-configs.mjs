@@ -64,6 +64,12 @@ const EXPECTED = [
     value: '-1',
     why: 'a delivery that can never succeed must outlive the week nobody looked at it',
   },
+  {
+    topic: 'community.feed',
+    name: 'retention.ms',
+    value: '604800000',
+    why: 'the sequence is the information here, so a week of it survives a consumer being down for a weekend',
+  },
   ...['notification.retry.1', 'notification.retry.2', 'notification.retry.3'].map((topic) => ({
     topic,
     name: 'retention.ms',
@@ -155,13 +161,31 @@ async function main() {
     const resource = described.resources.find((r) => r.resourceName === e.topic);
     const entry = resource?.configEntries.find((c) => c.configName === e.name);
 
+    /**
+     * THE VALUE, AND THAT THIS FILE IS WHY IT HAS THAT VALUE.
+     *
+     * `configValue === e.value` alone cannot tell a config we set from one the
+     * broker handed out. community.feed was added here asserting
+     * retention.ms=604800000, and passed green while `create-topics.mjs` had
+     * never applied a thing: log.retention.hours=168 IS 604800000, so the
+     * assertion was reading the broker default back and agreeing with itself.
+     * That is the events.activity.dlq bug at the top of this file, committed a
+     * second time by the test written to prevent it.
+     *
+     * isDefault=false means the value is set on the topic. Measured: every
+     * expectation here is isDefault=false except the one that was wrong.
+     */
+    const set = entry?.configValue === e.value && entry?.isDefault === false;
     check(
-      entry?.configValue === e.value,
-      entry?.configValue === e.value
-        ? `${e.topic} ${e.name}=${e.value} — ${e.why}`
-        : `${e.topic} ${e.name} is ${entry?.configValue ?? '(absent)'}, expected ${e.value}. ` +
-          `${e.why}. Note the setup script reports success without applying config to ` +
-          'topics that already exist, so "I ran create-topics" does not settle this.',
+      set,
+      set
+        ? `${e.topic} ${e.name}=${e.value}, set on the topic — ${e.why}`
+        : entry?.configValue === e.value
+          ? `${e.topic} ${e.name} is ${e.value} but INHERITED from the broker, not set by create-topics.mjs. ` +
+            `${e.why}. The right value for the wrong reason: change the broker default and it moves silently.`
+          : `${e.topic} ${e.name} is ${entry?.configValue ?? '(absent)'}, expected ${e.value}. ` +
+            `${e.why}. Note the setup script reports success without applying config to ` +
+            'topics that already exist, so "I ran create-topics" does not settle this.',
     );
   }
 

@@ -35,11 +35,25 @@ const communityEnvSchema = z.object({
    * user creates unbounded rows, and a per-IP limit at a gateway cannot express "five
    * posts but sixty reactions" because it does not know what the endpoint means.
    */
+  /**
+   * Creating a space was the one write here that nothing metered, in the service this
+   * comment calls out for unbounded rows. It is also the heaviest: a space is a
+   * container other people join, and each one costs two rows and a name in a unique
+   * index. Lower than posting for that reason.
+   */
+  RATE_LIMIT_SPACE_PER_MINUTE: z.coerce.number().int().positive().default(3),
   RATE_LIMIT_JOIN_PER_MINUTE: z.coerce.number().int().positive().default(10),
   RATE_LIMIT_POST_PER_MINUTE: z.coerce.number().int().positive().default(5),
   RATE_LIMIT_COMMENT_PER_MINUTE: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_REACTION_PER_MINUTE: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_REPORT_PER_MINUTE: z.coerce.number().int().positive().default(10),
+
+  /**
+   * The most comments one thread request returns. Configurable so the verifier can set
+   * it low enough to reach the boundary in a few requests: a cap that can only be hit
+   * by creating five hundred rows is a cap nothing ever tests.
+   */
+  THREAD_PAGE_LIMIT: z.coerce.number().int().positive().default(500),
 });
 
 const base = loadBaseEnv();
