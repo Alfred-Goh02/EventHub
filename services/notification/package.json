@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "generate": "prisma generate",
     "dlq:replay": "node --env-file-if-exists=.env dist/scripts/dlq-replay.js",
-    "suppression:remove": "node --env-file-if-exists=.env dist/scripts/suppression-remove.js"
+    "suppression:remove": "node --env-file-if-exists=.env dist/scripts/suppression-remove.js",
+    "sweep:once": "node --env-file-if-exists=.env dist/scripts/sweep-once.js"
   },
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
@@ -23,11 +24,13 @@
     "jose": "^6.2.4",
     "kafkajs": "^2.2.4",
     "nodemailer": "^10.0.10",
+    "pg": "^8.22.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@eventhub/tsconfig": "workspace:*",
     "@types/express": "^4.17.21",
+    "@types/pg": "^8.20.0",
     "dotenv": "^17.4.2",
     "prisma": "^7.9.0",
     "tsx": "^4.19.2"

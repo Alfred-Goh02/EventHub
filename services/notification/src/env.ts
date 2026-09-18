@@ -48,6 +48,20 @@ const notificationEnvSchema = z.object({
    */
   SUPPRESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
 
+  /**
+   * The sweeper's own credential: SELECT and a three-column UPDATE on the sent-log,
+   * across every tenant. Separate from APP_DATABASE_URL because "which deliveries
+   * never finished" has no tenant in it, and the process that sends must not gain
+   * that reach. It refuses to start if this role can do more than sweep.
+   */
+  SWEEPER_DATABASE_URL: z.string().url(),
+  /** How long a delivery may sit PENDING before it is called abandoned. */
+  SWEEP_STUCK_AFTER_MS: z.coerce.number().int().positive().default(3_600_000),
+  /** How often to sweep. */
+  SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  /** Rows per pass, which bounds what one statement locks. */
+  SWEEP_BATCH_SIZE: z.coerce.number().int().positive().max(10_000).default(500),
+
   SMTP_HOST: z.string().min(1),
   SMTP_PORT: z.coerce.number().int().positive(),
   EMAIL_FROM: z.string().email(),

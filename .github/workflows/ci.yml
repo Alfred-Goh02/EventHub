@@ -950,6 +950,14 @@ jobs:
       - name: Assert an address that does not exist is suppressed, and only such an address
         run: node scripts/verify-email-suppression.mjs
 
+      # A delivery is claimed PENDING before anything is sent, and the ones whose
+      # message was dead-lettered stay that way for ever. The sweep ends them, on a
+      # credential that crosses tenants and may do nothing else: it cannot create a
+      # delivery, read the suppression list, or mark anything SENT, and the service
+      # refuses to start if it can. A young PENDING row beside them must survive.
+      - name: Assert deliveries claimed and never finished are ended, and nothing else is
+        run: node scripts/verify-notification-sweeper.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

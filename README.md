@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 66 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 67 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -508,6 +508,18 @@ address, never the address. To lift one by hand:
 
 ```bash
 pnpm --filter @eventhub/notification run suppression:remove -- <tenant-id> <address>
+```
+
+A delivery is claimed PENDING before anything is sent, and Kafka re-drives nearly all
+of them. The ones that never move again — a dead-lettered message, or one whose
+retention passed — are ended by a sweep inside the service, on its own credential:
+they become FAILED with "abandoned", so PENDING means "in flight" and its count is
+worth alerting on. That credential may end a delivery and nothing else, and the
+service refuses to start on one that can do more. `SWEEP_STUCK_AFTER_MS` sets how
+long is too long; one pass by hand is:
+
+```bash
+pnpm --filter @eventhub/notification run sweep:once
 ```
 
 Preferences and rate limits are still to come, and arrive with the first email
