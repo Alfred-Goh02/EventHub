@@ -1,0 +1,234 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A space is where posts live: one per event, or standing spaces a tenant keeps.
+///
+/// memberCount is denormalised and moved in SQL by the statement that joins or leaves,
+/// for the reason every counter here is: a feed that counts members on read does one
+/// aggregate per space per request, and that is the query that falls over first.
+model CommunitySpace {
+  id          String     @id @default(cuid())
+  tenantId    String
+  /// The event this space belongs to, when it belongs to one. Events live in another
+  /// service and another database, so this is an id and never a foreign key.
+  eventId     String?
+  slug        String
+  name        String
+  visibility  Visibility @default(PUBLIC)
+  memberCount Int        @default(0)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+}
+
+/// Who may read and write in a space, and who may moderate it.
+///
+/// The user id comes from the token Auth signed; there is no user table here.
+model Membership {
+  id       String       @id @default(cuid())
+  tenantId String
+  spaceId  String
+  userId   String
+  role     SpaceRole    @default(MEMBER)
+  status   MemberStatus @default(ACTIVE)
+  joinedAt DateTime     @default(now())
+
+  /// The tenant leads every unique key in this database: a unique index is not
+  /// filtered by policy, so a key that omitted it would let one tenant's insert
+  /// conflict with a row it cannot see.
+  @@unique([tenantId, spaceId, userId])
+  @@index([tenantId, userId])
+}
+
+model Post {
+  id            String        @id @default(cuid())
+  tenantId      String
+  spaceId       String
+  authorId      String
+  body          String
+  status        ContentStatus @default(VISIBLE)
+  reactionCount Int           @default(0)
+  commentCount  Int           @default(0)
+  /// Additive and time-stable, so a post's score never changes unless someone acts on
+  /// it. A decay score has to be recomputed for every row before it can be ordered,
+  /// which is the opposite of what an index is for.
+  rankScore     Float         @default(0)
+  createdAt     DateTime      @default(now())
+  editedAt      DateTime?
+
+  @@index([tenantId, spaceId, createdAt(sort: Desc)])
+}
+
+/// A comment's place in its thread is a materialised path, not a parent pointer walked
+/// at read time: `path` is an ltree of comment ids, so one indexed query returns a
+/// whole subtree in thread order.
+///
+/// THE ID MUST SORT BY TIME, because it becomes a path label and siblings are ordered
+/// lexicographically on it. cuid() is timestamp-prefixed; cuid2 is deliberately
+/// unsortable and would shuffle replies.
+model Comment {
+  id            String               @id @default(cuid())
+  tenantId      String
+  postId        String
+  authorId      String
+  parentId      String?
+  path          Unsupported("ltree")
+  depth         Int
+  body          String
+  status        ContentStatus        @default(VISIBLE)
+  reactionCount Int                  @default(0)
+  createdAt     DateTime             @default(now())
+
+  @@index([tenantId, postId])
+}
+
+/// One row per (target, user, kind), so reacting twice is the same as reacting once.
+/// The counter on the target moves in the same statement that inserts or deletes.
+model Reaction {
+  id         String     @id @default(cuid())
+  tenantId   String
+  targetType TargetType
+  targetId   String
+  userId     String
+  kind       String
+  createdAt  DateTime   @default(now())
+
+  @@unique([tenantId, targetType, targetId, userId, kind])
+  @@index([tenantId, targetId])
+}
+
+/// One report per person per target: reporting twice is not louder.
+model Report {
+  id         String       @id @default(cuid())
+  tenantId   String
+  targetType TargetType
+  targetId   String
+  reporterId String
+  reason     ReportReason
+  note       String?
+  status     ReportStatus @default(OPEN)
+  createdAt  DateTime     @default(now())
+
+  @@unique([tenantId, targetType, targetId, reporterId])
+  @@index([tenantId, status])
+}
+
+/// The audit trail for moderation, and APPEND-ONLY AT THE PRIVILEGE LEVEL: the service
+/// role is granted SELECT and INSERT here and nothing else, so a moderator cannot
+/// quietly rewrite what they did, and neither can a bug. See the migration.
+model ModerationAction {
+  id         String     @id @default(cuid())
+  tenantId   String
+  actorId    String
+  targetType TargetType
+  targetId   String
+  action     ModAction
+  reason     String?
+  reportId   String?
+  createdAt  DateTime   @default(now())
+
+  @@index([tenantId, targetId])
+}
+
+/// The materialised half of the feed: rows written for members of small spaces when a
+/// post appears. Large spaces are read at query time instead, because fanning a post
+/// out to a hundred thousand members on write is a hundred thousand rows nobody reads.
+model FeedEntry {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  postId    String
+  spaceId   String
+  rankScore Float
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, userId, postId])
+  @@index([tenantId, userId, rankScore(sort: Desc)])
+}
+
+/// The transactional outbox, in the shape @eventhub/relay drains. Named and columned
+/// to match the other services exactly: scripts/verify-outbox-relays.mjs requires a
+/// relay in compose for every schema that has this table, and the relay reads these
+/// columns by name.
+model OutboxMessage {
+  id       String @id @default(cuid())
+  tenantId String
+
+  seq BigInt @default(autoincrement())
+
+  topic         String
+  eventType     String
+  schemaVersion Int    @default(1)
+  aggregateId   String
+
+  payload     Json
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  attempts       Int       @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deadLetteredAt DateTime?
+
+  /// The drain, prune and backoff indexes are partial, so they are raw SQL in the
+  /// migration; Prisma cannot express a partial index.
+  @@index([tenantId])
+}
+
+enum Visibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum SpaceRole {
+  OWNER
+  MODERATOR
+  MEMBER
+}
+
+enum MemberStatus {
+  ACTIVE
+  BANNED
+}
+
+enum ContentStatus {
+  VISIBLE
+  /// Hidden by a moderator. The row stays, so the audit trail points at something.
+  HIDDEN
+  /// Removed by its author.
+  DELETED
+}
+
+enum TargetType {
+  POST
+  COMMENT
+}
+
+enum ReportReason {
+  SPAM
+  ABUSE
+  OFF_TOPIC
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  ACTIONED
+  DISMISSED
+}
+
+enum ModAction {
+  HIDE
+  UNHIDE
+  DELETE
+  BAN
+  UNBAN
+}

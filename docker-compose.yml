@@ -377,6 +377,7 @@ services:
       TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
       NOTIFICATION_DATABASE_URL: postgresql://eventhub_notification_owner:eventhub_notification_owner@postgres:5432/eventhub_notification
+      COMMUNITY_DATABASE_URL: postgresql://eventhub_community_owner:eventhub_community_owner@postgres:5432/eventhub_community
     volumes:
       - jwt-keys:/app/services/auth/keys
       - jwt-public:/app/public-keys
@@ -422,6 +423,8 @@ services:
         DATABASE_URL="$$LIVE_DATABASE_URL" pnpm --filter @eventhub/live exec prisma migrate deploy
         echo "setup: migrating notification"
         DATABASE_URL="$$NOTIFICATION_DATABASE_URL" pnpm --filter @eventhub/notification exec prisma migrate deploy
+        echo "setup: migrating community"
+        DATABASE_URL="$$COMMUNITY_DATABASE_URL" pnpm --filter @eventhub/community exec prisma migrate deploy
 
         # Auth only. Every service's prisma.config.ts declares the same seed
         # command and only Auth has the file, so running this against the others
@@ -685,6 +688,74 @@ services:
     command: ["node", "dist/index.js"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3012/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # The same relay again, draining Community's outbox: posts, comments and
+  # reactions on their way to community.feed. The fourth instance of one binary,
+  # pointed at a fourth database by RELAY_DATABASE_URL.
+  #
+  # RELAY_FORBIDDEN_TABLE is Post here: the relay asserts at boot that its
+  # credential cannot read the service's own business tables, and Post is the one
+  # that would hurt most to leak across tenants.
+  # ---------------------------------------------------------------------------
+  relay-community:
+    <<: *app
+    container_name: eventhub-relay-community
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3013:3013"
+    environment:
+      <<: *app-env
+      RELAY_DATABASE_URL: postgresql://eventhub_community_relay:eventhub_community_relay@postgres:5432/eventhub_community
+      RELAY_FORBIDDEN_TABLE: Post
+      RELAY_METRICS_PORT: 3013
+      RELAY_BATCH_SIZE: 100
+      RELAY_POLL_INTERVAL_MS: 1000
+      RELAY_MAX_ATTEMPTS: 5
+    working_dir: /app/services/relay
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3013/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Community: spaces, posts, threaded comments, reactions and moderation.
+  #
+  # Connects as eventhub_community_app, which owns nothing, and refuses to start as
+  # a role that could bypass RLS. Verifies tokens with Auth's public key from the
+  # jwt-public volume, as every other verifying service does.
+  # ---------------------------------------------------------------------------
+  community:
+    <<: *app
+    container_name: eventhub-community
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "3008:3008"
+    environment:
+      <<: *app-env
+      PORT: 3008
+      DATABASE_URL: postgresql://eventhub_community_owner:eventhub_community_owner@postgres:5432/eventhub_community
+      APP_DATABASE_URL: postgresql://eventhub_community_app:eventhub_community_app@postgres:5432/eventhub_community
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+    volumes:
+      - jwt-public:/run/eventhub/keys:ro
+    working_dir: /app/services/community
+    command: ["node", "dist/index.js"]
+    healthcheck:
+      # /ready, not /health: it asks Postgres as the app role, and nothing else here
+      # would notice the database being unreachable.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3008/ready >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
