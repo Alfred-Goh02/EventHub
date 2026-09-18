@@ -85,7 +85,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 65 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 66 executable proofs of the invariants above |
 
 Five separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -498,8 +498,21 @@ message id; a delivery already sent is not sent again:
 pnpm --filter @eventhub/notification run dlq:replay -- <message-id>
 ```
 
-Preferences, rate limits and suppression are still to come. Chapter 9, community, is designed and
-documented but not implemented.
+An address the relay refuses as non-existent (a 5.1.x reply to RCPT TO) is suppressed
+for its tenant: later deliveries to it are recorded SUPPRESSED and never attempted.
+Only that reply suppresses. A policy block (5.7.x) or a bare 550 is recorded FAILED
+and tried again next time, because a wrong suppression would lock its owner out of
+password resets. For the same reason a suppression ends after `SUPPRESSION_TTL_DAYS`,
+and every later bounce moves that end out again. The table holds a hash of the
+address, never the address. To lift one by hand:
+
+```bash
+pnpm --filter @eventhub/notification run suppression:remove -- <tenant-id> <address>
+```
+
+Preferences and rate limits are still to come, and arrive with the first email
+anyone could opt out of. Chapter 9, community, is designed and documented but not
+implemented.
 
 Known gaps, named rather than hidden:
 

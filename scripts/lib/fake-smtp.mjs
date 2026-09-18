@@ -9,13 +9,20 @@ import net from 'node:net';
  * TLS, no AUTH), records every message it accepts, and can:
  *   - be stopped, so connections are refused, the way an outage looks;
  *   - reply to RCPT TO for one address with a code the caller chooses, such as
- *     451 (try again later) or 550 (no such mailbox).
+ *     451 (try again later) or 550 (no such mailbox). `{address}` in a reply is
+ *     replaced by the recipient, because real servers repeat it back, and that is
+ *     text which must never reach a log.
  */
 export function createFakeSmtp() {
   /** @type {Array<{ from: string, to: string[], data: string, at: number }>} */
   const accepted = [];
   /** Lower-cased address -> the full reply line to send for its RCPT TO. */
   const rules = new Map();
+  /**
+   * Every RCPT TO the server was sent, refused or not. `accepted` alone cannot tell
+   * an address that was never tried from one that was tried and refused.
+   */
+  const rcpts = [];
   const sockets = new Set();
   let server = null;
 
@@ -61,8 +68,9 @@ export function createFakeSmtp() {
           reply('250 2.1.0 ok');
         } else if (verb === 'RCPT') {
           const to = address(line);
+          rcpts.push({ to, at: Date.now() });
           const rule = rules.get(to.toLowerCase());
-          if (rule) reply(rule);
+          if (rule) reply(rule.replaceAll('{address}', to));
           else {
             envelope.to.push(to);
             reply('250 2.1.5 ok');
@@ -90,6 +98,8 @@ export function createFakeSmtp() {
     rules,
     /** Messages accepted for one address. */
     to: (addr) => accepted.filter((m) => m.to.some((t) => t.toLowerCase() === addr.toLowerCase())),
+    /** Every RCPT TO naming one address, whether it was accepted or refused. */
+    tried: (addr) => rcpts.filter((r) => r.to.toLowerCase() === addr.toLowerCase()),
     get listening() {
       return server !== null;
     },

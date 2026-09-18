@@ -36,6 +36,18 @@ const notificationEnvSchema = z.object({
     .transform((list) => list.split(',').map((part) => Number(part.trim())))
     .pipe(z.array(z.number().int().positive()).length(3)),
 
+  /**
+   * How long a hard bounce keeps an address suppressed, in days.
+   *
+   * NOT FOREVER, because the reply that suppresses comes from the relay this service
+   * sends through, not necessarily from the recipient's own mail server. A smarthost
+   * with a stale recipient table, or a half-finished MX migration, answers 5.1.1 for
+   * a mailbox that exists — and a suppression with no end would lock those users out
+   * of password resets permanently. Each new hard bounce extends the window, so an
+   * address that really is gone costs one refused send per window, not one per reset.
+   */
+  SUPPRESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
+
   SMTP_HOST: z.string().min(1),
   SMTP_PORT: z.coerce.number().int().positive(),
   EMAIL_FROM: z.string().email(),
