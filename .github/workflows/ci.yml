@@ -1903,6 +1903,27 @@ jobs:
             || { echo "TICKETING_APP_DATABASE_URL does not reach its own database"; exit 1; }
           echo "  connected via TICKETING_APP_DATABASE_URL"
 
+      # The other half of what db/init settles per role: the relays and sweepers
+      # are given idle_in_transaction_session_timeout and statement_timeout, and
+      # until now nothing asserted they arrive. services/relay/src/db.ts names
+      # them in the comment on its pool -- an open transaction pins xmin and
+      # blocks VACUUM across the WHOLE cluster, so a relay that hangs mid-batch
+      # degrades every database, and the timeout is what ends it.
+      #
+      # Its failure is silent and slow. A role dropped and recreated by a later
+      # migration loses the ALTER ROLE with nothing raised, every test stays
+      # green, and the symptom is table bloat somewhere else, weeks later.
+      #
+      # DERIVED, NOT LISTED, like the step above: the roles, the settings and
+      # the values are read out of db/init, so a seventh role given a timeout is
+      # covered the moment it is bootstrapped. Checked on the role in
+      # pg_db_role_setting AND in a session opened as that role, because the
+      # catalog row and a backend actually starting with the value are different
+      # claims -- and against a role the file does not alter, so 15s cannot be
+      # read back from a cluster default and mistaken for the setting.
+      - name: Assert the relay and sweeper roles carry their timeouts
+        run: node scripts/verify-role-timeouts.mjs
+
       # The sent-log's claim and its row-level security, checked against the
       # table. The coverage step above proves the flags are set; this proves the
       # policy does what the flags promise, and that concurrent claims of one key
