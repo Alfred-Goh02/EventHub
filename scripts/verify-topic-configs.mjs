@@ -70,6 +70,12 @@ const EXPECTED = [
     value: '604800000',
     why: 'the sequence is the information here, so a week of it survives a consumer being down for a weekend',
   },
+  {
+    topic: 'community.feed.dlq',
+    name: 'retention.ms',
+    value: '-1',
+    why: 'a feed message that can never be applied must outlive the week nobody looked at it',
+  },
   ...['notification.retry.1', 'notification.retry.2', 'notification.retry.3'].map((topic) => ({
     topic,
     name: 'retention.ms',

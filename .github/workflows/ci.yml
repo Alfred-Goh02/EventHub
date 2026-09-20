@@ -1001,6 +1001,18 @@ jobs:
       - name: Assert a post, its thread and its reactions, and the event they commit with
         run: node scripts/verify-community-posts.mjs
 
+      # The write half of the hybrid feed. A post in a small space reaches every
+      # ACTIVE member and nobody else; a space past the threshold is left to the read
+      # path, with a small space in the same run as the control so "no rows" cannot
+      # pass by nothing having worked. The same message republished writes nothing
+      # twice, and the score is COPIED from the post rather than adjusted by a delta —
+      # asserted by applying the same message again and requiring nothing to move,
+      # because `rankScore + x` survives every other check and is wrong by exactly x
+      # the first time a partition replays. A message that can never be applied goes
+      # to community.feed.dlq and the partition carries on.
+      - name: Assert a post reaches the right feeds, exactly once
+        run: node scripts/verify-community-feed-fanout.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,

@@ -54,6 +54,44 @@ const communityEnvSchema = z.object({
    * by creating five hundred rows is a cap nothing ever tests.
    */
   THREAD_PAGE_LIMIT: z.coerce.number().int().positive().default(500),
+
+  /**
+   * Whether this process runs the fan-out consumer. On everywhere that matters.
+   *
+   * It exists because three verifiers spawn this service to test the HTTP side and do
+   * not want a Kafka consumer as a side effect: on the shared group they would consume
+   * and commit other runs' messages, and from `earliest` they would replay a week of
+   * the topic to do it. Neither of them imports kafkajs, so neither can clean up a
+   * throwaway group afterwards.
+   *
+   * Defaulting to true is the point — a deployment has to opt OUT, so nobody turns the
+   * feed off by forgetting a variable.
+   */
+  FEED_CONSUMER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+
+  /** Where community.feed is read from, and the schema its messages are encoded against. */
+  KAFKA_BROKERS: z.string().min(1),
+  SCHEMA_REGISTRY_URL: z.string().url(),
+  FEED_CONSUMER_GROUP: z.string().min(1).default('community-feed'),
+  /**
+   * earliest, so a consumer group created after the topic already has messages builds
+   * the feed from what is there rather than from whatever arrives next.
+   */
+  FEED_START_FROM: z.enum(['earliest', 'latest']).default('earliest'),
+
+  /**
+   * The largest space whose posts are fanned out to every member on write. Past it a
+   * space is read at query time instead.
+   *
+   * Not a latency limit — fan-out happens in the consumer, after the post is committed
+   * and answered. Measured here, one insert covering 100 000 members takes under a
+   * second. It is a write-amplification limit: at that size a hundred posts a day is
+   * ten million rows a day from one space.
+   */
+  FEED_FANOUT_MAX_MEMBERS: z.coerce.number().int().positive().default(5000),
 });
 
 const base = loadBaseEnv();

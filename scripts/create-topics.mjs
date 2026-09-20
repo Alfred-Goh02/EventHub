@@ -106,6 +106,16 @@ const TOPICS = [
     configEntries: [{ name: 'retention.ms', value: '604800000' }],
     note: 'Community activity: posts, comments and reactions. Keyed by space id, so one space stays ordered.',
   },
+  {
+    topic: 'community.feed.dlq',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // Kept forever, for the reason every dead-letter topic here is: only messages
+    // that can never succeed land in it, so its size is bounded by failures rather
+    // than by traffic, and each one is for a person to look at.
+    configEntries: [{ name: 'retention.ms', value: '-1' }],
+    note: 'Messages the feed consumer can never apply. Inspect, then replay deliberately.',
+  },
   // Notification's delayed retries. Kafka has no delayed delivery, so each delay is
   // a topic: a send that failed for a reason that may pass waits in the next tier,
   // and its source partition moves on. A day's retention is far past any tier's
