@@ -255,6 +255,14 @@ happens at the write, keyed on what the message is, not where it was read:
 - Keyed on the message id alone, one tenant's message silently erased another's
   under a colliding id. Kafka is not tenant-scoped, and an id is only as unique as
   its producer makes it.
+- Community's membership cache was keyed `member:{spaceId}:{userId}`. Redis is not
+  tenant-scoped either, and row security only guards the Postgres read behind it.
+  Another tenant's request under the same user id cached "not a member" under the
+  shared key, and the real member was refused their own space until it expired —
+  measured: their leave answered 404 on the old key and 204 on the fixed one. The
+  other direction let a role check pass on another tenant's cached MODERATOR; row
+  security caught the query after it, which is the only reason nothing leaked.
+  Any cache in front of a tenant-scoped store needs the tenant in its key.
 
 ## Refuse at the edge what the store would silently change
 
