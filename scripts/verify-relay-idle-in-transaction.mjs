@@ -407,7 +407,7 @@ function partE() {
       if (line.includes(DEFINITION)) defAt = i;
       else if (/\bwithClient\s*\(/.test(line)) calls += 1;
       if (!CHECKOUT.test(line)) return;
-      const where = `${relative(REPO_ROOT, file)}:${i + 1}`;
+      const where = `${relative(REPO_ROOT, file).replace(/\\/g, '/')}:${i + 1}`;
       // The one checkout allowed: withClient's own, in the first lines of its body.
       if (i - defAt <= 8) inside.push(where);
       else outside.push(where);
