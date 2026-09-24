@@ -388,8 +388,15 @@ async function main() {
     const members = await inTenant(owner, TENANT, `SELECT "memberCount" FROM "CommunitySpace" WHERE id = $1`, [bigId]);
     check(Number(members.rows[0].memberCount) === FANOUT_MAX + 1, `CONTROL: the big space has ${members.rows[0].memberCount} members, past the threshold of ${FANOUT_MAX}`);
 
-    const bigPost = await api(`/spaces/${bigId}/posts`, { method: 'POST', bearer: asAuthor, body: { body: `big ${RUN}` } });
+    /**
+     * The baseline is read BEFORE the post is written, not after. With the compose
+     * stack up, relay-community publishes a post within milliseconds of it being
+     * written, so the consumer could decline this one before a baseline read after it —
+     * and then waited for a count that had already moved. The feed-read verifier hit
+     * exactly that: "3 of 8" handled, while all eight had been correctly handled.
+     */
     const tooLargeBefore = (await metrics())?.spacesTooLargeToFanOutTotal ?? 0;
+    const bigPost = await api(`/spaces/${bigId}/posts`, { method: 'POST', bearer: asAuthor, body: { body: `big ${RUN}` } });
     await relayOnce();
     const refused = await waitFor(async () => ((await metrics())?.spacesTooLargeToFanOutTotal ?? 0) > tooLargeBefore, 45_000);
     const bigRows = await feedRows(owner, TENANT, bigPost.body?.id);
