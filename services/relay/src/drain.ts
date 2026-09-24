@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
 import { CLAIM_SQL } from './claim-sql.js';
+import { withClient } from './db.js';
 import { PermanentPublishError, type Publisher } from './publisher.js';
 
 export interface OutboxRow {
@@ -76,6 +77,14 @@ export interface DrainResult {
  * forgotten `tsx watch` this comment has warned about since it was
  * written now costs throughput rather than a projection that rebuilds to stale
  * state.
+ *
+ * WHY THE CHECKOUT GOES THROUGH withClient. Holding a transaction across the
+ * Kafka round-trip is the whole design above — and it is also the longest
+ * stretch in this repository during which a client is checked out with no query
+ * in flight. That is the shape `idle_in_transaction_session_timeout = '30s'`,
+ * which this role carries, exists to kill. pg emits that FATAL as an 'error' on
+ * the Client, which has no listener while it is checked out, so before
+ * withClient it was an unhandled 'error' event and the relay exited 1 mid-drain.
  */
 export async function drainOnce(
   pool: pg.Pool,
@@ -83,9 +92,29 @@ export async function drainOnce(
   logger: Logger,
   opts: { batchSize: number; maxAttempts: number },
 ): Promise<DrainResult> {
-  const client = await pool.connect();
   const result: DrainResult = { claimed: 0, published: 0, failed: 0, deadLettered: 0 };
 
+  await withClient(pool, logger, 'eventhub-relay', (client) =>
+    drainWithClient(client, result, publisher, logger, opts),
+  );
+
+  return result;
+}
+
+/**
+ * The drain itself, on a client someone else owns.
+ *
+ * Split out so drainOnce is the checkout and this is the work. The transaction
+ * is still entirely here: whoever hands this a client gets it back in the same
+ * state it was lent, committed or rolled back.
+ */
+async function drainWithClient(
+  client: pg.PoolClient,
+  result: DrainResult,
+  publisher: Publisher,
+  logger: Logger,
+  opts: { batchSize: number; maxAttempts: number },
+): Promise<void> {
   try {
     await client.query('BEGIN');
 
@@ -111,7 +140,7 @@ export async function drainOnce(
 
     if (rows.length === 0) {
       await client.query('COMMIT');
-      return result;
+      return;
     }
 
     const succeeded: string[] = [];
@@ -244,11 +273,7 @@ export async function drainOnce(
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
-  } finally {
-    client.release();
   }
-
-  return result;
 }
 
 export interface RelayMetrics {
