@@ -1952,11 +1952,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # THE SAME DISK FIX AS THE build JOB, which this job never had.
+      #
+      # This job builds the application image and pulls every infrastructure
+      # image onto a runner that still carries the preinstalled SDKs. A run on
+      # #120 measured the root filesystem at 83% before `compose up`, and the
+      # `setup` container then died in bootstrap:index with
+      #   index_create_block_exception: blocked by: [FORBIDDEN/10/cluster
+      #   create-index blocked (api)]
+      # — OpenSearch's 90% high watermark, the exact error the build job's step
+      # below was written for. The same commit's compose job had passed an hour
+      # earlier, so it was variance whether the build crossed the line; every PR
+      # that adds an image or a service makes crossing it more likely.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h /
+
       # The whole file this time, not a named subset. --wait returns only when
       # every container is HEALTHY, so this step passing is already the claim:
       # a non-zero exit means the one-command start does not work.
       - name: docker compose up -d --wait
         run: docker compose up -d --wait --wait-timeout 600
+
+      # Measured after the build, because the build is what fills the disk. If
+      # this job ever starts failing on OpenSearch again, this line says how
+      # close it came rather than leaving it to be rediscovered from a 403.
+      - name: Report disk after the stack is up
+        if: always()
+        run: df -h /
 
       - name: Show what came up
         if: always()
