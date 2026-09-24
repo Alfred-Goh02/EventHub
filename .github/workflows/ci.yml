@@ -2045,6 +2045,14 @@ jobs:
       - name: Prove a password reset crosses the whole stack
         run: node scripts/verify-compose-password-reset.mjs
 
+      # Every other sweeper verifier starts a sweeper of its own with --once, so
+      # none of them could notice that nothing in the stack ran one -- and nothing
+      # did: Ticketing's container never imported it, and a lapsed hold kept its
+      # seats for good. This one lets a hold lapse in the running containers and
+      # starts nothing; the stack has to give the seats back by itself.
+      - name: Prove the stack returns an expired seat hold
+        run: node scripts/verify-compose-hold-sweeper.mjs
+
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
       # issued, and the symptom is a 401 with no explanation.

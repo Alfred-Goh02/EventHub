@@ -86,7 +86,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis |
 | `db/init/` | Six databases and eighteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 71 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 72 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a

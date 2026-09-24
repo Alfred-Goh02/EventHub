@@ -519,11 +519,11 @@ services:
       PORT: 3003
       DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       APP_DATABASE_URL: postgresql://eventhub_ticketing_app:eventhub_ticketing_app@postgres:5432/eventhub_ticketing
-      # A third role, with its own narrow grants: the sweeper and reconciler run
-      # inside this process and must not inherit the API's permissions.
+      # The sweeper's cross-tenant credential, which the API holds for ONE read:
+      # a webhook arrives with no tenant, and the route looks up which tenant the
+      # payment belongs to (routes/webhooks.ts). The sweeper does NOT run in this process --
+      # it is ticketing-sweeper, below.
       SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
-      SWEEPER_BATCH_SIZE: 100
-      SWEEPER_INTERVAL_MS: 5000
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
       # Local only, and the same value the .env.example carries. A real secret
       # would come from the environment, never from a committed file.
@@ -538,6 +538,38 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Ticketing's hold sweeper: returns the seats of every hold that lapsed.
+  #
+  # Its own process and its own credential, because it works ACROSS tenants -- a
+  # TTL sweep selects by expiry, which has no tenant -- so it gets a role bounded
+  # by grants and not the API's. See src/sweeper/index.ts.
+  #
+  # Until this was added nothing ran it. The block above said "the sweeper and
+  # reconciler run inside this process" and handed the API SWEEPER_BATCH_SIZE and
+  # SWEEPER_INTERVAL_MS, but dist/index.js never imports the sweeper; only
+  # verifiers ran it, with --once. Measured on the stack: a lapsed hold was still
+  # HELD 30 s later with its seats out of inventory, and a leftover one had sat
+  # HELD six days past its expiry. Every abandoned checkout removed its seats for
+  # good, and the symptom is "sold out" on an event that is not.
+  #
+  # scripts/verify-compose-hold-sweeper.mjs lets a hold lapse in the running stack
+  # and requires it back without starting a sweeper of its own.
+  # ---------------------------------------------------------------------------
+  ticketing-sweeper:
+    <<: *app
+    container_name: eventhub-ticketing-sweeper
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
+      SWEEPER_BATCH_SIZE: 100
+      SWEEPER_INTERVAL_MS: 5000
+    working_dir: /app/services/ticketing
+    command: ["node", "dist/sweeper/index.js"]
 
   # ---------------------------------------------------------------------------
   # The Live service: the only stateful one in the fleet.
