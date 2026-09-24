@@ -63,6 +63,11 @@ model Post {
   rankScore     Float         @default(0)
   createdAt     DateTime      @default(now())
   editedAt      DateTime?
+  /// Which half of the feed this post belongs to, decided once, by the consumer, in the
+  /// same transaction as the fan-out. False means the read path queries it directly.
+  /// Judging by the space's size at READ time instead loses the posts of a space that
+  /// shrank under the threshold — see migration 20260924000000.
+  fannedOut     Boolean       @default(false)
 
   @@index([tenantId, spaceId, createdAt(sort: Desc)])
 }
@@ -148,10 +153,15 @@ model FeedEntry {
   postId    String
   spaceId   String
   rankScore Float
+  /// The POST's createdAt, copied at fan-out, not the time this row was written — so
+  /// the feed is ordered by when things happened rather than by consumer lag. Immutable,
+  /// which is what makes it safe to page on; rankScore is not.
   createdAt DateTime @default(now())
 
   @@unique([tenantId, userId, postId])
-  @@index([tenantId, userId, rankScore(sort: Desc)])
+  /// The keyset the feed pages on. See migration 20260924000000 for why it is not
+  /// rankScore.
+  @@index([tenantId, userId, createdAt(sort: Desc), postId(sort: Desc)], map: "FeedEntry_time_keyset_idx")
 }
 
 /// The transactional outbox, in the shape @eventhub/relay drains. Named and columned
