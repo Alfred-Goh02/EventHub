@@ -104,6 +104,48 @@ export async function readMembership(
   return membership;
 }
 
+/**
+ * May this caller read or write in this space?
+ *
+ * A public space is open to anyone in the tenant; a private one only to its members,
+ * and it answers 404 rather than 403 so it does not confirm its own existence.
+ *
+ * Moved here from routes/posts.ts when reporting needed the same answer. Two copies of
+ * an authorisation check are two places for them to disagree.
+ */
+export async function reach(
+  tenantId: string,
+  spaceId: string,
+  userId: string,
+  need: 'read' | 'write',
+  logger: Logger,
+): Promise<{ status: 200 | 403 | 404; error?: string }> {
+  const rows = await withTenant(tenantId, (tx) =>
+    tx.$queryRaw<Array<{ visibility: string }>>`
+      SELECT visibility::text AS visibility FROM "CommunitySpace" WHERE id = ${spaceId}`,
+  );
+  if (!rows[0]) return { status: 404 };
+  const membership = await readMembership(tenantId, spaceId, userId, logger);
+  if (membership?.status === 'BANNED') return { status: 403, error: 'banned from this space' };
+  if (rows[0].visibility === 'PRIVATE' && !membership) return { status: 404 };
+  // Reading a public space needs nothing; writing in any space needs membership.
+  if (need === 'write' && !membership) return { status: 403, error: 'join the space first' };
+  return { status: 200 };
+}
+
+/**
+ * Is this membership ACTIVE and at least `minRole`? The same test requireMembership
+ * applies, for callers that cannot take the space from the URL.
+ *
+ * Moderation is the reason it exists. There the space must come from the TARGET — the
+ * post or comment being acted on — and never from a path parameter, or a moderator of
+ * one space passes their own space's id alongside a post from another and the check
+ * passes on the wrong space.
+ */
+export function atLeast(membership: Membership | null, minRole: SpaceRole): boolean {
+  return membership !== null && membership.status === 'ACTIVE' && RANK[membership.role] >= RANK[minRole];
+}
+
 export function requireMembership(minRole: SpaceRole, logger: Logger): RequestHandler {
   // Wrapped, like every async handler here: Express 4 does not await middleware, so a
   // database error inside this would be an unhandled rejection rather than a 500.

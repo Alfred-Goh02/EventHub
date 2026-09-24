@@ -1025,6 +1025,18 @@ jobs:
       - name: Assert the feed returns every post once, in order, while scores move
         run: node scripts/verify-community-feed-read.mjs
 
+      # Moderation. A moderator's role is judged in the TARGET'S space: one who
+      # moderates S1 and is a plain member of S2 asks to hide S2's post, naming S1
+      # in the body the way a route trusting its request would be fooled, and must
+      # get 403 with the post untouched and nothing audited. Every change writes its
+      # audit row in the same transaction; a second HIDE writes none; a report
+      # attached to the wrong target is refused AND rolls the hide back with it.
+      # Hiding a comment takes its subtree — its replies are not promoted to the top
+      # — and the post's count and score are recomputed, so hidden spam stops buying
+      # rank. Nothing can be written under hidden content. Eight mutations watched red.
+      - name: Assert moderation acts only where the moderator moderates, and is audited
+        run: node scripts/verify-community-moderation.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,
