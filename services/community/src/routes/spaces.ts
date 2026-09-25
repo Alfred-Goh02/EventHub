@@ -5,7 +5,8 @@ import { getAuth } from '@eventhub/auth-middleware';
 import type { Logger } from '@eventhub/logger';
 import { ah } from '@eventhub/http';
 import { withTenant } from '../db.js';
-import { forgetMembership, readMembership, requireMembership, type SpaceRole } from '../middleware/space.js';
+import { forgetMembership, RANK, readMembership, requireMembership, type SpaceRole } from '../middleware/space.js';
+import { recordAction } from '../visibility.js';
 
 /**
  * Spaces and who is in them.
@@ -33,6 +34,8 @@ const memberSchema = z
   .object({
     role: z.enum(['MEMBER', 'MODERATOR', 'OWNER']).optional(),
     status: z.enum(['ACTIVE', 'BANNED']).optional(),
+    /** Why, for the audit row of a ban or an unban. */
+    reason: z.string().max(500).optional(),
   })
   .refine((body) => body.role !== undefined || body.status !== undefined, {
     message: 'give a role, a status, or both',
@@ -137,49 +140,89 @@ export function spaceRoutes(
   /**
    * A moderator may ban or restore a member; only an OWNER may change roles.
    *
+   * EVERYONE ACTS ONLY ON LOWER RANKS. A moderator bans members, not other moderators —
+   * or two moderators who disagree ban each other, and whoever is faster owns the
+   * space. Only an owner acts on a moderator. An owner is protected from everyone,
+   * other owners included: the only way out of ownership is leaving, which checks for
+   * the last one. Decided 2026-09-25.
+   *
+   * THE ROLES ARE JUDGED INSIDE THE TRANSACTION, ON LOCKED ROWS. requireMembership read
+   * the actor's role through the cache, which can be up to MEMBERSHIP_CACHE_TTL_S old if
+   * a cache delete failed, and the target's role could change between reading it and
+   * writing. Both rows are locked in one statement, in id order, so two moderators
+   * acting on each other at once queue rather than deadlock.
+   *
+   * A BAN AND AN UNBAN ARE AUDITED, in the same transaction, as compare-and-set: banning
+   * someone already banned changes nothing and writes no second row.
+   *
    * The cache is dropped for the user whose membership changed, so the next request
    * sees it — not up to MEMBERSHIP_CACHE_TTL_S later.
    */
   router.patch('/spaces/:spaceId/members/:userId', requireMembership('MODERATOR', logger), ah(async (req, res) => {
     const parsed = memberSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
-    const { tenantId } = getAuth(req);
+    const { tenantId, userId: actorId } = getAuth(req);
     const spaceId = req.params['spaceId']!;
     const target = req.params['userId']!;
-    const actor = req.membership!;
+    const { role, status, reason } = parsed.data;
 
-    if (parsed.data.role !== undefined && actor.role !== 'OWNER') {
-      return res.status(403).json({ error: 'only an owner changes roles' });
-    }
+    type Outcome =
+      | { kind: 'no-member' }
+      | { kind: 'refused'; code: 403 | 409; error: string }
+      | { kind: 'done'; statusChanged: boolean };
 
-    const changed = await withTenant(tenantId, async (tx) => {
-      const rows = await tx.$queryRaw<Array<{ role: SpaceRole }>>`
-        SELECT role::text AS role FROM "Membership"
-         WHERE "tenantId" = ${tenantId} AND "spaceId" = ${spaceId} AND "userId" = ${target}`;
-      const current = rows[0];
-      if (!current) return null;
-      // An owner is not demoted or banned by a moderator, and not by another owner
-      // either: the only way out of ownership is leaving, which checks for the last one.
-      if (current.role === 'OWNER') return { protected: true };
+    const outcome = await withTenant(tenantId, async (tx): Promise<Outcome> => {
+      const rows = await tx.$queryRaw<Array<{ userId: string; role: SpaceRole; status: 'ACTIVE' | 'BANNED' }>>`
+        SELECT m."userId", m.role::text AS role, m.status::text AS status FROM "Membership" m
+         WHERE m."tenantId" = ${tenantId} AND m."spaceId" = ${spaceId} AND m."userId" IN (${actorId}, ${target})
+         ORDER BY m.id
+         FOR UPDATE`;
+      const actor = rows.find((r) => r.userId === actorId);
+      const current = rows.find((r) => r.userId === target);
 
-      if (parsed.data.role !== undefined) {
+      // The cached answer let the request in; the locked row decides.
+      if (!actor || actor.status !== 'ACTIVE' || RANK[actor.role] < RANK.MODERATOR) {
+        return { kind: 'refused', code: 403, error: 'only a moderator of this space can do that' };
+      }
+      if (role !== undefined && actor.role !== 'OWNER') return { kind: 'refused', code: 403, error: 'only an owner changes roles' };
+      if (!current) return { kind: 'no-member' };
+      if (current.role === 'OWNER') return { kind: 'refused', code: 409, error: "an owner's membership cannot be changed here" };
+      if (RANK[current.role] >= RANK[actor.role]) {
+        return { kind: 'refused', code: 403, error: 'only someone above their role can change this membership' };
+      }
+
+      if (role !== undefined) {
         await tx.$executeRaw`
-          UPDATE "Membership" SET role = ${parsed.data.role}::"SpaceRole"
+          UPDATE "Membership" SET role = ${role}::"SpaceRole"
            WHERE "tenantId" = ${tenantId} AND "spaceId" = ${spaceId} AND "userId" = ${target}`;
       }
-      if (parsed.data.status !== undefined) {
-        await tx.$executeRaw`
-          UPDATE "Membership" SET status = ${parsed.data.status}::"MemberStatus"
-           WHERE "tenantId" = ${tenantId} AND "spaceId" = ${spaceId} AND "userId" = ${target}`;
+      let statusChanged = false;
+      if (status !== undefined) {
+        const moved = await tx.$executeRaw`
+          UPDATE "Membership" SET status = ${status}::"MemberStatus"
+           WHERE "tenantId" = ${tenantId} AND "spaceId" = ${spaceId} AND "userId" = ${target}
+             AND status <> ${status}::"MemberStatus"`;
+        statusChanged = moved === 1;
+        if (statusChanged) {
+          await recordAction(tx, {
+            tenantId,
+            spaceId,
+            actorId,
+            targetType: 'MEMBER',
+            targetId: target,
+            action: status === 'BANNED' ? 'BAN' : 'UNBAN',
+            reason,
+          });
+        }
       }
-      return { protected: false };
+      return { kind: 'done', statusChanged };
     });
 
-    if (!changed) return res.status(404).json({ error: 'not a member of this space' });
-    if (changed.protected) return res.status(409).json({ error: "an owner's membership cannot be changed here" });
+    if (outcome.kind === 'no-member') return res.status(404).json({ error: 'not a member of this space' });
+    if (outcome.kind === 'refused') return res.status(outcome.code).json({ error: outcome.error });
 
     await forgetMembership(tenantId, spaceId, target);
-    return res.json({ spaceId, userId: target, ...parsed.data });
+    return res.json({ spaceId, userId: target, role, status, statusChanged: outcome.statusChanged });
   }));
 
   /** Leaving, except for the last owner: a space nobody can moderate is worse than a space nobody left. */

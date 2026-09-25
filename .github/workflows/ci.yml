@@ -1069,6 +1069,16 @@ jobs:
       - name: Assert moderation acts only where the moderator moderates, and is audited
         run: node scripts/verify-community-moderation.mjs
 
+      # Authors' deletes and bans. Only the author deletes, audited once; UNHIDE
+      # cannot bring a deleted post back; leaving the space does not strand what you
+      # wrote, and a ban stops it. A deleted comment keeps other people's replies: it
+      # comes back as a tombstone, with its words and author blanked in SQL, and goes
+      # once nothing is left under it. Everyone acts only on lower ranks, judged on
+      # the locked row — a moderator demoted behind a still-warm cache is refused.
+      # Bans and unbans are audited once each. Five red runs, twelve mutations.
+      - name: Assert authors delete only their own words, and bans follow rank
+        run: node scripts/verify-community-deletes-bans.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,
