@@ -7,6 +7,7 @@ import { redis } from './redis.js';
 import { createRateLimiter } from './ratelimit.js';
 import { spaceRoutes } from './routes/spaces.js';
 import { postRoutes } from './routes/posts.js';
+import { feedRoutes } from './routes/feed.js';
 import { createFeedConsumer, feedMetrics } from './feed/consumer.js';
 
 /**
@@ -128,6 +129,7 @@ async function main(): Promise<void> {
       reaction: env.RATE_LIMIT_REACTION_PER_MINUTE,
     }),
   );
+  app.use(requireAuth, feedRoutes());
 
   app.use(errorHandler);
 

@@ -90,6 +90,15 @@ export async function fanOutPost(
        AND m.status = 'ACTIVE'::"MemberStatus"
     ON CONFLICT ("tenantId", "userId", "postId") DO NOTHING`;
 
+  /**
+   * And the post is marked as belonging to the materialised half, IN THE SAME
+   * TRANSACTION as the rows. A reader's single statement then sees the rows and the
+   * flag together or neither, so the post is never in both halves and never in none.
+   * Judging "large" at read time instead loses every post of a space that shrinks
+   * back under the threshold; see migration 20260924000000.
+   */
+  await tx.$executeRaw`UPDATE "Post" SET "fannedOut" = true WHERE id = ${message.postId} AND "fannedOut" = false`;
+
   return { outcome: 'fanned-out', memberCount, rows };
 }
 
