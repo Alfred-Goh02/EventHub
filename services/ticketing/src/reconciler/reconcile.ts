@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
 import type { PaymentProvider } from '../payments/provider.js';
+import { withClient } from '../pool.js';
 import { settleAttempt } from '../payments/settle.js';
 
 export interface ReconcileResult {
@@ -200,22 +201,21 @@ export async function reconcileOnce(
     // learn the same fact by different routes -- one asks, one is told -- and
     // two copies of this logic would drift, with the drift showing up as
     // inventory that does not add up weeks later.
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const settled = await settleAttempt(client, payment, outcome, logger);
-      await client.query('COMMIT');
+    await withClient(pool, logger, 'ticketing-reconciler', async (client) => {
+      try {
+        await client.query('BEGIN');
+        const settled = await settleAttempt(client, payment, outcome, logger);
+        await client.query('COMMIT');
 
-      if (settled === 'confirmed') result.confirmed += 1;
-      else if (settled === 'released') result.released += 1;
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      // One bad row must not stop the batch. It stays unsettled and is picked up
-      // next pass, which is the safe direction to fail.
-      logger.error({ err, paymentId: payment.id }, 'failed to reconcile');
-    } finally {
-      client.release();
-    }
+        if (settled === 'confirmed') result.confirmed += 1;
+        else if (settled === 'released') result.released += 1;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        // One bad row must not stop the batch. It stays unsettled and is picked up
+        // next pass, which is the safe direction to fail.
+        logger.error({ err, paymentId: payment.id }, 'failed to reconcile');
+      }
+    });
   }
 
   return result;

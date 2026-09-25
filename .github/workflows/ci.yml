@@ -1721,6 +1721,30 @@ jobs:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
         run: node scripts/verify-relay-ordering.mjs
 
+      # A connection the database kills while it is CHECKED OUT must not kill
+      # the process. It did: the relay exited 1 mid-drain on
+      #
+      #   error: terminating connection due to idle-in-transaction timeout
+      #   Emitted 'error' event on Client instance
+      #
+      # which is the one error its role's idle_in_transaction_session_timeout
+      # exists to produce. pg-pool forwards errors only from IDLE clients, and
+      # pg's Client emits (rather than rejecting a query) only when no query is
+      # in flight -- so "checked out, transaction open, idle" had no listener.
+      # withClient() closes it in all three services that carry a pool helper.
+      #
+      # Forces the case with a per-session 1s timeout rather than waiting 30s.
+      # Its negative control runs every time: a child process doing the
+      # unguarded checkout must die of exactly that unhandled 'error'. Also
+      # counts listeners across twelve checkouts of one Client, drives the
+      # shipped drain through a termination mid-publish, and ratchets every
+      # pool.connect() in services/ into a withClient.
+      - name: Assert a connection terminated while checked out is not fatal
+        env:
+          EVENT_APP_DATABASE_URL: ${{ env.EVENT_APP_DATABASE_URL }}
+          RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
+        run: node scripts/verify-relay-idle-in-transaction.mjs
+
       - name: Verify outbox to Kafka end to end
         env:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
