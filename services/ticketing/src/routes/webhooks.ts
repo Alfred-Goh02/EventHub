@@ -3,9 +3,9 @@ import { Router, type Request } from 'express';
 import pg from 'pg';
 import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { settleAttempt } from '../payments/settle.js';
-import { attachPoolErrorHandler } from '../pool.js';
+import { attachPoolErrorHandler, withClient } from '../pool.js';
 
 export const webhooks: Router = Router();
 
@@ -235,26 +235,25 @@ webhooks.post('/payments', ah(async (req, res) => {
       ? ({ status: 'succeeded', providerRef: providerRef ?? `webhook_${paymentId}` } as const)
       : ({ status: 'failed', reason: reason ?? 'charge_failed' } as const);
 
-  const client = await appPool.connect();
-  try {
-    await client.query('BEGIN');
-    // The tenant comes from the DATABASE, never from the payload. From here on
-    // this is an ordinary tenant-scoped transaction under the same policies as
-    // any request.
-    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [payment.tenantId]);
+  return withClient(appPool, logger, 'webhook-settle', async (client) => {
+    try {
+      await client.query('BEGIN');
+      // The tenant comes from the DATABASE, never from the payload. From here on
+      // this is an ordinary tenant-scoped transaction under the same policies as
+      // any request.
+      await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [payment.tenantId]);
 
-    const settled = await settleAttempt(client, payment, outcome, logger);
-    await client.query('COMMIT');
+      const settled = await settleAttempt(client, payment, outcome, logger);
+      await client.query('COMMIT');
 
-    logger.info({ paymentId, type, settled }, 'webhook applied');
-    return res.status(200).json({ received: true, result: settled });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    // 500 so the provider retries. Nothing was written, and the reconciler would
-    // pick this up anyway — the webhook is an accelerator, never the only route.
-    logger.error({ err, paymentId }, 'failed to apply webhook');
-    return res.status(500).json({ error: 'could not apply webhook' });
-  } finally {
-    client.release();
-  }
+      logger.info({ paymentId, type, settled }, 'webhook applied');
+      return res.status(200).json({ received: true, result: settled });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      // 500 so the provider retries. Nothing was written, and the reconciler would
+      // pick this up anyway — the webhook is an accelerator, never the only route.
+      logger.error({ err, paymentId }, 'failed to apply webhook');
+      return res.status(500).json({ error: 'could not apply webhook' });
+    }
+  });
 }));

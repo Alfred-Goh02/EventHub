@@ -255,6 +255,14 @@ happens at the write, keyed on what the message is, not where it was read:
 - Keyed on the message id alone, one tenant's message silently erased another's
   under a colliding id. Kafka is not tenant-scoped, and an id is only as unique as
   its producer makes it.
+- Community's membership cache was keyed `member:{spaceId}:{userId}`. Redis is not
+  tenant-scoped either, and row security only guards the Postgres read behind it.
+  Another tenant's request under the same user id cached "not a member" under the
+  shared key, and the real member was refused their own space until it expired —
+  measured: their leave answered 404 on the old key and 204 on the fixed one. The
+  other direction let a role check pass on another tenant's cached MODERATOR; row
+  security caught the query after it, which is the only reason nothing leaked.
+  Any cache in front of a tenant-scoped store needs the tenant in its key.
 
 ## Refuse at the edge what the store would silently change
 
@@ -302,6 +310,110 @@ columns. On ClickHouse 25.8, `EXPLAIN indexes = 1` shows it using `event_id` onl
 whether the list is a parameter or literals, so it reads every tenant's granules.
 Two separate `IN` lists use both columns.
 
+## A cleanup filtered by the policy it ignores deletes nothing, quietly
+
+`verify-community-foundation.mjs` ended with a DELETE per tenant per table as the
+owner, and then counted what was left. Both ran with **no `app.tenant_id` set**.
+FORCE row security binds the owner, so the DELETE matched zero rows — and the
+count asked through the same filter, saw an empty table, and reported "0 left".
+A cleanup that works and a cleanup that deletes nothing were indistinguishable,
+and the error was swallowed by `.catch(() => {})`.
+
+It ran that way for several chapters. Every run left two `OutboxMessage` rows on
+community.feed with a payload of `{}`, which no relay can ever encode. Eight rows
+and four abandoned runs later, a relay pass in a *different* verifier claimed one,
+dead-lettered it, exited 1, and failed CI — which is the only reason anyone
+looked. Locally it stayed hidden, because compose's relay-community had already
+dead-lettered them; CI starts infrastructure only, so there they were still
+waiting.
+
+Measured, with the delete reverted: `0 deleted, 22 left`. Fixed: `22 deleted,
+0 left`.
+
+Two rules fall out. A cleanup runs in the same context the writes ran in. And it
+reports what it **deleted**, not only what remains — `0 deleted, 0 left` passing
+is exactly the bug, so the delete count is the positive control.
+
+## The compose stack may be doing your verifier's work for it
+
+A verifier ran the relay itself with `--once` and asserted the pass exited 0. That
+control was worth nothing twice over: the exit code is 0 for a pass that found
+nothing to do, and `relay-community` is a compose service draining the *same*
+outbox, so with the stack up the row is published whether the verifier's pass runs
+or not.
+
+Deleting the call to `relayOnce()` entirely left every assertion below it green.
+A control that survives the removal of the thing it controls for is decoration.
+
+The fix is to assert the effect on the row — `publishedAt` is set for THIS message
+id — rather than the behaviour of the process the verifier happens to have started.
+Same family as checking what owns a port before trusting its answer.
+
+## Timestamps come from the database, and are compared there
+
+Prisma maps `DateTime` to `timestamp WITHOUT time zone`, and node-postgres reads
+such a column as LOCAL time and writes a JS `Date` into it as local wall time.
+Containers run UTC, so this is invisible in compose and in CI — and a verifier
+spawns services on the HOST, which here is UTC+8.
+
+Community's outbox payload carried `occurredAt: new Date().toISOString()` while
+the schema said it was the row's commit time and consumers order on it. It was
+really the app's clock: measured 2 ms from the row's own `createdAt` on one
+machine with both clocks correct, and the gap across services is whatever their
+clocks disagree by. It is stamped in the same statement now, from the same
+`now()` the row defaults to.
+
+Then the *assertion* for it made the mirror-image mistake — reading `createdAt`
+into JS and comparing `Date.parse()` — and reported an eight-hour difference, to
+the millisecond, on a correct service. It would have failed here and passed on
+CI. The comparison happens in SQL now; Postgres comparing its own column to its
+own rendering has no timezone to get wrong.
+
+The rest of the repository is already safe because it does all of this in SQL:
+`now()`, `now() + ($4 || ' seconds')::interval`, `extract(epoch from now() - ...)`.
+Keep it that way — never pass a JS `Date` into one of these columns, and never
+compare one in JS.
+
+## The right value for the wrong reason is not a passing test
+
+`community.feed` was added to `create-topics.mjs` asking for
+`retention.ms=604800000`, and to `verify-topic-configs.mjs` asserting the same
+number. It went green immediately. Nothing had been applied: Kafka's
+`log.retention.hours=168` **is** 604800000, so the check was reading the broker
+default back and agreeing with itself.
+
+Both halves had the same blindness, and both were written by the events.activity.dlq
+bug at the top of that file:
+
+- the verifier compared `configValue` only, so it could not tell a value we set
+  from one we were given;
+- `create-topics.mjs` measured drift the same way, so the config was never
+  counted as drifted and `alterConfigs` was never called. It printed
+  "topic configs already match this file".
+
+`describeConfigs` answers this directly — `isDefault: false` means the value is
+set on the topic. Measured across every expectation in that file: all
+`isDefault=false` except the one that was wrong. After the fix the script printed
+`reconciled community.feed: retention.ms 604800000 (broker default) -> 604800000`,
+which is the whole bug in one line.
+
+When an expected value coincides with a default, equality proves nothing. Assert
+the provenance, not just the number.
+
+## A closed set is a ranking control, not tidiness
+
+Community's reactions accepted any upper-case string as a `kind`. `kind` is part of
+the Reaction unique key, so two different kinds from the same user are two rows and
+two increments of the counter that feeds `rankScore`. One account could invent a
+kind per request and push a post's rank as far as the rate limiter allowed.
+
+Measured before it was fixed: one user, two invented kinds, the post's count went
+from one to three. The unique key looked like "one reaction per person per post"
+and enforced nothing of the sort.
+
+Where a value is part of a key, the set of values it may take is part of the
+constraint.
+
 ## Readiness must ask the dependency as this process
 
 ClickHouse answers `GET /ping` without authenticating, so a `/ready` built on
@@ -310,3 +422,81 @@ fails with `AUTHENTICATION_FAILED`.
 
 The same probe had also latched true once the consumer started, so a crash-looping
 consumer answered ready. Readiness has to track the failure it exists to report.
+
+## A probe that can match nothing proves nothing
+
+Notification refuses to start if its sweeper credential can mark a delivery SENT. The
+probe was `UPDATE "NotificationDelivery" SET status = 'SENT' WHERE status = 'PENDING'`,
+and row security refuses that PER ROW. On a database with nothing in flight it matched
+no rows, raised nothing, and reported that the credential could do the one thing it
+must not — so every email verifier's Notification refused to start, on a system that
+was merely idle.
+
+Probe something that cannot be empty: ask the catalog whether the rule exists, or hold
+a row and act on it. Same shape as `relayB.length >= 0`, which held most strongly of
+nothing.
+
+## An RLS test of WITH CHECK must not use RETURNING or WHERE
+
+Either one makes Postgres apply the USING clause to the new row, so a policy with
+`WITH CHECK (true)` stayed green. Roll such statements back rather than committing
+them: with RLS broken, an unscoped UPDATE moves every visible row.
+
+## A refusal from your relay is not a verdict from the recipient
+
+Suppression reacts to a 5.1.x reply to RCPT TO. That reply comes from the SMTP host
+this system relays through — a smarthost with a stale recipient table, a half-finished
+MX migration — not from the recipient's own server. The design note claimed otherwise,
+and with no expiry that would have been a permanent password-reset lockout for every
+user of a misconfigured domain. Every suppression now ends, and each new bounce extends
+it.
+
+Addresses are less regular than a pattern assumes, too: `mary.o'connor@corp.example` is
+one Auth accepts, and a redaction pattern treating `'` as a delimiter published the
+name into logs, rows and Kafka headers.
+
+## `pnpm run <script> -- a b` hands the script the `--`
+
+On every shell except PowerShell, where pnpm.ps1 swallows it first. The documented
+`suppression:remove -- <tenant> <address>` therefore read the tenant as `--` and told
+the operator the address was not suppressed — the one answer that must not be wrong
+while a user is locked out. `dlq:replay` had it too. Strip a leading `--` before
+reading arguments, and have a verifier run the DOCUMENTED form, not just the file.
+
+## Count check results with an anchor and a control
+
+A merge guard counted `FAIL` lines in a CI log with a pattern built for the wrong
+format. It found 0 failures, and also 0 passes: zero failures out of zero lines is not
+a green run. Anchor on the timestamp (`\dZ\s+ok {4}\S`), and print the ok count as the
+control every time — 972 on #109, 1043 on #112.
+
+## Retrying a partial batch API never succeeds
+
+kafkajs's `admin.deleteGroups(list)` deletes what it can and throws for the rest.
+Retried with the same list, it then fails on the groups it already deleted, for ever,
+so a verifier's cleanup reported "left to expire" on every run. Delete one at a time,
+and judge by the effect: whether the cluster still lists the group.
+
+## Measure the container before blaming the process
+
+Notification exited 137 on `docker compose stop`, and the conclusion written down was
+"shutdown outlives the grace period". It did not: every container on that machine had
+been created with `Config.StopTimeout=1`, and the stop took 1.7 s. An explicit
+`stop_grace_period` fixed it, and the shutdown then took 4.6 s and exited 0. The
+measurement — `docker inspect` and a timed stop — cost two minutes and pointed
+somewhere else entirely.
+
+## Searches that quietly look at nothing
+
+Each of these returned "no matches" from a search that was not running:
+
+- a `*/src/**` or brace glob matches nothing; use `**/src/**`, or pass the path
+- ripgrep skips `node_modules` when handed a directory, because .gitignore excludes it:
+  pass the exact file, or use `Select-String`
+- PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, which Prisma rejects as
+  an invalid schema
+- a here-string can stop being one on a stray trailing space, and the shell then splits
+  a commit message into pathspecs. `git commit -F <file>` has no quoting to get wrong.
+
+Treat "no matches" from a narrow search as no evidence at all, and prove the search
+works by making it match something.

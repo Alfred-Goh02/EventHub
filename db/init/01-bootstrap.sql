@@ -32,6 +32,32 @@ CREATE ROLE eventhub_live_app   LOGIN          PASSWORD 'eventhub_live_app';
 CREATE ROLE eventhub_notification_owner LOGIN CREATEDB PASSWORD 'eventhub_notification_owner';
 CREATE ROLE eventhub_notification_app   LOGIN          PASSWORD 'eventhub_notification_app';
 
+-- Ends deliveries that were claimed and never finished.
+--
+-- A delivery is claimed PENDING before anything is sent, and Kafka re-drives almost
+-- all of them. The ones that never move again are the ones whose message was
+-- dead-lettered, or whose retention passed while the row waited. Nothing can re-drive
+-- those — the row holds no sealed request, and a reset link is dead within the hour —
+-- so they are given a terminal state instead, and PENDING goes back to meaning "in
+-- flight", which is what makes a count of PENDING rows worth alerting on.
+--
+-- Its own role, like Ticketing's sweeper, because "which deliveries never finished"
+-- is a question with no tenant in it: it cannot use the tenant-scoped policy the app
+-- role uses, and the process that sends must not gain that reach.
+CREATE ROLE eventhub_notification_sweeper LOGIN PASSWORD 'eventhub_notification_sweeper';
+ALTER ROLE eventhub_notification_sweeper SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_notification_sweeper SET statement_timeout = '15s';
+
+CREATE ROLE eventhub_community_owner LOGIN CREATEDB PASSWORD 'eventhub_community_owner';
+CREATE ROLE eventhub_community_app   LOGIN          PASSWORD 'eventhub_community_app';
+
+-- Drains Community's outbox. The fourth relay credential, and the same reasoning as
+-- the other three: it reads by delivery state, which has no tenant, so it gets its own
+-- role and its own policy rather than the service's credential gaining that reach.
+CREATE ROLE eventhub_community_relay LOGIN PASSWORD 'eventhub_community_relay';
+ALTER ROLE eventhub_community_relay SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_community_relay SET statement_timeout = '15s';
+
 -- Drains Ticketing's own outbox. Same shape and same reasoning as the Event
 -- relay: it reads by delivery state across every tenant, so it is a separate
 -- role with its own policy rather than a reason to reach for the superuser.
@@ -91,6 +117,7 @@ CREATE DATABASE eventhub_event OWNER eventhub_event_owner;
 CREATE DATABASE eventhub_ticketing OWNER eventhub_ticketing_owner;
 CREATE DATABASE eventhub_live OWNER eventhub_live_owner;
 CREATE DATABASE eventhub_notification OWNER eventhub_notification_owner;
+CREATE DATABASE eventhub_community OWNER eventhub_community_owner;
 
 -- ---------------------------------------------------------------------------
 -- Connection isolation. By default PUBLIC may CONNECT to any database, so the
@@ -112,7 +139,12 @@ REVOKE CONNECT ON DATABASE eventhub_live FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_live TO eventhub_live_owner, eventhub_live_app;
 
 REVOKE CONNECT ON DATABASE eventhub_notification FROM PUBLIC;
-GRANT  CONNECT ON DATABASE eventhub_notification TO eventhub_notification_owner, eventhub_notification_app;
+GRANT  CONNECT ON DATABASE eventhub_notification TO eventhub_notification_owner, eventhub_notification_app,
+                                                    eventhub_notification_sweeper;
+
+REVOKE CONNECT ON DATABASE eventhub_community FROM PUBLIC;
+GRANT  CONNECT ON DATABASE eventhub_community TO eventhub_community_owner, eventhub_community_app,
+                                                 eventhub_community_relay;
 
 -- ---------------------------------------------------------------------------
 -- Schema-level access, granted inside each database.
@@ -138,4 +170,13 @@ GRANT USAGE ON SCHEMA public TO eventhub_ticketing_app, eventhub_ticketing_relay
 GRANT USAGE ON SCHEMA public TO eventhub_live_app;
 
 \connect eventhub_notification
-GRANT USAGE ON SCHEMA public TO eventhub_notification_app;
+GRANT USAGE ON SCHEMA public TO eventhub_notification_app, eventhub_notification_sweeper;
+
+\connect eventhub_community
+GRANT USAGE ON SCHEMA public TO eventhub_community_app, eventhub_community_relay;
+
+-- ltree, for the materialised path threaded comments are ordered and fetched by.
+-- Created here, as the superuser, rather than in the migration: CREATE EXTENSION
+-- needs privileges the owner role does not have, and a migration that cannot run on a
+-- fresh database is a migration that fails on the one machine nobody has tried.
+CREATE EXTENSION IF NOT EXISTS ltree;

@@ -6,7 +6,7 @@ import type { Logger } from '@eventhub/logger';
 import { PermanentSendError, type EmailChannel } from '../channels/types.js';
 import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
-import { claimDelivery, markFailed, markSent, recordAttempt, type DeliveryKey } from './sent-log.js';
+import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
 import { renderPasswordReset } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
@@ -18,6 +18,8 @@ const counters = {
   expired: 0,
   poison: 0,
   rejected: 0,
+  suppressed: 0,
+  suppressionsAdded: 0,
   transientFailures: 0,
   retried: 0,
   deadLettered: 0,
@@ -39,6 +41,10 @@ export function dispatchMetrics(): Record<string, number> {
     expiredSkippedTotal: counters.expired,
     poisonSkippedTotal: counters.poison,
     rejectedTotal: counters.rejected,
+    /** Not sent, because the address is on the suppression list. */
+    suppressedTotal: counters.suppressed,
+    /** Addresses newly suppressed, after a refusal that proved they do not exist. */
+    suppressionsAddedTotal: counters.suppressionsAdded,
     transientFailuresTotal: counters.transientFailures,
     /** Moved to a delayed retry tier. */
     retriedTotal: counters.retried,
@@ -84,6 +90,8 @@ export type Outcome =
   | { kind: 'duplicate' }
   | { kind: 'expired' }
   | { kind: 'rejected' }
+  /** The address is on the suppression list. Recorded, and nothing sent. */
+  | { kind: 'suppressed' }
   /** Will never succeed. Straight to the dead-letter topic. */
   | { kind: 'poison'; reason: string }
   /** May succeed later. To the next retry tier. */
@@ -111,8 +119,12 @@ export interface MessageHandlerOptions {
  *      means this message was already handled, so it is a duplicate and nothing is
  *      sent. PENDING means an earlier attempt never finished, so it is tried again,
  *      which is how a retry tier resumes a delivery the main topic started.
- *   4. Send, then record SENT. A permanent refusal is recorded as FAILED. Anything
- *      else is transient, and the row stays PENDING with its attempts counted.
+ *   4. An address on the tenant's suppression list is recorded SUPPRESSED, and nothing
+ *      is sent.
+ *   5. Send, then record SENT. A permanent refusal is recorded as FAILED, and when it
+ *      proves the address does not exist, the address is suppressed in the same
+ *      transaction. Anything else is transient, and the row stays PENDING with its
+ *      attempts counted.
  *
  * AT LEAST ONCE, NOT EXACTLY ONCE. If the process dies after the provider accepted
  * the mail but before SENT is recorded, the row stays PENDING and the next attempt
@@ -184,6 +196,18 @@ export function createMessageHandler(opts: MessageHandlerOptions): (value: Buffe
       return { kind: 'duplicate' };
     }
 
+    let suppressed: boolean;
+    try {
+      suppressed = await suppressIfListed(key, opened.email);
+    } catch (err) {
+      return transient(err);
+    }
+    if (suppressed) {
+      counters.suppressed += 1;
+      opts.logger.warn(ids, 'the address is on the suppression list; recorded SUPPRESSED and not sent');
+      return { kind: 'suppressed' };
+    }
+
     const email = renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt });
     try {
       const result = await opts.channel.send({
@@ -197,13 +221,22 @@ export function createMessageHandler(opts: MessageHandlerOptions): (value: Buffe
       return { kind: 'sent' };
     } catch (err) {
       if (err instanceof PermanentSendError) {
+        let recorded: { suppressionAdded: boolean };
         try {
-          await markFailed(key, describe(err));
+          recorded = await markFailed(
+            key,
+            describe(err),
+            err.addressDoesNotExist && err.status ? { address: opened.email, status: err.status } : undefined,
+          );
         } catch (recordErr) {
           return transient(recordErr);
         }
         counters.rejected += 1;
-        opts.logger.warn({ ...ids, reason: describe(err) }, 'the provider refused the email; recorded as FAILED');
+        if (recorded.suppressionAdded) counters.suppressionsAdded += 1;
+        opts.logger.warn(
+          { ...ids, reason: describe(err), suppressionAdded: recorded.suppressionAdded },
+          'the provider refused the email; recorded as FAILED',
+        );
         return { kind: 'rejected' };
       }
       await recordAttempt(key, describe(err)).catch(() => {});

@@ -7,6 +7,7 @@ import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
 import { createSmtpChannel } from './channels/smtp.js';
 import { createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
 import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/consumer.js';
+import { createSweeper } from './sweeper/index.js';
 
 /**
  * The Notification service: the one service that sends email.
@@ -20,6 +21,7 @@ const logger = createLogger('notification-service');
 
 const channel = createSmtpChannel({ host: env.SMTP_HOST, port: env.SMTP_PORT, from: env.EMAIL_FROM });
 let dispatcher: ReturnType<typeof createDispatcher> | null = null;
+let sweeper: ReturnType<typeof createSweeper> | null = null;
 
 const app = express();
 app.use(express.json());
@@ -46,7 +48,12 @@ app.get('/metrics', async (_req, res) => {
     const [lag, retryLag] = await Promise.all([bounded(dispatcher.lag()), bounded(dispatcher.retryLag())]);
     slow = { at: Date.now(), lag, retryLag };
   }
-  res.json({ dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null } });
+  res.json({
+    dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null },
+    // Straight from memory: the sweep keeps its own counts and asks the database on
+    // its own clock, so a /metrics request never waits on it.
+    sweep: sweeper?.metrics() ?? null,
+  });
 });
 
 /**
@@ -111,6 +118,7 @@ async function shutdown(signal: string): Promise<void> {
   // session times out.
   await dispatcher?.stop();
   logger.info({ ms: Date.now() - started }, 'dispatch consumers stopped');
+  await sweeper?.stop();
   await prisma.$disconnect().catch(() => {});
   logger.info({ ms: Date.now() - started }, 'shut down');
   process.exit(0);
@@ -142,10 +150,22 @@ async function main(): Promise<void> {
     },
   });
 
+  sweeper = createSweeper({
+    databaseUrl: env.SWEEPER_DATABASE_URL,
+    intervalMs: env.SWEEP_INTERVAL_MS,
+    stuckAfterMs: env.SWEEP_STUCK_AFTER_MS,
+    batchSize: env.SWEEP_BATCH_SIZE,
+    logger,
+  });
+
   app.listen(env.PORT, () => {
     logger.info(`notification-service listening on port ${env.PORT}`);
   });
   void startDispatcher(dispatcher);
+  // Awaited, so a sweeper credential that can do more than sweep stops the service
+  // here rather than being discovered by someone reading grants later.
+  await sweeper.start();
+  logger.info({ everyMs: env.SWEEP_INTERVAL_MS, stuckAfterMs: env.SWEEP_STUCK_AFTER_MS }, 'stuck-delivery sweep running');
 }
 
 main().catch((err) => {

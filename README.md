@@ -84,10 +84,11 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
-| `db/init/` | Five databases and fourteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 65 executable proofs of the invariants above |
+| `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time — the copy of a post's rank score is always copied from the post, never adjusted, so a redelivered message cannot move it |
+| `db/init/` | Six databases and eighteen roles, with `CONNECT` revoked from `PUBLIC` |
+| `scripts/verify-*.mjs` | 75 executable proofs of the invariants above |
 
-Five separate Postgres databases with their own credentials. CI reads every
+Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
 connection to a database it was not granted.
 
@@ -223,7 +224,7 @@ docker compose up -d --wait
 That builds one image, shared by every application service, and then:
 
 1. waits for Postgres, Redis, Kafka, the Schema Registry, OpenSearch, ClickHouse and Mailpit to pass their healthchecks
-2. runs a `setup` container that migrates all five databases, seeds Auth,
+2. runs a `setup` container that migrates all six databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
    migrates ClickHouse, and generates a signing keypair into a volume
 3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relays for Event, Ticketing and Auth
@@ -254,10 +255,12 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Analytics | `http://localhost:3006/ready` |
 | Analytics ingest | `http://localhost:3016/metrics` |
 | Notification | `http://localhost:3007/ready` |
+| Community | `http://localhost:3008/ready` |
 | Mailpit, the local email inbox | `http://localhost:8025` |
 | Event relay | `http://localhost:3010/metrics` |
 | Ticketing relay | `http://localhost:3011/metrics` |
 | Auth relay | `http://localhost:3012/metrics` |
+| Community relay | `http://localhost:3013/metrics` |
 
 Proof that it is working end to end, rather than just listening — sign in as the
 seeded admin, create an event through one service, and read it back out of
@@ -311,7 +314,7 @@ half-started broker:
 docker compose up -d --wait postgres redis kafka schema-registry opensearch clickhouse mailpit
 ```
 
-The Postgres container creates all five databases and their roles on first boot
+The Postgres container creates all six databases and their roles on first boot
 through its own `/docker-entrypoint-initdb.d` hook, so there is no separate
 bootstrap step. First boot only: the hook never runs against an existing data
 volume, so a volume created before a service's database was added does not have
@@ -325,7 +328,7 @@ owns the tables and runs migrations, `APP_DATABASE_URL` owns nothing and is what
 the service connects as at runtime. That separation is what makes row-level
 security work at all.
 
-Then migrate each service. All five have their own migrations, and each reads
+Then migrate each service. All six have their own migrations, and each reads
 the `DATABASE_URL` from its own `.env` — which is why the copy above has to
 happen first:
 
@@ -347,6 +350,10 @@ pnpm --filter @eventhub/live exec prisma migrate deploy
 
 ```bash
 pnpm --filter @eventhub/notification exec prisma migrate deploy
+```
+
+```bash
+pnpm --filter @eventhub/community exec prisma migrate deploy
 ```
 
 Only Auth has a seed. Running this against Event or Ticketing fails with a
@@ -498,8 +505,40 @@ message id; a delivery already sent is not sent again:
 pnpm --filter @eventhub/notification run dlq:replay -- <message-id>
 ```
 
-Preferences, rate limits and suppression are still to come. Chapter 9, community, is designed and
-documented but not implemented.
+An address the relay refuses as non-existent (a 5.1.x reply to RCPT TO) is suppressed
+for its tenant: later deliveries to it are recorded SUPPRESSED and never attempted.
+Only that reply suppresses. A policy block (5.7.x) or a bare 550 is recorded FAILED
+and tried again next time, because a wrong suppression would lock its owner out of
+password resets. For the same reason a suppression ends after `SUPPRESSION_TTL_DAYS`,
+and every later bounce moves that end out again. The table holds a hash of the
+address, never the address. To lift one by hand:
+
+```bash
+pnpm --filter @eventhub/notification run suppression:remove -- <tenant-id> <address>
+```
+
+A delivery is claimed PENDING before anything is sent, and Kafka re-drives nearly all
+of them. The ones that never move again — a dead-lettered message, or one whose
+retention passed — are ended by a sweep inside the service, on its own credential:
+they become FAILED with "abandoned", so PENDING means "in flight" and its count is
+worth alerting on. That credential may end a delivery and nothing else, and the
+service refuses to start on one that can do more. `SWEEP_STUCK_AFTER_MS` sets how
+long is too long; one pass by hand is:
+
+```bash
+pnpm --filter @eventhub/notification run sweep:once
+```
+
+The whole chain is proved in the compose stack itself, not only against natively run
+services: `node scripts/verify-compose-password-reset.mjs` adds a user to the seeded
+tenant, asks for a reset, reads the mail out of Mailpit, and checks that the link
+works, that the old password stops working and that the session issued before the
+reset is revoked — then removes what it made. Locally the mail arrives about a second
+after the request.
+
+Preferences and rate limits are still to come, and arrive with the first email
+anyone could opt out of. Chapter 9, community, is designed and documented but not
+implemented.
 
 Known gaps, named rather than hidden:
 

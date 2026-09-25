@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { withTenant } from '../db.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { requireAuth, requireRole } from '../auth.js';
-import { ah } from '../async.js';
+import { ah } from '@eventhub/http';
 import { SNAPSHOT_SELECT, emitEventSnapshot } from '../outbox.js';
 
 // The explicit `: Router` annotation is required, not stylistic. With

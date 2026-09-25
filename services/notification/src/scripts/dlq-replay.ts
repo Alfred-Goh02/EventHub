@@ -23,7 +23,12 @@ import { DLQ_HEADERS, DLQ_TOPIC, header, originalHeaders } from '../dispatch/ret
 const { KAFKA_BROKERS } = z.object({ KAFKA_BROKERS: z.string().min(1) }).parse(process.env);
 
 async function main(): Promise<void> {
-  const messageId = process.argv[2];
+  // `pnpm run <script> -- <id>` hands this script '--' as its first argument in every
+  // shell but PowerShell, where pnpm.ps1 swallows it. Without this the documented
+  // command looks for a message whose id is "--" and reports it is not in the topic.
+  const rest = process.argv.slice(2);
+  if (rest[0] === '--') rest.shift();
+  const messageId = rest[0];
   if (!messageId) {
     console.error('usage: dlq-replay <message-id>');
     process.exitCode = 2;

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { createLogger } from '@eventhub/logger';
 import { FakePaymentProvider, withTimeout } from '../payments/provider.js';
 import { reconcileOnce } from './reconcile.js';
-import { attachPoolErrorHandler } from '../pool.js';
+import { attachPoolErrorHandler, withClient } from '../pool.js';
 
 /**
  * The payment reconciler: a separate process, on the sweeper's credential.
@@ -114,8 +114,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * it moves money-adjacent state across every tenant in the system.
  */
 async function assertLeastPrivilege(): Promise<void> {
-  const client = await pool.connect();
-  try {
+  await withClient(pool, logger, 'ticketing-reconciler', async (client) => {
     const { rows } = await client.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
       'SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user',
     );
@@ -150,9 +149,7 @@ async function assertLeastPrivilege(): Promise<void> {
           'SELECT plus column-level UPDATE.',
       );
     }
-  } finally {
-    client.release();
-  }
+  });
 }
 
 async function tick(): Promise<void> {

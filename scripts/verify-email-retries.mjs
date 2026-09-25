@@ -463,6 +463,8 @@ async function main() {
     await producer.disconnect().catch(() => {});
     await relayDb.query('DELETE FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await inTenant(notifyOwner, 'DELETE FROM "NotificationDelivery" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
+    // The 550 5.1.1 above suppresses its address, and that row is this run's too.
+    await inTenant(notifyOwner, 'DELETE FROM "EmailSuppression" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await inTenant(authApp, 'DELETE FROM "User" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
     const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, ...scanGroups]);
