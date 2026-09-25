@@ -42,7 +42,7 @@ export function createSweeper(opts: {
 
   async function pass(): Promise<void> {
     try {
-      const result = await sweepOnce(pool, { stuckAfterMs: opts.stuckAfterMs, batchSize: opts.batchSize });
+      const result = await sweepOnce(pool, opts.logger, { stuckAfterMs: opts.stuckAfterMs, batchSize: opts.batchSize });
       counters.passes += 1;
       counters.abandoned += result.swept;
       last = { at: Date.now(), oldestPendingMs: result.oldestPendingMs };
@@ -67,7 +67,7 @@ export function createSweeper(opts: {
   return {
     /** Checks the credential, sweeps once, then keeps sweeping. */
     async start(): Promise<void> {
-      await assertSweeperIsLeastPrivilege(pool);
+      await assertSweeperIsLeastPrivilege(pool, opts.logger);
       await pass();
       schedule();
     },

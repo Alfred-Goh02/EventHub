@@ -151,7 +151,7 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 
 async function main(): Promise<void> {
-  await assertSweeperIsLeastPrivilege(pool);
+  await assertSweeperIsLeastPrivilege(pool, logger);
 
   if (runOnce) {
     const result = await sweepOnce(pool, logger, { batchSize: env.SWEEPER_BATCH_SIZE });
