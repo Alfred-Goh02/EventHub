@@ -74,7 +74,7 @@ export function spaceRoutes(
       throw err;
     }
 
-    await forgetMembership(spaceId, userId);
+    await forgetMembership(tenantId, spaceId, userId);
     return res.status(201).json({ id: spaceId, slug: parsed.data.slug, visibility: parsed.data.visibility });
   }));
 
@@ -108,7 +108,7 @@ export function spaceRoutes(
     });
 
     if (!joined) return res.status(404).json({ error: 'not found' });
-    await forgetMembership(spaceId, userId);
+    await forgetMembership(tenantId, spaceId, userId);
     return res.status(200).json({ spaceId, role: 'MEMBER', joined: joined.added });
   }));
 
@@ -178,7 +178,7 @@ export function spaceRoutes(
     if (!changed) return res.status(404).json({ error: 'not a member of this space' });
     if (changed.protected) return res.status(409).json({ error: "an owner's membership cannot be changed here" });
 
-    await forgetMembership(spaceId, target);
+    await forgetMembership(tenantId, spaceId, target);
     return res.json({ spaceId, userId: target, ...parsed.data });
   }));
 
@@ -205,7 +205,7 @@ export function spaceRoutes(
     });
 
     if (left.lastOwner) return res.status(409).json({ error: 'the last owner cannot leave' });
-    await forgetMembership(spaceId, userId);
+    await forgetMembership(tenantId, spaceId, userId);
     return res.status(204).end();
   }));
 

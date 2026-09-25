@@ -7,6 +7,7 @@ import { redis } from './redis.js';
 import { createRateLimiter } from './ratelimit.js';
 import { spaceRoutes } from './routes/spaces.js';
 import { postRoutes } from './routes/posts.js';
+import { createFeedConsumer, feedMetrics } from './feed/consumer.js';
 
 /**
  * The Community service: spaces, posts, threaded comments, reactions and moderation.
@@ -52,6 +53,27 @@ app.get('/ready', async (_req, res) => {
 });
 
 /**
+ * The fan-out consumer's counters, and its lag in offsets.
+ *
+ * Lag is asked for on request and bounded, so a broker that has stopped answering
+ * makes this slow rather than making it hang — the same shape Notification and
+ * Analytics settled on. There is deliberately no "seconds behind" derived from the
+ * last message's timestamp: an idle topic and a dead consumer look identical by that
+ * measure, which Ticketing shipped once and had to take back out.
+ */
+let lagCache: { at: number; value: unknown } | null = null;
+app.get('/metrics', async (_req, res) => {
+  if (feed && (lagCache === null || Date.now() - lagCache.at > 5_000)) {
+    const value = await Promise.race([
+      feed.lag(),
+      new Promise((resolve) => setTimeout(() => resolve({ error: 'timed out reading offsets' }), 2_000)),
+    ]).catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }));
+    lagCache = { at: Date.now(), value };
+  }
+  res.json({ feed: { ...feedMetrics(), lag: lagCache?.value ?? null } });
+});
+
+/**
  * Registered AFTER the routes, in main(), because Express matches middleware in order:
  * an error handler mounted before the routes never sees their errors. It sat here at
  * first, and a handler that threw took the process down instead of answering 500.
@@ -61,8 +83,14 @@ const errorHandler: express.ErrorRequestHandler = (err, _req, res, _next) => {
   res.status(500).json({ error: 'internal error' });
 };
 
+let feed: ReturnType<typeof createFeedConsumer> | null = null;
+
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');
+  // The consumer first: leaving the group deliberately, rather than letting the
+  // broker time the member out, means the partitions are reassigned in seconds
+  // instead of after session.timeout.ms.
+  await feed?.stop().catch(() => {});
   await prisma.$disconnect().catch(() => {});
   await redis.quit().catch(() => {});
   process.exit(0);
@@ -102,6 +130,51 @@ async function main(): Promise<void> {
   );
 
   app.use(errorHandler);
+
+  /**
+   * The consumer runs in this process, as Search's indexer does.
+   *
+   * It could be its own container, and if fan-out ever needs to scale separately from
+   * the API that is the change to make. It does not yet: the work is one INSERT per
+   * post, measured at 23 ms for a thousand members, and a second container is a second
+   * thing to deploy, watch and get the credentials right for.
+   */
+  if (!env.FEED_CONSUMER_ENABLED) {
+    logger.warn('FEED_CONSUMER_ENABLED is false: this process serves requests but no post will reach anyone\'s feed');
+    app.listen(env.PORT, () => logger.info(`community-service listening on port ${env.PORT}`));
+    return;
+  }
+
+  feed = createFeedConsumer({
+    brokers: env.KAFKA_BROKERS.split(','),
+    registryUrl: env.SCHEMA_REGISTRY_URL,
+    groupId: env.FEED_CONSUMER_GROUP,
+    startFrom: env.FEED_START_FROM,
+    maxMembers: env.FEED_FANOUT_MAX_MEMBERS,
+    logger,
+  });
+  /**
+   * Started but NOT awaited into the listen, and RETRIED FOR EVER.
+   *
+   * A broker that is slow to answer must not stop this service from serving reads,
+   * which do not depend on it — and `.catch(log)` on a single attempt would leave the
+   * consumer permanently dead after one unlucky restart, with every route still
+   * answering 200. Search's indexer settled on exactly this loop; once kafkajs is
+   * running it handles its own reconnects.
+   */
+  void (async () => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await feed.start();
+        return;
+      } catch (err) {
+        const waitMs = Math.min(30_000, 1_000 * 2 ** attempt);
+        logger.error({ err, attempt, waitMs }, 'the feed consumer failed to start; retrying');
+        await feed.stop().catch(() => {});
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+  })();
 
   app.listen(env.PORT, () => {
     logger.info(`community-service listening on port ${env.PORT}`);
