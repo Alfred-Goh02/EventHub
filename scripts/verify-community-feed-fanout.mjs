@@ -11,9 +11,10 @@
  *     republishes the exact bytes and requires the row count to be unchanged. A
  *     consumer without the unique key looks identical until the day a partition
  *     replays.
- *   - The score is COPIED from the post, never adjusted by a delta. The same reaction
- *     message is applied twice and the copy must still equal the post: `rankScore + x`
- *     would be wrong by exactly x, and only ever on a redelivery.
+ *   - A fanned-out row is written once and never touched again. A comment is consumed
+ *     and counted as known-and-ignored, not as an unknown kind, and the app role holds
+ *     no UPDATE on FeedEntry at all: the feed ranks by the post's own score, so there
+ *     is no copy to keep in step. The control is that the comment really was consumed.
  *   - A message this consumer can never apply goes to community.feed.dlq and the
  *     partition MOVES ON. A consumer that rethrew poison would stall for ever, and a
  *     consumer that dead-lettered an outage would lose good events.
@@ -165,7 +166,7 @@ async function inTenant(client, tenant, sql, params = []) {
 }
 
 const feedRows = (owner, tenant, postId) =>
-  inTenant(owner, tenant, `SELECT "userId", "rankScore" FROM "FeedEntry" WHERE "postId" = $1 ORDER BY "userId"`, [postId]).then((r) => r.rows);
+  inTenant(owner, tenant, `SELECT "userId" FROM "FeedEntry" WHERE "postId" = $1 ORDER BY "userId"`, [postId]).then((r) => r.rows);
 
 async function main() {
   const taken = await fetch(`http://127.0.0.1:${PORT}/health`).then(
@@ -296,88 +297,49 @@ async function main() {
     }
 
     console.log('');
-    console.log('  activity moves the copy to whatever the post now says');
+    console.log('  activity is consumed, and leaves the fanned-out rows alone');
     /**
-     * A COMMENT, NOT A REACTION, AND THE REASON MATTERS.
+     * The feed ranks by the POST's score, read at query time, so a comment or a reaction
+     * has nothing to do here. What is asserted is that the consumer still TAKES such a
+     * message — a kind it knows — and does not count it as an unknown one, which is the
+     * signal for a producer shipping something nobody taught this consumer.
      *
-     * The score is ln(greatest(reactions + 2*comments, 1) + 1) + t. Going from zero
-     * reactions to one moves NOTHING: greatest(0, 1) and greatest(1, 1) are both 1.
-     * The first version of this section used a single reaction, so the post's score
-     * never changed, the resync matched no rows, and both assertions below compared
-     * two values that were already equal — they stayed green with the copy replaced by
-     * `rankScore + 0.5`, which is the exact bug they exist to catch.
-     *
-     * One comment is worth 2, so greatest(2, 1) = 2 and the score really moves. The
-     * control below asserts that it did, because if it ever stops moving this section
-     * goes back to proving nothing.
+     * Baselines first, before the comment exists: with the compose stack up, the relay
+     * publishes within milliseconds of the write.
      */
-    const scoreAtFanOut = Number((await feedRows(owner, TENANT, postId))[0]?.rankScore);
-    const comment = await api(`/posts/${postId}/comments`, { method: 'POST', bearer: asMember, body: { body: `moves the score ${RUN}` } });
-    check(comment.status === 201, `a comment is added, which is worth 2 to the formula (${comment.status})`);
+    const ignoredBefore = (await metrics())?.activityIgnoredTotal ?? 0;
+    const unknownBefore = (await metrics())?.unknownKindsSkippedTotal ?? 0;
+    const rowsBefore = (await inTenant(owner, TENANT, `SELECT id, "createdAt"::text AS at FROM "FeedEntry" WHERE "postId" = $1 ORDER BY id`, [postId])).rows;
+    const comment = await api(`/posts/${postId}/comments`, { method: 'POST', bearer: asMember, body: { body: `a comment ${RUN}` } });
+    check(comment.status === 201, `a comment is added (${comment.status})`);
     await relayOnce();
-
-    const postNow = await waitFor(async () => {
-      const r = await inTenant(owner, TENANT, `SELECT "rankScore", "commentCount", "reactionCount" FROM "Post" WHERE id = $1`, [postId]);
-      const row = r.rows[0];
-      return row && Number(row.rankScore) !== scoreAtFanOut ? row : null;
-    }, 30_000);
-    const finalPost = await inTenant(owner, TENANT, `SELECT "rankScore", "commentCount" FROM "Post" WHERE id = $1`, [postId]);
+    const consumed = await waitFor(async () => ((await metrics())?.activityIgnoredTotal ?? 0) > ignoredBefore, 45_000);
+    check(Boolean(consumed), `CONTROL: the consumer took the comment message (activityIgnoredTotal ${ignoredBefore} -> ${(await metrics())?.activityIgnoredTotal})`);
     check(
-      postNow !== null,
-      `CONTROL: the post's own score moved (${scoreAtFanOut} -> ${finalPost.rows[0]?.rankScore}, commentCount ${finalPost.rows[0]?.commentCount})${postNow === null ? ' — UNCHANGED, so nothing below can fail' : ''}`,
+      ((await metrics())?.unknownKindsSkippedTotal ?? 0) === unknownBefore,
+      `and counted it as a kind it knows, not an unknown one (unknownKindsSkippedTotal ${unknownBefore} -> ${(await metrics())?.unknownKindsSkippedTotal})`,
+    );
+    const rowsAfter = (await inTenant(owner, TENANT, `SELECT id, "createdAt"::text AS at FROM "FeedEntry" WHERE "postId" = $1 ORDER BY id`, [postId])).rows;
+    // The length is part of it: two empty lists are equal too.
+    check(
+      rowsBefore.length === 2 && JSON.stringify(rowsBefore) === JSON.stringify(rowsAfter),
+      `the post's two feed rows are exactly as they were (${rowsBefore.length} before, ${rowsAfter.length} after)`,
     );
 
-    const matched = await waitFor(async () => {
-      const rows = await inTenant(
-        owner,
-        TENANT,
-        `SELECT f."rankScore" AS feed, p."rankScore" AS post
-           FROM "FeedEntry" f JOIN "Post" p ON p.id = f."postId"
-          WHERE f."postId" = $1 AND f."rankScore" = p."rankScore"`,
-        [postId],
-      );
-      return rows.rows.length === 2 ? rows.rows : null;
-    }, 45_000);
-    check(Boolean(matched), `every copy of the score equals the post's (${matched ? matched[0].feed : 'never matched'})`);
-
     /**
-     * THE SAME MESSAGE, AGAIN.
-     *
-     * This is what separates a copy from a delta. `SET rankScore = rankScore + x`
-     * survives every test above and is wrong by exactly x the first time a partition
-     * replays — so the redelivery is the test, and the assertion is that nothing moved.
+     * Asked of the catalog, not by attempting an UPDATE: row security would refuse an
+     * UPDATE per row, so one that matched nothing would prove nothing. The control is
+     * that the same query finds the INSERT the role does hold.
      */
-    const commentMsg = await (async () => {
-      const c = kafka.consumer({ groupId: `${GROUP}-scan2` });
-      await c.connect();
-      await c.subscribe({ topic: TOPIC, fromBeginning: true });
-      let found = null;
-      await c.run({
-        eachMessage: async ({ message }) => {
-          const d = await registry.decode(message.value).catch(() => null);
-          if (d?.postId === postId && d?.kind === 'COMMENT_CREATED') found = { key: message.key, value: message.value, headers: message.headers };
-        },
-      });
-      await waitFor(async () => found !== null, 45_000);
-      await c.disconnect();
-      return found;
-    })();
-    check(Boolean(commentMsg), 'CONTROL: the comment message was found, so there is something to redeliver');
-
-    if (commentMsg) {
-      const scoreBefore = (await feedRows(owner, TENANT, postId)).map((r) => Number(r.rankScore));
-      const resyncsBefore = (await metrics())?.scoreResyncsTotal ?? 0;
-      await producer.send({ topic: TOPIC, messages: [commentMsg] });
-      await waitFor(async () => ((await metrics())?.scoreResyncsTotal ?? 0) >= resyncsBefore, 20_000);
-      await sleep(2_000);
-      const scoreAfter = (await feedRows(owner, TENANT, postId)).map((r) => Number(r.rankScore));
-      // Two empty arrays stringify the same, so the length is part of the assertion.
-      // Without it this passed on a run where nothing had been fanned out at all.
-      check(
-        scoreBefore.length === 2 && JSON.stringify(scoreBefore) === JSON.stringify(scoreAfter),
-        `applying it twice changes nothing — the score is copied, not added to (${scoreBefore.join(', ') || 'VACUOUS: no rows'} then ${scoreAfter.join(', ') || 'none'})`,
-      );
-    }
+    const grants = (await owner.query(
+      `SELECT privilege_type AS p FROM information_schema.role_table_grants
+        WHERE table_name = 'FeedEntry' AND grantee = 'eventhub_community_app'
+       UNION ALL
+       SELECT 'column ' || privilege_type FROM information_schema.column_privileges
+        WHERE table_name = 'FeedEntry' AND grantee = 'eventhub_community_app' AND privilege_type = 'UPDATE'`,
+    )).rows.map((r) => r.p);
+    check(grants.includes('INSERT'), `CONTROL: the catalog query sees the app role's grants on FeedEntry (${grants.join(', ')})`);
+    check(!grants.some((g) => /UPDATE/.test(g)), 'and none of them is UPDATE: a fanned-out row is written once and never changed');
 
     console.log('');
     console.log('  a space past the threshold is not fanned out');

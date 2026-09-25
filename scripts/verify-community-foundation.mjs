@@ -153,7 +153,7 @@ async function main() {
         Reaction: [`INSERT INTO "Reaction" (id, "tenantId", "targetType", "targetId", "userId", kind) VALUES ($1, $2, 'POST', $3, $4, 'LIKE')`, [id, tenant, `post_${RUN}`, `user_${id}`]],
         Report: [`INSERT INTO "Report" (id, "tenantId", "targetType", "targetId", "reporterId", reason) VALUES ($1, $2, 'POST', $3, $4, 'SPAM')`, [id, tenant, `post_${RUN}`, `user_${id}`]],
         ModerationAction: [`INSERT INTO "ModerationAction" (id, "tenantId", "spaceId", "actorId", "targetType", "targetId", action) VALUES ($1, $2, $3, 'mod', 'POST', $4, 'HIDE')`, [id, tenant, `space_${RUN}`, `post_${RUN}`]],
-        FeedEntry: [`INSERT INTO "FeedEntry" (id, "tenantId", "userId", "postId", "spaceId", "rankScore") VALUES ($1, $2, $3, $4, $5, 1)`, [id, tenant, `user_${id}`, `post_${id}`, `space_${RUN}`]],
+        FeedEntry: [`INSERT INTO "FeedEntry" (id, "tenantId", "userId", "postId", "spaceId") VALUES ($1, $2, $3, $4, $5)`, [id, tenant, `user_${id}`, `post_${id}`, `space_${RUN}`]],
         OutboxMessage: [`INSERT INTO "OutboxMessage" (id, "tenantId", topic, "eventType", "aggregateId", payload) VALUES ($1, $2, 'community.feed', 'PostCreated', $3, '{}'::jsonb)`, [id, tenant, `post_${RUN}`]],
       };
       return rows[table];

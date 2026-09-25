@@ -4,7 +4,7 @@ import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
 import type { Logger } from '@eventhub/logger';
 import { z } from 'zod';
 import { withTenant } from '../db.js';
-import { fanOutPost, resyncScore } from './fanout.js';
+import { fanOutPost } from './fanout.js';
 
 const TOPIC = 'community.feed';
 const DLQ = 'community.feed.dlq';
@@ -36,7 +36,7 @@ const activity = z.object({
   postId: z.string().min(1),
 });
 
-const counters = { fannedOut: 0, rowsWritten: 0, tooLarge: 0, missingSpace: 0, resynced: 0, skipped: 0, deadLettered: 0 };
+const counters = { fannedOut: 0, rowsWritten: 0, tooLarge: 0, missingSpace: 0, ignored: 0, skipped: 0, deadLettered: 0 };
 let assignedPartitions = 0;
 
 export function feedMetrics(): Record<string, unknown> {
@@ -45,7 +45,7 @@ export function feedMetrics(): Record<string, unknown> {
     feedRowsWrittenTotal: counters.rowsWritten,
     spacesTooLargeToFanOutTotal: counters.tooLarge,
     missingSpaceTotal: counters.missingSpace,
-    scoreResyncsTotal: counters.resynced,
+    activityIgnoredTotal: counters.ignored,
     unknownKindsSkippedTotal: counters.skipped,
     deadLetteredTotal: counters.deadLettered,
     assignedPartitions,
@@ -137,11 +137,24 @@ export function createFeedConsumer(opts: {
     return { ok: true, value: parsed.data };
   }
 
-  /** What this consumer does something about. Anything else is someone else's business. */
-  const HANDLED = new Set(['POST_CREATED', 'COMMENT_CREATED', 'REACTION_ADDED', 'REACTION_REMOVED']);
+  /**
+   * Kinds this consumer knows and has nothing to do for. A comment or a reaction moves
+   * the post's score, and the feed reads that score from the post at query time, so no
+   * fanned-out row needs touching. They used to rewrite a copy of the score on every
+   * row; see migration 20260925120000.
+   *
+   * Counted apart from UNKNOWN kinds, which mean a producer shipped something this
+   * consumer was never taught. Folding the two together would bury that signal under
+   * every comment and reaction.
+   */
+  const IGNORED = new Set(['COMMENT_CREATED', 'REACTION_ADDED', 'REACTION_REMOVED']);
 
   async function apply(value: z.infer<typeof activity>): Promise<void> {
-    if (!HANDLED.has(value.kind)) {
+    if (IGNORED.has(value.kind)) {
+      counters.ignored += 1;
+      return;
+    }
+    if (value.kind !== 'POST_CREATED') {
       // Counted, not silent: a kind nobody handles climbing steadily is how you find
       // out a producer shipped something this consumer was never taught.
       counters.skipped += 1;
@@ -149,37 +162,26 @@ export function createFeedConsumer(opts: {
       return;
     }
 
-    if (value.kind === 'POST_CREATED') {
-      const result = await withTenant(value.tenantId, (tx) => fanOutPost(tx, value, opts.maxMembers));
-      if (result.outcome === 'fanned-out') {
-        counters.fannedOut += 1;
-        counters.rowsWritten += result.rows;
-      } else if (result.outcome === 'too-large') {
-        counters.tooLarge += 1;
-        opts.logger.info(
-          { spaceId: value.spaceId, postId: value.postId, memberCount: result.memberCount, maxMembers: opts.maxMembers },
-          'space is past the fan-out threshold; its posts are read at query time',
-        );
-      } else {
-        /**
-         * Not an error, and NOT the same as too large. The topic keeps a week, so a
-         * replay reaches posts whose space has since been deleted. Counted separately
-         * so a rising number here means something real — a producer naming a space
-         * that never existed — rather than being lost inside the threshold count.
-         */
-        counters.missingSpace += 1;
-        opts.logger.warn({ spaceId: value.spaceId, postId: value.postId }, 'no such space for this tenant; nothing to fan out to');
-      }
-      return;
+    const result = await withTenant(value.tenantId, (tx) => fanOutPost(tx, value, opts.maxMembers));
+    if (result.outcome === 'fanned-out') {
+      counters.fannedOut += 1;
+      counters.rowsWritten += result.rows;
+    } else if (result.outcome === 'too-large') {
+      counters.tooLarge += 1;
+      opts.logger.info(
+        { spaceId: value.spaceId, postId: value.postId, memberCount: result.memberCount, maxMembers: opts.maxMembers },
+        'space is past the fan-out threshold; its posts are read at query time',
+      );
+    } else {
+      /**
+       * Not an error, and NOT the same as too large. The topic keeps a week, so a
+       * replay reaches posts whose space has since been deleted. Counted separately
+       * so a rising number here means something real — a producer naming a space
+       * that never existed — rather than being lost inside the threshold count.
+       */
+      counters.missingSpace += 1;
+      opts.logger.warn({ spaceId: value.spaceId, postId: value.postId }, 'no such space for this tenant; nothing to fan out to');
     }
-
-    /**
-     * A comment or a reaction moved the post's score, so the fanned-out copies are
-     * brought back to whatever the Post row now says. Nothing happens for a post that
-     * was never fanned out — the UPDATE simply matches no rows, which is correct
-     * rather than an error.
-     */
-    counters.resynced += await withTenant(value.tenantId, (tx) => resyncScore(tx, value));
   }
 
   async function eachBatch({ batch, resolveOffset, heartbeat, isRunning, isStale }: EachBatchPayload): Promise<void> {
