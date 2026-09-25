@@ -134,6 +134,19 @@ jobs:
       - name: Assert the shared types match their schemas and contracts
         run: node scripts/verify-shared-types.mjs
 
+      # A migration runs as the table owner with no app.tenant_id, and FORCE row
+      # security binds the owner too -- so an UPDATE or DELETE on a FORCE table
+      # matches zero rows and succeeds. Two merged migrations did exactly that and
+      # changed nothing: event's empty-slug backfill and ticketing's delete of
+      # leftover in_progress idempotency keys. Measured as each owner: UPDATE 0 and
+      # DELETE 0 under FORCE, UPDATE 2 and DELETE 53 with it lifted.
+      #
+      # Walks every service's migrations in order, tracking FORCE per table, and
+      # fails any write to a table under FORCE at that point. Reads files only, so
+      # it runs before anything is up.
+      - name: Assert no migration writes to a table row security hides from it
+        run: node scripts/verify-migration-force-rls.mjs
+
       # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
       # ClickHouse measured the 72G root filesystem at 91% used by the time the
       # Search verifiers ran, and OpenSearch refuses to create any index past its
@@ -633,6 +646,13 @@ jobs:
       # schema has an OutboxMessage table must have a relay in compose.
       - name: Assert every outbox has a relay in compose
         run: node scripts/verify-outbox-relays.mjs
+
+      # A service with no stop_grace_period gets whatever the engine picks, and
+      # Docker Desktop before 4.81 picks one second: Kafka was killed mid-shutdown
+      # and recovered 87 logs on its next start. This runner's engine gives 10 s,
+      # so nothing else here can see it. Every service must set its own.
+      - name: Assert every compose service sets its own stop grace period
+        run: node scripts/verify-stop-grace-periods.mjs
 
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
@@ -1754,6 +1774,30 @@ jobs:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
         run: node scripts/verify-relay-ordering.mjs
 
+      # A connection the database kills while it is CHECKED OUT must not kill
+      # the process. It did: the relay exited 1 mid-drain on
+      #
+      #   error: terminating connection due to idle-in-transaction timeout
+      #   Emitted 'error' event on Client instance
+      #
+      # which is the one error its role's idle_in_transaction_session_timeout
+      # exists to produce. pg-pool forwards errors only from IDLE clients, and
+      # pg's Client emits (rather than rejecting a query) only when no query is
+      # in flight -- so "checked out, transaction open, idle" had no listener.
+      # withClient() closes it in all three services that carry a pool helper.
+      #
+      # Forces the case with a per-session 1s timeout rather than waiting 30s.
+      # Its negative control runs every time: a child process doing the
+      # unguarded checkout must die of exactly that unhandled 'error'. Also
+      # counts listeners across twelve checkouts of one Client, drives the
+      # shipped drain through a termination mid-publish, and ratchets every
+      # pool.connect() in services/ into a withClient.
+      - name: Assert a connection terminated while checked out is not fatal
+        env:
+          EVENT_APP_DATABASE_URL: ${{ env.EVENT_APP_DATABASE_URL }}
+          RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
+        run: node scripts/verify-relay-idle-in-transaction.mjs
+
       - name: Verify outbox to Kafka end to end
         env:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
@@ -2136,6 +2180,14 @@ jobs:
       # sign-in example broken for the next reader.
       - name: Prove a password reset crosses the whole stack
         run: node scripts/verify-compose-password-reset.mjs
+
+      # Every other sweeper verifier starts a sweeper of its own with --once, so
+      # none of them could notice that nothing in the stack ran one -- and nothing
+      # did: Ticketing's container never imported it, and a lapsed hold kept its
+      # seats for good. This one lets a hold lapse in the running containers and
+      # starts nothing; the stack has to give the seats back by itself.
+      - name: Prove the stack returns an expired seat hold
+        run: node scripts/verify-compose-hold-sweeper.mjs
 
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
