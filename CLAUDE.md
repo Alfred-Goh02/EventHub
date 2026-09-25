@@ -500,3 +500,86 @@ Each of these returned "no matches" from a search that was not running:
 
 Treat "no matches" from a narrow search as no evidence at all, and prove the search
 works by making it match something.
+
+## A migration's UPDATE sees what the owner's policy lets it see: nothing
+
+A migration runs as the table owner with no `app.tenant_id` set, and FORCE row
+security binds the owner, so an UPDATE or DELETE in a migration matches zero rows and
+succeeds. Three shipped that way: event's empty-slug backfill, ticketing's
+in-progress-key delete, and community's `fannedOut` backfill. Measured each time the
+same way — as the owner, in a rolled-back transaction, with a planted row: `0` as
+written, the planted row and the real ones with FORCE lifted (2, 53, 1). The
+ticketing one left 52 idempotency keys answering 409 for good.
+
+It is the cleanup lesson above, arriving by a different door. Lift FORCE around the
+statement, on every table it reads as well as the one it writes, and restore it in
+the same file. `scripts/verify-migration-force-rls.mjs` now reads every migration in
+order and fails a write that meets a table under FORCE.
+
+## Prisma does not run a migration file in a transaction
+
+It sends the statements one at a time. Measured on community's `20260925000000` with
+its backfill broken so the deploy failed at `SET NOT NULL`: the new column and the new
+enum value stayed behind. With `BEGIN;` at the top and `COMMIT;` at the bottom, the
+same failure left nothing. So the migrations that lifted FORCE "in one transaction, so
+nothing interleaves" had no such transaction; had one failed between the lift and the
+restore, the table would have been left without FORCE.
+
+Wrap every migration that does more than one thing in `BEGIN`/`COMMIT`. The FORCE
+verifier requires it around any lift, with the three that predate the measurement
+allowed by name.
+
+## When both sides bump the same line, git sees no conflict
+
+The README's verifier count is ratcheted, so two branches that each add a verifier
+both change `80` to `81`. Merged, that is an identical change on both sides: git
+reports nothing, and main then holds 82 verifiers under a README that says 81. Only
+`verify-readme-setup.mjs` notices, on the next run. Recount after every merge of main,
+rather than trusting a merge that went quietly.
+
+## A check the clocks agree on cannot tell which clock was used
+
+The contact-card verifier asserted that a card's time came from Postgres. It stayed
+green with the card stamped by `new Date()`: this machine's clock and the container's
+agree to the millisecond, so both stamps were the same number. The fixture could not
+show the failure. `scripts/lib/skewed-clock.mjs` now runs the service an hour fast —
+the real failure is an app server whose clock disagrees with the database's — and the
+check reads `18:10:30.095` against `17:10:30.095`.
+
+The same run found the second half: `now()` is when the TRANSACTION started. Two
+transactions serialised on one row can commit in the opposite order to their start
+times, so the one that waited, and wrote the newer value, carries the older time.
+`clock_timestamp()` read inside the statement that takes the row lock follows commit
+order.
+
+## "It changed nothing" has to wait for the change
+
+A handler that starts a write and returns before it finishes looks, to a check that
+reads at once, exactly like a handler that wrote nothing. The unsubscribe verifier
+asserted that following a link changes nothing; it stayed green with the unsubscribe
+fired from GET and not awaited. It reads after a pause now. Any assertion that
+something did NOT happen needs to give it time to happen.
+
+## A verifier with a fuller environment than production hides a missing variable
+
+The contact-card publish command passed its verifier and crashed in the compose job
+with `PORT: Expected number, received nan`: Auth's `db.ts` validates the whole base
+environment, and the verifier ran the command with Auth's full `.env.example`, which
+has a PORT. Setup has none. The compose job, which runs setup as deployed, is the only
+place that could see it — which is the argument for that job existing.
+
+## Rebuild everything you restored before the next red run
+
+A red run's result only means something if the process running is the code you think
+it is. After one mutation run, the source was restored but only one of two services
+rebuilt, and the next run tested the new mutation against the OLD mutation still
+compiled into the other service's `dist/`: a check passed that should have failed, and
+a count came out one short. Restore, rebuild everything touched, confirm green, then
+break the next thing.
+
+## An empty topic has no lag to read
+
+A consumer on a new group, on a topic nothing has been written to, has no position on
+any partition, and its lag is unknown rather than zero — so "caught up" never becomes
+true and a control waiting for it fails on a healthy consumer. Prove a consumer is
+reading with a canary it must process, then wait for the lag.
