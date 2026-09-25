@@ -33,8 +33,19 @@ ALTER TABLE "Post" ADD COLUMN "fannedOut" BOOLEAN NOT NULL DEFAULT false;
 
 -- Posts the consumer already fanned out before this column existed. Without this they
 -- would sit in both halves until the dedupe caught them, for ever.
+--
+-- FORCE row security is lifted for the backfill, and restored immediately. A migration
+-- runs as the table owner with no app.tenant_id set, which matches no tenant policy,
+-- so under FORCE this UPDATE sees ZERO rows and succeeds. The first version of this
+-- file did exactly that. Measured as the owner, in a rolled-back transaction with one
+-- planted post and its FeedEntry: 0 rows as first written, 1 with FORCE lifted. The
+-- same file is one transaction, so no application traffic runs while FORCE is off.
+ALTER TABLE "Post"      NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE "FeedEntry" NO FORCE ROW LEVEL SECURITY;
 UPDATE "Post" p SET "fannedOut" = true
  WHERE EXISTS (SELECT 1 FROM "FeedEntry" f WHERE f."postId" = p.id AND f."tenantId" = p."tenantId");
+ALTER TABLE "FeedEntry" FORCE ROW LEVEL SECURITY;
+ALTER TABLE "Post"      FORCE ROW LEVEL SECURITY;
 
 -- The read-time half: one index-ordered scan per space the reader belongs to, walked
 -- by LATERAL. Partial on VISIBLE AND NOT fannedOut, so it holds only the posts that
