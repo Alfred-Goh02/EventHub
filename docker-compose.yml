@@ -30,11 +30,30 @@ x-app: &app
     JWT_ISSUER: https://auth.eventhub.local
     JWT_AUDIENCE: eventhub-api
 
+# EVERY SERVICE SETS stop_grace_period. None is left to the default, because the
+# default is not the documented 10 s everywhere: Docker Desktop before 4.81 stores
+# StopTimeout=1 on any container created without one (moby/moby#52775). On the
+# machine this was written on, `docker compose stop` gave Kafka, Postgres,
+# ClickHouse and OpenSearch one second after SIGTERM, and Kafka's next start
+# logged "Recovering 87 logs ... since no clean shutdown file was found".
+#
+# A ceiling, not a wait: a service that exits in two seconds still takes two.
+#
+# CHANGING ONE RECREATES THE CONTAINER, and `up` stops the old one with the OLD
+# timeout unless given another. Pass the new ceiling:
+#   docker compose up -d --timeout 60
+#
+# Quitting Docker Desktop or shutting Windows down can still cut a stop short
+# (docker/desktop-feedback#494). Stop the stack first when that matters.
+# scripts/verify-stop-grace-periods.mjs requires a value on every service.
 services:
   postgres:
     image: postgres:16
     container_name: eventhub-postgres
     restart: unless-stopped
+    # The image stops with SIGINT, a fast shutdown: it ends sessions and writes a
+    # shutdown checkpoint, which is what spares the next start a WAL replay.
+    stop_grace_period: 30s
     environment:
       POSTGRES_USER: eventhub
       POSTGRES_PASSWORD: eventhub
@@ -73,6 +92,8 @@ services:
     image: redis:7-alpine
     container_name: eventhub-redis
     restart: unless-stopped
+    # Nothing to write on the way down, with persistence off.
+    stop_grace_period: 10s
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
@@ -110,6 +131,9 @@ services:
     image: opensearchproject/opensearch:2.19.0
     container_name: eventhub-opensearch
     restart: unless-stopped
+    # Closes its shards on the way down. Killed first, the next start recovers each
+    # one from its translog.
+    stop_grace_period: 60s
     environment:
       - cluster.name=eventhub-local
       - node.name=opensearch-node1
@@ -165,6 +189,8 @@ services:
     image: opensearchproject/opensearch-dashboards:2.19.0
     container_name: eventhub-dashboards
     restart: unless-stopped
+    # Keeps no state of its own; its saved objects live in OpenSearch.
+    stop_grace_period: 10s
     profiles: ["tools"]
     environment:
       - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
@@ -198,6 +224,9 @@ services:
     image: clickhouse/clickhouse-server:25.8
     container_name: eventhub-clickhouse
     restart: unless-stopped
+    # Waits up to shutdown_wait_unfinished (5 s on this image, read from
+    # system.server_settings) for running queries before it closes its tables.
+    stop_grace_period: 30s
     environment:
       CLICKHOUSE_DB: analytics
       CLICKHOUSE_USER: eventhub
@@ -226,6 +255,9 @@ services:
     image: confluentinc/cp-kafka:7.8.0
     container_name: eventhub-kafka
     restart: unless-stopped
+    # Closes every partition log and writes the clean shutdown file last. Killed a
+    # second in, it had got as far as "LogManager: Shutting down".
+    stop_grace_period: 60s
     ports:
       # Only the host listener is published. Containers use kafka:29092 instead.
       - "9092:9092"
@@ -288,6 +320,9 @@ services:
     image: confluentinc/cp-schema-registry:7.8.0
     container_name: eventhub-schema-registry
     restart: unless-stopped
+    # Its schemas live in Kafka. Long enough to leave its group rather than be timed
+    # out of it.
+    stop_grace_period: 15s
     depends_on:
       kafka:
         condition: service_healthy
@@ -319,6 +354,8 @@ services:
     image: axllent/mailpit:v1.31.1
     container_name: eventhub-mailpit
     restart: unless-stopped
+    # A local inbox with nothing that depends on it surviving a restart.
+    stop_grace_period: 10s
     ports:
       - "1025:1025"
       - "8025:8025"
@@ -519,11 +556,11 @@ services:
       PORT: 3003
       DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       APP_DATABASE_URL: postgresql://eventhub_ticketing_app:eventhub_ticketing_app@postgres:5432/eventhub_ticketing
-      # A third role, with its own narrow grants: the sweeper and reconciler run
-      # inside this process and must not inherit the API's permissions.
+      # The sweeper's cross-tenant credential, which the API holds for ONE read:
+      # a webhook arrives with no tenant, and the route looks up which tenant the
+      # payment belongs to (routes/webhooks.ts). The sweeper does NOT run in this process --
+      # it is ticketing-sweeper, below.
       SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
-      SWEEPER_BATCH_SIZE: 100
-      SWEEPER_INTERVAL_MS: 5000
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
       # Local only, and the same value the .env.example carries. A real secret
       # would come from the environment, never from a committed file.
@@ -538,6 +575,38 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Ticketing's hold sweeper: returns the seats of every hold that lapsed.
+  #
+  # Its own process and its own credential, because it works ACROSS tenants -- a
+  # TTL sweep selects by expiry, which has no tenant -- so it gets a role bounded
+  # by grants and not the API's. See src/sweeper/index.ts.
+  #
+  # Until this was added nothing ran it. The block above said "the sweeper and
+  # reconciler run inside this process" and handed the API SWEEPER_BATCH_SIZE and
+  # SWEEPER_INTERVAL_MS, but dist/index.js never imports the sweeper; only
+  # verifiers ran it, with --once. Measured on the stack: a lapsed hold was still
+  # HELD 30 s later with its seats out of inventory, and a leftover one had sat
+  # HELD six days past its expiry. Every abandoned checkout removed its seats for
+  # good, and the symptom is "sold out" on an event that is not.
+  #
+  # scripts/verify-compose-hold-sweeper.mjs lets a hold lapse in the running stack
+  # and requires it back without starting a sweeper of its own.
+  # ---------------------------------------------------------------------------
+  ticketing-sweeper:
+    <<: *app
+    container_name: eventhub-ticketing-sweeper
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
+      SWEEPER_BATCH_SIZE: 100
+      SWEEPER_INTERVAL_MS: 5000
+    working_dir: /app/services/ticketing
+    command: ["node", "dist/sweeper/index.js"]
 
   # ---------------------------------------------------------------------------
   # The Live service: the only stateful one in the fleet.

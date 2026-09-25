@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
+import { withClient } from '../pool.js';
 
 /**
  * A prune that reported success while deleting nothing.
@@ -125,9 +126,10 @@ export async function pruneOnce(
     const { countSql, deleteSql } = TABLES[table];
     result.deleted[table] = 0;
 
-    for (let batch = 0; batch < opts.maxBatches; batch += 1) {
-      const client = await pool.connect();
-
+    // One batch, on a client withClient owns (see ../pool.ts for why). Returns
+    // whether to run another: a callback cannot `break` the loop below, so the
+    // two stopping conditions return false instead.
+    const pruneBatch = async (client: pg.PoolClient, batch: number): Promise<boolean> => {
       try {
         await client.query('BEGIN');
 
@@ -153,7 +155,7 @@ export async function pruneOnce(
 
         if (candidates === 0) {
           await client.query('COMMIT');
-          break;
+          return false;
         }
 
         const deleted = await client.query(deleteSql, [opts.olderThanDays, opts.batchSize]);
@@ -168,14 +170,20 @@ export async function pruneOnce(
         result.deleted[table] += removed;
 
         // A short batch means the candidates ran out, not that the ceiling hit.
-        if (removed < opts.batchSize) break;
+        if (removed < opts.batchSize) return false;
         if (batch === opts.maxBatches - 1) result.moreToDo = true;
+        return true;
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         throw err;
-      } finally {
-        client.release();
       }
+    };
+
+    for (let batch = 0; batch < opts.maxBatches; batch += 1) {
+      const again = await withClient(pool, logger, 'ticketing-sweeper', (client) =>
+        pruneBatch(client, batch),
+      );
+      if (!again) break;
     }
   }
 
