@@ -10,7 +10,13 @@
 -- createdAt costs little here. rankScore is ln(activity) + epoch/45000: the time term
 -- is about 39,773 today and the activity term rarely passes 5, so a ranked feed was
 -- already a chronological one with a nudge.
+--
+-- ONE EXPLICIT TRANSACTION, because Prisma does not make a migration one: it sends
+-- the statements one at a time, and a failure part-way leaves the ones before it
+-- applied. Measured on 20260925000000, whose broken backfill failed a deploy: without
+-- BEGIN its earlier statements stayed; with it, nothing did.
 -- ---------------------------------------------------------------------------
+BEGIN;
 
 -- ---------------------------------------------------------------------------
 -- Which half of the feed a post belongs to is decided ONCE, per post, when the
@@ -37,9 +43,10 @@ ALTER TABLE "Post" ADD COLUMN "fannedOut" BOOLEAN NOT NULL DEFAULT false;
 -- FORCE row security is lifted for the backfill, and restored immediately. A migration
 -- runs as the table owner with no app.tenant_id set, which matches no tenant policy,
 -- so under FORCE this UPDATE sees ZERO rows and succeeds. The first version of this
--- file did exactly that. Measured as the owner, in a rolled-back transaction with one
--- planted post and its FeedEntry: 0 rows as first written, 1 with FORCE lifted. The
--- same file is one transaction, so no application traffic runs while FORCE is off.
+-- file did exactly that. Measured with the real `prisma migrate deploy`, on one
+-- planted post and its FeedEntry: fannedOut stayed false as first written, and became
+-- true with FORCE lifted. NO FORCE exempts only the owner; the app role stays under
+-- the policies throughout.
 ALTER TABLE "Post"      NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE "FeedEntry" NO FORCE ROW LEVEL SECURITY;
 UPDATE "Post" p SET "fannedOut" = true
@@ -66,3 +73,5 @@ CREATE INDEX "FeedEntry_time_keyset_idx"
 -- index on the rewritten column makes each of those an index write as well.
 DROP INDEX "FeedEntry_keyset_idx";
 DROP INDEX "FeedEntry_tenantId_userId_rankScore_idx";
+
+COMMIT;
