@@ -134,6 +134,19 @@ jobs:
       - name: Assert the shared types match their schemas and contracts
         run: node scripts/verify-shared-types.mjs
 
+      # A migration runs as the table owner with no app.tenant_id, and FORCE row
+      # security binds the owner too -- so an UPDATE or DELETE on a FORCE table
+      # matches zero rows and succeeds. Two merged migrations did exactly that and
+      # changed nothing: event's empty-slug backfill and ticketing's delete of
+      # leftover in_progress idempotency keys. Measured as each owner: UPDATE 0 and
+      # DELETE 0 under FORCE, UPDATE 2 and DELETE 53 with it lifted.
+      #
+      # Walks every service's migrations in order, tracking FORCE per table, and
+      # fails any write to a table under FORCE at that point. Reads files only, so
+      # it runs before anything is up.
+      - name: Assert no migration writes to a table row security hides from it
+        run: node scripts/verify-migration-force-rls.mjs
+
       # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
       # ClickHouse measured the 72G root filesystem at 91% used by the time the
       # Search verifiers ran, and OpenSearch refuses to create any index past its
