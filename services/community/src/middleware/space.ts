@@ -35,11 +35,31 @@ declare global {
   }
 }
 
-const cacheKey = (spaceId: string, userId: string) => `member:${spaceId}:${userId}`;
+/**
+ * THE TENANT IS PART OF THE KEY.
+ *
+ * It was `member:${spaceId}:${userId}`, and Redis is not tenant-scoped the way the
+ * database is: the Postgres read under row security only ever sees the caller's
+ * tenant, but the cache in front of it answered for whoever had asked first. Measured
+ * with the moderation verifier: a token for another tenant carrying the same user id
+ * read space S1's report queue — 200 — because M1's MODERATOR entry was cached under a
+ * key the other tenant's request produced too. Row security then scoped the query and
+ * nothing leaked, but the ROLE CHECK passed on another tenant's answer.
+ *
+ * The reverse is worse. The negative is cached as well (see readMembership), so a
+ * lookup from another tenant that found no row there wrote `null` under the shared key,
+ * and the real member was refused their own space until it expired — a denial of
+ * service for anyone who knows a space id and a user id.
+ *
+ * Same lesson as the dedupe key in CLAUDE.md: identity includes the tenant, because an
+ * id is only as unique as the service that minted it, and Auth mints user ids per
+ * tenant.
+ */
+const cacheKey = (tenantId: string, spaceId: string, userId: string) => `member:${tenantId}:${spaceId}:${userId}`;
 
 /** Called by anything that changes a membership, so the next request sees it. */
-export async function forgetMembership(spaceId: string, userId: string): Promise<void> {
-  await redis.del(cacheKey(spaceId, userId)).catch(() => {
+export async function forgetMembership(tenantId: string, spaceId: string, userId: string): Promise<void> {
+  await redis.del(cacheKey(tenantId, spaceId, userId)).catch(() => {
     // A cache that cannot be cleared is a stale answer for MEMBERSHIP_CACHE_TTL_S, not
     // a failed write: the change is already committed in Postgres.
   });
@@ -58,7 +78,7 @@ export async function readMembership(
   userId: string,
   logger: Logger,
 ): Promise<Membership | null> {
-  const key = cacheKey(spaceId, userId);
+  const key = cacheKey(tenantId, spaceId, userId);
   try {
     const hit = await redis.get(key);
     // 'null' is a real cached answer: see below.
