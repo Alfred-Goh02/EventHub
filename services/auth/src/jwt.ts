@@ -81,6 +81,39 @@ export async function signEmailRequest(params: {
 }
 
 /**
+ * A contact card's type: a user's address, sealed for Notification.
+ *
+ * A DIFFERENT typ FROM AN EMAIL REQUEST, and that is the point of it. Both are sealed
+ * to the same key and signed by the same key, so the type is the only thing that
+ * tells them apart. Without it a contact card, which Auth publishes for every user,
+ * could be passed off to Notification's email path as a request to send something.
+ * Notification pins typ on each path.
+ */
+export const CONTACT_CARD_TYPE = 'auth-contact+jwt';
+
+/**
+ * Signs the claims sealed inside a contact card.
+ *
+ * NO EXPIRY. A card is valid until a newer one for the same user replaces it, and a
+ * contact card that expired would silently stop a user's reply emails one day with
+ * nothing to say why. Replacement, not time, is what retires a card.
+ */
+export async function signContactCard(params: {
+  subject: string;
+  jti: string;
+  claims: Record<string, string>;
+}): Promise<string> {
+  return new SignJWT(params.claims)
+    .setProtectedHeader({ alg: ALG, typ: CONTACT_CARD_TYPE })
+    .setSubject(params.subject)
+    .setJti(params.jti)
+    .setIssuer(ISSUER!)
+    .setAudience(EMAIL_REQUEST_AUDIENCE)
+    .setIssuedAt()
+    .sign(privateKey);
+}
+
+/**
  * There is no verifyAccessToken here, and that is deliberate.
  *
  * This file used to export one: a second implementation of token verification

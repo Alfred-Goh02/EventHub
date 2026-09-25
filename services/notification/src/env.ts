@@ -21,6 +21,13 @@ const notificationEnvSchema = z.object({
   /** One group per deployment. Verifiers run their own, so they never take its partitions. */
   KAFKA_CONSUMER_GROUP: z.string().min(1).default('notification-dispatch'),
   /**
+   * The group that keeps the contact-card copy, from auth.user-contact. Its own, so a
+   * backlog of cards never waits behind email requests or the reverse. It always
+   * starts from the earliest offset: the topic is compacted precisely so a new group
+   * can read every user's card, and there is deliberately no setting for that.
+   */
+  CONTACTS_CONSUMER_GROUP: z.string().min(1).default('notification-contacts'),
+  /**
    * Where a group with no committed offset starts. earliest, so a request queued
    * before the service first ran is still delivered if its link has not expired.
    */

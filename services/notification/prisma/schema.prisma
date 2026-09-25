@@ -93,3 +93,19 @@ model EmailSuppression {
 
   @@unique([tenantId, addressHash])
 }
+
+/// A user's contact card from auth.user-contact: their address, SEALED to this
+/// service's key, so the table holds ciphertext rather than addresses. The latest
+/// card per user wins. See migration 20260926000000.
+model ContactCard {
+  tenantId   String
+  userId     String
+  /// The JWE exactly as Auth sealed it. Opened only when an email is sent.
+  sealed     String
+  messageId  String
+  /// When Auth queued the card. An older card never replaces a newer one.
+  occurredAt DateTime
+  updatedAt  DateTime @default(now())
+
+  @@id([tenantId, userId])
+}

@@ -65,6 +65,24 @@ const EXPECTED = [
     why: 'a delivery that can never succeed must outlive the week nobody looked at it',
   },
   {
+    topic: 'auth.user-contact',
+    name: 'cleanup.policy',
+    value: 'compact',
+    why: "Notification's copy of every address is rebuilt by replaying this topic from the beginning",
+  },
+  {
+    topic: 'auth.user-contact',
+    name: 'delete.retention.ms',
+    value: '604800000',
+    why: 'a withdrawn card has to reach a consumer that was down for a weekend, not only for a day',
+  },
+  {
+    topic: 'auth.user-contact.dlq',
+    name: 'retention.ms',
+    value: '-1',
+    why: 'a card Notification refused is a possible forgery, and must outlive the week nobody looked at it',
+  },
+  {
     topic: 'community.feed',
     name: 'retention.ms',
     value: '604800000',

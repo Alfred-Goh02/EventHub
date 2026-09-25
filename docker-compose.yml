@@ -410,6 +410,9 @@ services:
       # names and assigned per command below, rather than hoping three migrations
       # can share one variable.
       AUTH_DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
+      # Auth's app role, for queueing contact cards: that command writes the way the
+      # service does, one tenant at a time under row security, not as the owner.
+      AUTH_APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@postgres:5432/eventhub_auth
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
       TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
@@ -468,6 +471,11 @@ services:
         # dies on a missing module.
         echo "setup: seeding auth"
         DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma db seed
+
+        # Seeded users get no card from /register, so they are queued here. Only
+        # users who never had one: a second `up` queues nothing.
+        echo "setup: queueing contact cards"
+        DATABASE_URL="$$AUTH_DATABASE_URL" APP_DATABASE_URL="$$AUTH_APP_DATABASE_URL" pnpm --filter @eventhub/auth run contact-cards:publish
 
         # Not optional: the broker runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
         # on purpose, so nothing will create these on first publish.

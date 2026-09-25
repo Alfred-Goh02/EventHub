@@ -7,7 +7,8 @@
     "dev": "tsx watch --env-file=.env src/index.ts",
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
-    "generate": "prisma generate"
+    "generate": "prisma generate",
+    "contact-cards:publish": "node --env-file-if-exists=.env dist/scripts/publish-contact-cards.js"
   },
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
