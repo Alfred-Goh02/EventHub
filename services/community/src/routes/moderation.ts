@@ -7,7 +7,7 @@ import type { Logger } from '@eventhub/logger';
 import { withTenant } from '../db.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { atLeast, reach, readMembership, requireMembership } from '../middleware/space.js';
-import { rankScore } from '../rank.js';
+import { hiddenAbove, recordAction, recountComments } from '../visibility.js';
 
 /**
  * Reports, and what a moderator does about them.
@@ -52,7 +52,8 @@ interface Target {
   status: 'VISIBLE' | 'HIDDEN' | 'DELETED';
   /**
    * True when the target cannot be seen whatever its own status says: its post is not
-   * visible, or a comment above it is not.
+   * visible, or a comment above it is HIDDEN. A DELETED comment above it hides nothing:
+   * see visibility.ts.
    */
   hiddenAbove: boolean;
 }
@@ -66,10 +67,7 @@ async function resolveTarget(tx: Prisma.TransactionClient, type: TargetType, id:
             FROM "Post" WHERE id = ${id}`
       : await tx.$queryRaw<Target[]>`
           SELECT p."spaceId", c."postId", c.status::text AS status,
-                 (p.status <> 'VISIBLE'::"ContentStatus" OR EXISTS (
-                    SELECT 1 FROM "Comment" h
-                     WHERE h."postId" = c."postId" AND h.id <> c.id
-                       AND h.status <> 'VISIBLE'::"ContentStatus" AND c.path <@ h.path)) AS "hiddenAbove"
+                 (p.status <> 'VISIBLE'::"ContentStatus" OR ${hiddenAbove('c')}) AS "hiddenAbove"
             FROM "Comment" c JOIN "Post" p ON p.id = c."postId"
            WHERE c.id = ${id}`;
   return rows[0] ?? null;
@@ -186,30 +184,8 @@ export function moderationRoutes(
           // nothing to audit. A second HIDE is not a second action.
           if (moved !== 1) return false;
 
-          if (type === 'COMMENT') {
-            /**
-             * THE POST'S COUNT IS RECOMPUTED, NOT DECREMENTED.
-             *
-             * A hidden comment takes its whole subtree out of the thread, so "minus one"
-             * is wrong whenever it had replies — and spam comments are exactly what
-             * gets hidden, so their boost to the post's rank must go with them or
-             * hiding them leaves the ranking they bought. Counting what is visible now
-             * is right however many were affected, and running it twice is running it
-             * once: the same reasoning as the feed consumer copying a score instead of
-             * adding to it.
-             */
-            await tx.$executeRaw`
-              UPDATE "Post" p
-                 SET "commentCount" = v.n,
-                     "rankScore" = ${rankScore(Prisma.sql`p."reactionCount"`, Prisma.sql`v.n`, Prisma.sql`p."createdAt"`)}
-                FROM (SELECT count(*)::int AS n FROM "Comment" c
-                       WHERE c."postId" = ${target.postId} AND c.status = 'VISIBLE'::"ContentStatus"
-                         AND NOT EXISTS (
-                           SELECT 1 FROM "Comment" h
-                            WHERE h."postId" = c."postId" AND h.status <> 'VISIBLE'::"ContentStatus"
-                              AND c.path <@ h.path)) v
-               WHERE p.id = ${target.postId}`;
-          }
+          // Recomputed, not decremented: a hidden comment takes its subtree with it.
+          if (type === 'COMMENT') await recountComments(tx, target.postId);
 
           if (reportId !== undefined) {
             /**
@@ -225,10 +201,16 @@ export function moderationRoutes(
             if (resolved !== 1) throw new ReportMismatch();
           }
 
-          await tx.$executeRaw`
-            INSERT INTO "ModerationAction" (id, "tenantId", "actorId", "targetType", "targetId", action, reason, "reportId", "createdAt")
-            VALUES (${randomUUID()}, ${tenantId}, ${userId}, ${type}::"TargetType", ${id}, ${action}::"ModAction",
-                    ${reason ?? null}, ${reportId ?? null}, now())`;
+          await recordAction(tx, {
+            tenantId,
+            spaceId: target.spaceId,
+            actorId: userId,
+            targetType: type,
+            targetId: id,
+            action,
+            reason,
+            reportId,
+          });
           return true;
         });
       } catch (err) {

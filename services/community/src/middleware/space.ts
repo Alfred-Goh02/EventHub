@@ -13,7 +13,7 @@ import { redis } from '../redis.js';
  * moderator has to take effect now. So the role is read per request, cached briefly,
  * and the cache is dropped by whatever changes it.
  */
-const RANK = { MEMBER: 0, MODERATOR: 1, OWNER: 2 } as const;
+export const RANK = { MEMBER: 0, MODERATOR: 1, OWNER: 2 } as const;
 export type SpaceRole = keyof typeof RANK;
 
 export interface Membership {

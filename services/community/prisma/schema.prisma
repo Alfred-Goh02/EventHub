@@ -132,8 +132,12 @@ model Report {
 model ModerationAction {
   id         String     @id @default(cuid())
   tenantId   String
+  /// The space the action happened in. A ban's target is a user, which names no space
+  /// by itself; see migration 20260925000000.
+  spaceId    String
   actorId    String
   targetType TargetType
+  /// The post, the comment, or for MEMBER the user id.
   targetId   String
   action     ModAction
   reason     String?
@@ -220,6 +224,9 @@ enum ContentStatus {
 enum TargetType {
   POST
   COMMENT
+  /// A user in one space: the target of a ban. Only ModerationAction uses it; a report
+  /// is always about content.
+  MEMBER
 }
 
 enum ReportReason {

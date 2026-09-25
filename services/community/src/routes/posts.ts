@@ -8,8 +8,9 @@ import { withTenant } from '../db.js';
 import { env } from '../env.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { sortableId } from '../ids.js';
-import { reach as reachSpace } from '../middleware/space.js';
+import { reach as reachSpace, readMembership } from '../middleware/space.js';
 import { rankScore } from '../rank.js';
+import { hiddenAbove, recordAction, recountComments } from '../visibility.js';
 
 /**
  * Posts, threaded comments and reactions.
@@ -50,12 +51,37 @@ const reactionSchema = z.object({
 interface CommentRow {
   id: string;
   parentId: string | null;
-  authorId: string;
-  body: string;
+  /** Null on a tombstone: the author deleted it, and who wrote it goes with the words. */
+  authorId: string | null;
+  body: string | null;
+  deleted: boolean;
   depth: number;
   path: string;
   reactionCount: number;
   createdAt: Date;
+}
+
+type ThreadNode = CommentRow & { replies: ThreadNode[] };
+
+/**
+ * Drops every tombstone with nothing under it, bottom-up, and counts what is left.
+ *
+ * A deleted comment is only shown to hold the replies that answered it. With no reply
+ * left — none written, or all of them deleted too — it would be a "[deleted]" line
+ * holding nothing, so it goes. Bottom-up, because a chain of tombstones ending in
+ * nothing goes entirely: removing the last one empties its parent in turn.
+ */
+function prune(nodes: ThreadNode[]): { kept: ThreadNode[]; count: number } {
+  const kept: ThreadNode[] = [];
+  let count = 0;
+  for (const node of nodes) {
+    const below = prune(node.replies);
+    node.replies = below.kept;
+    if (node.deleted && below.kept.length === 0) continue;
+    kept.push(node);
+    count += 1 + below.count;
+  }
+  return { kept, count };
 }
 
 /** The outbox row every write leaves behind, in the shape community.feed-value declares. */
@@ -215,20 +241,21 @@ export function postRoutes(
         await tx.$executeRaw`
           WITH parent AS (
             /*
-             * The parent must be VISIBLE, and so must everything above it. A reply
-             * under hidden content would be invisible the moment it was written — its
+             * The parent must be VISIBLE, and nothing above it HIDDEN. A reply under
+             * hidden content would be invisible the moment it was written — its
              * ancestor hides it — while still counting towards the post's rank, and it
              * gives anyone holding the id a way to keep writing into a thread a
              * moderator closed. Same refusal as an unknown parent: the path goes NULL
              * and the NOT NULL constraint stops the row.
+             *
+             * A DELETED comment is no parent either: there is nothing left to answer.
+             * But one ABOVE the parent is fine — its replies are still in the thread,
+             * and still answerable. See visibility.ts.
              */
             SELECT c.path FROM "Comment" c
              WHERE c.id = ${parentId} AND c."postId" = ${postId}
                AND c.status = 'VISIBLE'::"ContentStatus"
-               AND NOT EXISTS (
-                 SELECT 1 FROM "Comment" h
-                  WHERE h."postId" = c."postId" AND h.status <> 'VISIBLE'::"ContentStatus"
-                    AND c.path <@ h.path)
+               AND NOT ${hiddenAbove('c')}
           )
           INSERT INTO "Comment" (id, "tenantId", "postId", "authorId", "parentId", path, depth, body, status, "createdAt")
           VALUES (
@@ -296,45 +323,156 @@ export function postRoutes(
      */
     const rows = await withTenant(tenantId, (tx) =>
       tx.$queryRaw<CommentRow[]>`
-        SELECT c.id, c."parentId", c."authorId", c.body, c.depth, c.path::text AS path, c."reactionCount", c."createdAt"
+        SELECT c.id, c."parentId",
+               /*
+                * A tombstone's words and author are blanked HERE, so they never leave
+                * the database. Blanking them in JavaScript would work until the day a
+                * change returned the row before the blanking ran.
+                */
+               CASE WHEN c.status = 'DELETED'::"ContentStatus" THEN NULL ELSE c."authorId" END AS "authorId",
+               CASE WHEN c.status = 'DELETED'::"ContentStatus" THEN NULL ELSE c.body END AS body,
+               c.status = 'DELETED'::"ContentStatus" AS deleted,
+               c.depth, c.path::text AS path, c."reactionCount", c."createdAt"
           FROM "Comment" c
-         WHERE c."postId" = ${postId} AND c.status = 'VISIBLE'::"ContentStatus"
+         WHERE c."postId" = ${postId} AND c.status <> 'HIDDEN'::"ContentStatus"
            /*
-            * And no ANCESTOR hidden. Filtering on the row's own status alone left the
-            * replies of a hidden comment in the result with their parent missing from
-            * it, and the one-pass nesting below attached every orphan at the top — so
-            * hiding a comment PROMOTED its replies to standalone comments, the opposite
-            * of hiding a thread. Part 3 wrote that down as the problem moderation would
-            * have to solve; this is the answer. c.path <@ h.path is "c is under h", and
-            * the GiST index on path answers it.
+            * And nothing HIDDEN above it. Filtering on the row's own status alone left
+            * the replies of a hidden comment in the result with their parent missing
+            * from it, and the one-pass nesting below attached every orphan at the top —
+            * so hiding a comment PROMOTED its replies to standalone comments, the
+            * opposite of hiding a thread. Part 3 wrote that down as the problem
+            * moderation would have to solve; this is the answer.
+            *
+            * DELETED comments come back, blanked, because their replies hang from them;
+            * prune() drops the ones with nothing left under them.
             */
-           AND NOT EXISTS (
-             SELECT 1 FROM "Comment" h
-              WHERE h."postId" = c."postId" AND h.status <> 'VISIBLE'::"ContentStatus"
-                AND c.path <@ h.path)
+           AND NOT ${hiddenAbove('c')}
          ORDER BY c.path
          LIMIT ${THREAD_LIMIT + 1}`,
     );
     const truncated = rows.length > THREAD_LIMIT;
     if (truncated) rows.length = THREAD_LIMIT;
 
-    const nodes = new Map<string, CommentRow & { replies: unknown[] }>();
-    const thread: unknown[] = [];
+    const nodes = new Map<string, ThreadNode>();
+    const top: ThreadNode[] = [];
     for (const row of rows) {
-      const node = { ...row, replies: [] as unknown[] };
+      const node: ThreadNode = { ...row, replies: [] };
       nodes.set(row.id, node);
       /**
        * A parent always precedes its children in path order, so one pass is enough.
        *
-       * A node whose parent is not in this map is attached at the top. That now happens
+       * A node whose parent is not in this map is attached at the top. That happens
        * only at the truncation boundary: the query excludes every comment with a hidden
-       * ancestor, so a hidden comment's replies never arrive here to be promoted.
+       * ancestor, and returns a deleted parent as a tombstone, so no reply arrives here
+       * without its parent.
        */
       const parent = row.parentId ? nodes.get(row.parentId) : undefined;
       if (parent) parent.replies.push(node);
-      else thread.push(node);
+      else top.push(node);
     }
-    return res.json({ comments: thread, count: rows.length, truncated });
+    const { kept, count } = prune(top);
+    return res.json({ comments: kept, count, truncated });
+  }));
+
+  /**
+   * An author deletes their own post or comment.
+   *
+   * AUTHORSHIP IS THE PERMISSION, NOT MEMBERSHIP. Leaving a space must not strand what
+   * you wrote there, so a former member can still delete their own words. A BAN stops
+   * it, as it stops every other act in the space. Moderators do not delete: they hide,
+   * which can be undone, and deleting is the author's own decision.
+   *
+   * VISIBLE → DELETED, compare-and-set, audited as DELETE with the author as the actor,
+   * in the same transaction. The row stays, because reports and the audit trail name it.
+   * A second delete finds nothing to delete and answers 404: the content is gone, which
+   * is what the first call asked for.
+   *
+   * Nothing is published. The feed reads each post's status, and nothing outside this
+   * service consumes community.feed.
+   */
+  const refuseBanned = async (tenantId: string, spaceId: string, userId: string) =>
+    (await readMembership(tenantId, spaceId, userId, logger))?.status === 'BANNED';
+
+  /**
+   * Someone else's content: 403 to a caller who can read the space, and 404 to one who
+   * cannot. A flat 403 would confirm to a stranger that a post in a PRIVATE space
+   * exists, which every other route here refuses to do.
+   */
+  const notYours = async (tenantId: string, spaceId: string, userId: string) =>
+    (await reach(tenantId, spaceId, userId, 'read')).status === 200
+      ? { status: 403, error: 'only its author can delete this' }
+      : { status: 404, error: 'not found' };
+
+  // Two buckets, not one: the limiter keys on the action name, and two routes sharing a
+  // name with different limits would refill one bucket at two rates.
+  router.delete('/posts/:postId', limit.middleware('delete-post', limits.post), ah(async (req, res) => {
+    const { tenantId, userId } = getAuth(req);
+    const postId = req.params['postId']!;
+
+    const rows = await withTenant(tenantId, (tx) =>
+      tx.$queryRaw<Array<{ spaceId: string; authorId: string }>>`
+        SELECT "spaceId", "authorId" FROM "Post" WHERE id = ${postId} AND status = 'VISIBLE'::"ContentStatus"`,
+    );
+    const post = rows[0];
+    if (!post) return res.status(404).json({ error: 'not found' });
+    if (post.authorId !== userId) {
+      const refusal = await notYours(tenantId, post.spaceId, userId);
+      return res.status(refusal.status).json({ error: refusal.error });
+    }
+    if (await refuseBanned(tenantId, post.spaceId, userId)) return res.status(403).json({ error: 'banned from this space' });
+
+    const deleted = await withTenant(tenantId, async (tx) => {
+      const moved = await tx.$executeRaw`
+        UPDATE "Post" SET status = 'DELETED'::"ContentStatus"
+         WHERE id = ${postId} AND "authorId" = ${userId} AND status = 'VISIBLE'::"ContentStatus"`;
+      // Hidden or deleted in the meantime: nothing of the author's left to remove.
+      if (moved !== 1) return false;
+      await recordAction(tx, { tenantId, spaceId: post.spaceId, actorId: userId, targetType: 'POST', targetId: postId, action: 'DELETE' });
+      return true;
+    });
+    return deleted ? res.status(204).end() : res.status(404).json({ error: 'not found' });
+  }));
+
+  router.delete('/comments/:commentId', limit.middleware('delete-comment', limits.comment), ah(async (req, res) => {
+    const { tenantId, userId } = getAuth(req);
+    const commentId = req.params['commentId']!;
+
+    // Only what the author can see: on a visible post, visible itself, nothing hidden
+    // above it. A comment inside a hidden subtree is the same 404 as one that never was.
+    const rows = await withTenant(tenantId, (tx) =>
+      tx.$queryRaw<Array<{ postId: string; spaceId: string; authorId: string }>>`
+        SELECT c."postId", p."spaceId", c."authorId"
+          FROM "Comment" c JOIN "Post" p ON p.id = c."postId"
+         WHERE c.id = ${commentId} AND c.status = 'VISIBLE'::"ContentStatus"
+           AND p.status = 'VISIBLE'::"ContentStatus" AND NOT ${hiddenAbove('c')}`,
+    );
+    const comment = rows[0];
+    if (!comment) return res.status(404).json({ error: 'not found' });
+    if (comment.authorId !== userId) {
+      const refusal = await notYours(tenantId, comment.spaceId, userId);
+      return res.status(refusal.status).json({ error: refusal.error });
+    }
+    if (await refuseBanned(tenantId, comment.spaceId, userId)) return res.status(403).json({ error: 'banned from this space' });
+
+    const deleted = await withTenant(tenantId, async (tx) => {
+      const moved = await tx.$executeRaw`
+        UPDATE "Comment" SET status = 'DELETED'::"ContentStatus"
+         WHERE id = ${commentId} AND "authorId" = ${userId} AND status = 'VISIBLE'::"ContentStatus"`;
+      if (moved !== 1) return false;
+      // The replies stay, so the count drops by one — but it is recomputed, not
+      // decremented, for the reasons in visibility.ts.
+      await recountComments(tx, comment.postId);
+      await recordAction(tx, {
+        tenantId,
+        spaceId: comment.spaceId,
+        actorId: userId,
+        targetType: 'COMMENT',
+        targetId: commentId,
+        action: 'DELETE',
+      });
+      return true;
+    });
+    return deleted ? res.status(204).end() : res.status(404).json({ error: 'not found' });
   }));
 
   /**
