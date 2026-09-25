@@ -505,8 +505,9 @@ works by making it match something.
 
 A migration runs as the table owner with no `app.tenant_id` set, and FORCE row
 security binds the owner, so an UPDATE or DELETE in a migration matches zero rows and
-succeeds. Three shipped that way: event's empty-slug backfill, ticketing's
-in-progress-key delete, and community's `fannedOut` backfill. Measured each time the
+succeeds. Two merged that way — event's empty-slug backfill and ticketing's
+in-progress-key delete — and community's `fannedOut` backfill was caught one step
+before it would have. Measured each time the
 same way — as the owner, in a rolled-back transaction, with a planted row: `0` as
 written, the planted row and the real ones with FORCE lifted (2, 53, 1). The
 ticketing one left 52 idempotency keys answering 409 for good.
