@@ -45,8 +45,21 @@ import type { Logger } from '@eventhub/logger';
  * This event fires for a client sitting IDLE in the pool, so there is no query
  * in flight and no caller waiting on a result. `pg` has already removed the
  * client from the pool by the time this runs; the next checkout opens a fresh
- * connection. An error on a client that IS checked out does not arrive here —
- * it rejects the `query()` call, where the caller's own error handling belongs.
+ * connection.
+ *
+ * WHAT IT DOES NOT COVER, and this paragraph used to claim it did: "an error on
+ * a client that IS checked out does not arrive here — it rejects the query()
+ * call". That holds only while a query is in flight. pg-pool removes its idle
+ * listener on checkout and re-attaches it on release, so between two queries a
+ * checked-out Client has no 'error' listener at all — and pg emits there
+ * precisely when there is no query to reject. Node then throws and the process
+ * exits. Measured in the relay, whose role carries
+ * idle_in_transaction_session_timeout: an unhandled 'error' event, FATAL 25P03,
+ * exit 1 mid-transaction. A Postgres restart or a pg_terminate_backend does the
+ * same to any checked-out client here, transaction or not — including the
+ * webhook route's appPool, mid-settlement.
+ *
+ * withClient() below closes that half. This handler keeps the idle half.
  */
 export function attachPoolErrorHandler(pool: pg.Pool, logger: Logger, name: string): pg.Pool {
   pool.on('error', (err) => {
@@ -70,4 +83,58 @@ export function attachPoolErrorHandler(pool: pg.Pool, logger: Logger, name: stri
     );
   });
   return pool;
+}
+
+/**
+ * Checks a client out with an 'error' listener on it for the whole checkout.
+ *
+ * The other half of the same hazard: attachPoolErrorHandler covers a client
+ * sitting idle IN the pool, this covers one that has been handed out. Between
+ * two queries a checked-out client has no listener of its own, and that is
+ * exactly when pg's Client emits 'error' rather than rejecting a query — so a
+ * terminated connection there is an uncaught exception and an exit.
+ *
+ * DESTROYED, NOT RETURNED: if the listener fired the connection is gone, and
+ * `release(err)` makes pg drop the client rather than hand a dead socket to the
+ * next caller.
+ *
+ * THE removeListener MATTERS. pg reuses Client objects across checkouts, so a
+ * listener added per checkout and never removed accumulates on one object until
+ * Node prints MaxListenersExceededWarning.
+ *
+ * The relay carries its own copy in services/relay/src/db.ts and Notification
+ * in services/notification/src/pool.ts, for the same reason this file exists —
+ * the three services share no database package — and all three are named the
+ * same thing so scripts/verify-relay-idle-in-transaction.mjs can require that
+ * every `pool.connect()` in the repository goes through one.
+ */
+export async function withClient<T>(
+  pool: pg.Pool,
+  logger: Logger,
+  name: string,
+  fn: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+
+  let poisoned: Error | null = null;
+  const onError = (err: Error): void => {
+    poisoned = err;
+    // Fields, not the error object — same reason as above.
+    const e = err as NodeJS.ErrnoException & { code?: string };
+    logger.warn(
+      { pool: name, code: e.code, reason: e.message },
+      'the database terminated a connection that was checked out; it will not be reused',
+    );
+  };
+
+  client.on('error', onError);
+
+  try {
+    return await fn(client);
+  } finally {
+    client.removeListener('error', onError);
+    // release(err) destroys; release() returns it to the pool.
+    if (poisoned) client.release(poisoned);
+    else client.release();
+  }
 }

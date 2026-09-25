@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
+import { withClient } from '../pool.js';
 import { SWEEP_CLAIM_SQL } from './claim-sql.js';
 
 export interface SweepResult {
@@ -28,9 +29,27 @@ export async function sweepOnce(
   logger: Logger,
   opts: { batchSize: number },
 ): Promise<SweepResult> {
-  const client = await pool.connect();
   const result: SweepResult = { claimed: 0, expired: 0, skipped: 0, seatsReturned: 0 };
 
+  await withClient(pool, logger, 'ticketing-sweeper', (client) =>
+    sweepWithClient(client, result, logger, opts),
+  );
+
+  return result;
+}
+
+/**
+ * The sweep itself, on a client someone else owns.
+ *
+ * Split out so sweepOnce is the checkout and this is the work — the transaction
+ * is still wholly here, so the client goes back committed or rolled back.
+ */
+async function sweepWithClient(
+  client: pg.PoolClient,
+  result: SweepResult,
+  logger: Logger,
+  opts: { batchSize: number },
+): Promise<void> {
   try {
     await client.query('BEGIN');
 
@@ -190,11 +209,7 @@ export async function sweepOnce(
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
-  } finally {
-    client.release();
   }
-
-  return result;
 }
 
 /**
@@ -205,9 +220,8 @@ export async function sweepOnce(
  * It must be able to expire a hold and return inventory, and must NOT be able to
  * create reservations or read another service's data.
  */
-export async function assertSweeperIsLeastPrivilege(pool: pg.Pool): Promise<void> {
-  const client = await pool.connect();
-  try {
+export async function assertSweeperIsLeastPrivilege(pool: pg.Pool, logger: Logger): Promise<void> {
+  await withClient(pool, logger, 'ticketing-sweeper', async (client) => {
     const who = await client.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
       'SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user',
     );
@@ -276,7 +290,5 @@ export async function assertSweeperIsLeastPrivilege(pool: pg.Pool): Promise<void
           'DELETE on ProcessedMessage and IdempotencyKey only — nothing that holds inventory.',
       );
     }
-  } finally {
-    client.release();
-  }
+  });
 }
