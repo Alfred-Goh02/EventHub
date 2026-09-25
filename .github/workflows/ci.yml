@@ -978,6 +978,16 @@ jobs:
       - name: Assert an address that does not exist is suppressed, and only such an address
         run: node scripts/verify-email-suppression.mjs
 
+      # Preferences and the unsubscribe link. A user changes only their own choices, in
+      # their own tenant; a password reset cannot be turned off, and a row planted to
+      # say it is off is ignored; the categories are a closed set. Following an
+      # unsubscribe link changes nothing — read after a pause, because the first
+      # version read at once and missed an unsubscribe fired from GET and not awaited —
+      # and POSTing it unsubscribes. Four kinds of tampered token are refused and change
+      # nothing, and a production process refuses the public development secret.
+      - name: Assert a user turns off only what may be turned off, and an unsubscribe link does one thing
+        run: node scripts/verify-notification-preferences.mjs
+
       # A delivery is claimed PENDING before anything is sent, and the ones whose
       # message was dead-lettered stay that way for ever. The sweep ends them, on a
       # credential that crosses tenants and may do nothing else: it cannot create a

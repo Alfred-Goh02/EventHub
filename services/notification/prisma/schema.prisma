@@ -93,3 +93,17 @@ model EmailSuppression {
 
   @@unique([tenantId, addressHash])
 }
+
+/// A user's choice for one category on one channel. No row means the category's
+/// default; a transactional category can never be turned off. Never deleted by the
+/// service: an opt-out is evidence. See migration 20260926100000.
+model NotificationPreference {
+  tenantId  String
+  userId    String
+  category  String
+  channel   String
+  enabled   Boolean
+  updatedAt DateTime @default(now())
+
+  @@id([tenantId, userId, category, channel])
+}

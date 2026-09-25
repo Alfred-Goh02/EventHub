@@ -1,13 +1,14 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { publicKeyFromEnv } from '@eventhub/auth-middleware';
+import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
 import { createSmtpChannel } from './channels/smtp.js';
 import { createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
 import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/consumer.js';
 import { createSweeper } from './sweeper/index.js';
+import { preferenceRoutes } from './preferences/routes.js';
 
 /**
  * The Notification service: the one service that sends email.
@@ -90,10 +91,18 @@ app.get('/ready', async (_req, res) => {
   });
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+/**
+ * Registered in main(), AFTER the routes: Express matches middleware in order, so an
+ * error handler registered before a route never sees its errors. It sat up here while
+ * every route was synchronous and defined above it; /preferences is mounted in main()
+ * because requireAuth needs Auth's public key loaded first, which put the handler in
+ * front of it. Community shipped exactly that once — a handler that threw took the
+ * process down instead of answering 500.
+ */
+const errorHandler: express.ErrorRequestHandler = (err, _req, res, _next) => {
   logger.error({ err }, 'unhandled error');
   res.status(500).json({ error: 'internal error' });
-});
+};
 
 async function startDispatcher(d: NonNullable<typeof dispatcher>): Promise<void> {
   for (let attempt = 1; ; attempt++) {
@@ -134,6 +143,18 @@ async function main(): Promise<void> {
   // Both keys before anything is consumed: a request that cannot be opened or
   // verified must not be read and skipped as if it were poison.
   const [privateKey, authPublicKey] = await Promise.all([loadNotificationPrivateKey(), publicKeyFromEnv()]);
+
+  // A user's own preferences, and the unsubscribe link. requireAuth verifies an access
+  // token — aud JWT_AUDIENCE — with the same public key, so a sealed email request,
+  // which is for aud eventhub-notification, is not accepted as one.
+  app.use(
+    preferenceRoutes({
+      requireAuth: createRequireAuth({ publicKey: authPublicKey, issuer: env.JWT_ISSUER, audience: env.JWT_AUDIENCE }),
+      unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
+      logger,
+    }),
+  );
+  app.use(errorHandler);
 
   dispatcher = createDispatcher({
     brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),

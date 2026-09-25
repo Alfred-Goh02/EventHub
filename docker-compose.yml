@@ -975,6 +975,9 @@ services:
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
       EMAIL_FROM: no-reply@eventhub.local
+      # The development value from .env.example. NODE_ENV is development here; a
+      # production process refuses to start with this.
+      UNSUBSCRIBE_SECRET: dev-only-unsubscribe-secret-change-me-0123456789
     volumes:
       - jwt-public:/run/eventhub/keys:ro
       # keys/ resolves beside dist/, so the layout fixes this mount point.
