@@ -69,20 +69,20 @@ export async function fanOutPost(
   if (memberCount > maxMembers) return { outcome: 'too-large', memberCount, rows: 0 };
 
   /**
-   * The score is copied from the post rather than recomputed here. One formula, in one
-   * place, is the rule the post routes already follow; a second copy of it in the
-   * consumer would drift from the first the day either changed.
+   * No score is copied. The feed ranks each page by the POST's rankScore, read at
+   * query time, so a copy here was one more thing to keep in step — rewritten on every
+   * comment and reaction, once per fanned-out row — for a column nothing read. See
+   * migration 20260925120000.
    *
    * createdAt IS THE POST'S, NOT THIS ROW'S, and that is deliberate even though the
    * column defaults to now(). A feed is ordered by when the POST happened; taking the
    * moment the consumer got round to writing the row would order it by consumer lag
    * instead, so a backlog being worked off would shuffle everyone's feed. It also
-   * makes the column safe to page on, because unlike rankScore it never changes after
-   * the row exists.
+   * makes the column safe to page on, because it never changes after the row exists.
    */
   const rows = await tx.$executeRaw`
-    INSERT INTO "FeedEntry" (id, "tenantId", "userId", "postId", "spaceId", "rankScore", "createdAt")
-    SELECT gen_random_uuid()::text, ${message.tenantId}, m."userId", p.id, p."spaceId", p."rankScore", p."createdAt"
+    INSERT INTO "FeedEntry" (id, "tenantId", "userId", "postId", "spaceId", "createdAt")
+    SELECT gen_random_uuid()::text, ${message.tenantId}, m."userId", p.id, p."spaceId", p."createdAt"
       FROM "Membership" m
       JOIN "Post" p ON p.id = ${message.postId}
      WHERE m."tenantId" = ${message.tenantId}
@@ -100,34 +100,4 @@ export async function fanOutPost(
   await tx.$executeRaw`UPDATE "Post" SET "fannedOut" = true WHERE id = ${message.postId} AND "fannedOut" = false`;
 
   return { outcome: 'fanned-out', memberCount, rows };
-}
-
-/**
- * Bring the fanned-out copies of a post's score back in line with the post.
- *
- * THE VALUE IS COPIED, NEVER ADJUSTED, and that is the whole reason this is safe.
- * `SET "rankScore" = "rankScore" + x` would count a redelivered reaction twice and
- * would apply two reorderings in the wrong order if the partition ever replayed out of
- * sequence. Copying whatever the Post row currently says is idempotent — running it
- * twice is running it once — and self-correcting: a message that arrives late still
- * leaves the copy equal to the truth, because the truth is what it reads.
- *
- * So this deliberately ignores the counts in the event. The event is only a signal
- * that something moved; Postgres holds the answer.
- *
- * The app role is granted UPDATE on this column ALONE (see the migration), so this
- * cannot quietly move a row into somebody else's feed even if it tried.
- */
-export async function resyncScore(
-  tx: Prisma.TransactionClient,
-  message: { tenantId: string; postId: string },
-): Promise<number> {
-  return tx.$executeRaw`
-    UPDATE "FeedEntry" f
-       SET "rankScore" = p."rankScore"
-      FROM "Post" p
-     WHERE p.id = ${message.postId}
-       AND f."postId" = ${message.postId}
-       AND f."tenantId" = ${message.tenantId}
-       AND f."rankScore" IS DISTINCT FROM p."rankScore"`;
 }

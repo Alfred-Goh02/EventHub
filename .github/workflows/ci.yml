@@ -1025,11 +1025,10 @@ jobs:
       # ACTIVE member and nobody else; a space past the threshold is left to the read
       # path, with a small space in the same run as the control so "no rows" cannot
       # pass by nothing having worked. The same message republished writes nothing
-      # twice, and the score is COPIED from the post rather than adjusted by a delta —
-      # asserted by applying the same message again and requiring nothing to move,
-      # because `rankScore + x` survives every other check and is wrong by exactly x
-      # the first time a partition replays. A message that can never be applied goes
-      # to community.feed.dlq and the partition carries on.
+      # twice. A comment is consumed as a known kind with nothing to do — the feed
+      # ranks by the post's own score — and the app role holds no UPDATE on FeedEntry,
+      # asked of the catalog. A message that can never be applied goes to
+      # community.feed.dlq and the partition carries on.
       - name: Assert a post reaches the right feeds, exactly once
         run: node scripts/verify-community-feed-fanout.mjs
 

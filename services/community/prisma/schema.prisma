@@ -156,10 +156,10 @@ model FeedEntry {
   userId    String
   postId    String
   spaceId   String
-  rankScore Float
   /// The POST's createdAt, copied at fan-out, not the time this row was written — so
   /// the feed is ordered by when things happened rather than by consumer lag. Immutable,
-  /// which is what makes it safe to page on; rankScore is not.
+  /// which is what makes it safe to page on. There is no score here: the feed ranks by
+  /// the post's own, read at query time. See migration 20260925120000.
   createdAt DateTime @default(now())
 
   @@unique([tenantId, userId, postId])
