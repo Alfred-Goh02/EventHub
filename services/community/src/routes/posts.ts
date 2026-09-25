@@ -8,7 +8,8 @@ import { withTenant } from '../db.js';
 import { env } from '../env.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { sortableId } from '../ids.js';
-import { readMembership } from '../middleware/space.js';
+import { reach as reachSpace } from '../middleware/space.js';
+import { rankScore } from '../rank.js';
 
 /**
  * Posts, threaded comments and reactions.
@@ -25,36 +26,6 @@ const SCHEMA_VERSION = 1;
 /** The most comments one request returns. Overflow is reported, never silently dropped. */
 const THREAD_LIMIT = env.THREAD_PAGE_LIMIT;
 
-/**
- * ONE FORMULA, IN ONE PLACE.
- *
- * A score and the counters it derives from drifting apart is a bug nobody notices
- * until the feed order looks wrong, so insert and every update build it from here.
- * Additive and time-stable: a post's score changes only when someone acts on it, which
- * is what lets an index answer the feed. A decay score has to be recomputed for every
- * row before it can be ordered.
- *
- * The counters are passed in because the SET expressions of an UPDATE all see the
- * PRE-update row: the caller adding a reaction passes `"reactionCount" + 1`, or the
- * score lands one behind for ever.
- */
-/**
- * EVERY INTERPOLATED FRAGMENT IS PARENTHESISED, and that is not style.
- *
- * Without the brackets these arguments are pasted in as text and Postgres applies its
- * own precedence. The caller adding a comment passes `"commentCount" + 1`, and
- * `2 * ${comments}` became `2 * "commentCount" + 1` — so a comment was worth 1 instead
- * of 2, and the FIRST comment moved the score not at all: greatest(0 + 1, 1) and
- * greatest(0, 1) are both 1.
- *
- * It hid for a whole part because the verifier recomputed the formula from the stored
- * columns and compared, which agreed with itself, and because the reaction path
- * happens to be unaffected — `rc + 1 + 2 * cc` parses the same either way. It was
- * found by asking a different question: did the number I am about to compare actually
- * move?
- */
-const rankScore = (reactions: Prisma.Sql, comments: Prisma.Sql, createdAt: Prisma.Sql) =>
-  Prisma.sql`ln(greatest((${reactions}) + 2 * (${comments}), 1) + 1) + extract(epoch from ${createdAt}) / 45000.0`;
 
 /**
  * THE REACTION KINDS ARE A CLOSED SET, and that is a ranking control, not tidiness.
@@ -149,30 +120,22 @@ export function postRoutes(
 ): Router {
   const router = Router();
 
-  /**
-   * May this caller read or write in this space?
-   *
-   * A public space is open to anyone in the tenant; a private one only to its members,
-   * and it answers 404 rather than 403 so it does not confirm its own existence.
-   */
-  async function reach(tenantId: string, spaceId: string, userId: string, need: 'read' | 'write') {
-    const rows = await withTenant(tenantId, (tx) =>
-      tx.$queryRaw<Array<{ visibility: string }>>`
-        SELECT visibility::text AS visibility FROM "CommunitySpace" WHERE id = ${spaceId}`,
-    );
-    if (!rows[0]) return { status: 404 as const };
-    const membership = await readMembership(tenantId, spaceId, userId, logger);
-    if (membership?.status === 'BANNED') return { status: 403 as const, error: 'banned from this space' };
-    if (rows[0].visibility === 'PRIVATE' && !membership) return { status: 404 as const };
-    // Reading a public space needs nothing; writing in any space needs membership.
-    if (need === 'write' && !membership) return { status: 403 as const, error: 'join the space first' };
-    return { status: 200 as const };
-  }
+  /** The shared check, bound to this router's logger. See middleware/space.ts. */
+  const reach = (tenantId: string, spaceId: string, userId: string, need: 'read' | 'write') =>
+    reachSpace(tenantId, spaceId, userId, need, logger);
 
   /** The space a post belongs to, or null. Tenant-scoped by the policy, not by this query. */
+  /**
+   * VISIBLE POSTS ONLY, for every caller here: commenting, reacting, un-reacting and
+   * reading the thread. A hidden post that still took comments and reactions could be
+   * kept alive — and its rank pushed up — by exactly the people it was hidden from, and
+   * its thread would stay readable to anyone holding the id. Moderation looks posts up
+   * on its own, because un-hiding has to find the hidden ones.
+   */
   async function spaceOfPost(tenantId: string, postId: string): Promise<string | null> {
     const rows = await withTenant(tenantId, (tx) =>
-      tx.$queryRaw<Array<{ spaceId: string }>>`SELECT "spaceId" FROM "Post" WHERE id = ${postId}`,
+      tx.$queryRaw<Array<{ spaceId: string }>>`
+        SELECT "spaceId" FROM "Post" WHERE id = ${postId} AND status = 'VISIBLE'::"ContentStatus"`,
     );
     return rows[0]?.spaceId ?? null;
   }
@@ -251,7 +214,21 @@ export function postRoutes(
       await withTenant(tenantId, async (tx) => {
         await tx.$executeRaw`
           WITH parent AS (
-            SELECT path FROM "Comment" WHERE id = ${parentId} AND "postId" = ${postId}
+            /*
+             * The parent must be VISIBLE, and so must everything above it. A reply
+             * under hidden content would be invisible the moment it was written — its
+             * ancestor hides it — while still counting towards the post's rank, and it
+             * gives anyone holding the id a way to keep writing into a thread a
+             * moderator closed. Same refusal as an unknown parent: the path goes NULL
+             * and the NOT NULL constraint stops the row.
+             */
+            SELECT c.path FROM "Comment" c
+             WHERE c.id = ${parentId} AND c."postId" = ${postId}
+               AND c.status = 'VISIBLE'::"ContentStatus"
+               AND NOT EXISTS (
+                 SELECT 1 FROM "Comment" h
+                  WHERE h."postId" = c."postId" AND h.status <> 'VISIBLE'::"ContentStatus"
+                    AND c.path <@ h.path)
           )
           INSERT INTO "Comment" (id, "tenantId", "postId", "authorId", "parentId", path, depth, body, status, "createdAt")
           VALUES (
@@ -319,10 +296,23 @@ export function postRoutes(
      */
     const rows = await withTenant(tenantId, (tx) =>
       tx.$queryRaw<CommentRow[]>`
-        SELECT id, "parentId", "authorId", body, depth, path::text AS path, "reactionCount", "createdAt"
-          FROM "Comment"
-         WHERE "postId" = ${postId} AND status = 'VISIBLE'::"ContentStatus"
-         ORDER BY path
+        SELECT c.id, c."parentId", c."authorId", c.body, c.depth, c.path::text AS path, c."reactionCount", c."createdAt"
+          FROM "Comment" c
+         WHERE c."postId" = ${postId} AND c.status = 'VISIBLE'::"ContentStatus"
+           /*
+            * And no ANCESTOR hidden. Filtering on the row's own status alone left the
+            * replies of a hidden comment in the result with their parent missing from
+            * it, and the one-pass nesting below attached every orphan at the top — so
+            * hiding a comment PROMOTED its replies to standalone comments, the opposite
+            * of hiding a thread. Part 3 wrote that down as the problem moderation would
+            * have to solve; this is the answer. c.path <@ h.path is "c is under h", and
+            * the GiST index on path answers it.
+            */
+           AND NOT EXISTS (
+             SELECT 1 FROM "Comment" h
+              WHERE h."postId" = c."postId" AND h.status <> 'VISIBLE'::"ContentStatus"
+                AND c.path <@ h.path)
+         ORDER BY c.path
          LIMIT ${THREAD_LIMIT + 1}`,
     );
     const truncated = rows.length > THREAD_LIMIT;
@@ -336,13 +326,9 @@ export function postRoutes(
       /**
        * A parent always precedes its children in path order, so one pass is enough.
        *
-       * A node whose parent is not in this map is attached at the top. Today that only
-       * happens at the truncation boundary. Once a moderator can HIDE a comment it will
-       * also happen to the replies of a hidden parent, and attaching them at the top
-       * would promote them to standalone comments — the opposite of hiding a thread.
-       * The moderation part has to filter by hidden ANCESTOR, not by the row's own
-       * status; this comment is here so that arrives as a decision rather than a
-       * surprise.
+       * A node whose parent is not in this map is attached at the top. That now happens
+       * only at the truncation boundary: the query excludes every comment with a hidden
+       * ancestor, so a hidden comment's replies never arrive here to be promoted.
        */
       const parent = row.parentId ? nodes.get(row.parentId) : undefined;
       if (parent) parent.replies.push(node);

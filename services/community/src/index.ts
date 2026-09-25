@@ -8,6 +8,7 @@ import { createRateLimiter } from './ratelimit.js';
 import { spaceRoutes } from './routes/spaces.js';
 import { postRoutes } from './routes/posts.js';
 import { feedRoutes } from './routes/feed.js';
+import { moderationRoutes } from './routes/moderation.js';
 import { createFeedConsumer, feedMetrics } from './feed/consumer.js';
 
 /**
@@ -130,6 +131,7 @@ async function main(): Promise<void> {
     }),
   );
   app.use(requireAuth, feedRoutes());
+  app.use(requireAuth, moderationRoutes(logger, limiter, env.RATE_LIMIT_REPORT_PER_MINUTE));
 
   app.use(errorHandler);
 
