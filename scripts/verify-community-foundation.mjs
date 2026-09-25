@@ -152,7 +152,7 @@ async function main() {
         Comment: [`INSERT INTO "Comment" (id, "tenantId", "postId", "authorId", path, depth, body) VALUES ($1, $2, $3, 'author', $4::ltree, 1, 'hi')`, [id, tenant, `post_${RUN}`, id.replace(/-/g, '')]],
         Reaction: [`INSERT INTO "Reaction" (id, "tenantId", "targetType", "targetId", "userId", kind) VALUES ($1, $2, 'POST', $3, $4, 'LIKE')`, [id, tenant, `post_${RUN}`, `user_${id}`]],
         Report: [`INSERT INTO "Report" (id, "tenantId", "targetType", "targetId", "reporterId", reason) VALUES ($1, $2, 'POST', $3, $4, 'SPAM')`, [id, tenant, `post_${RUN}`, `user_${id}`]],
-        ModerationAction: [`INSERT INTO "ModerationAction" (id, "tenantId", "actorId", "targetType", "targetId", action) VALUES ($1, $2, 'mod', 'POST', $3, 'HIDE')`, [id, tenant, `post_${RUN}`]],
+        ModerationAction: [`INSERT INTO "ModerationAction" (id, "tenantId", "spaceId", "actorId", "targetType", "targetId", action) VALUES ($1, $2, $3, 'mod', 'POST', $4, 'HIDE')`, [id, tenant, `space_${RUN}`, `post_${RUN}`]],
         FeedEntry: [`INSERT INTO "FeedEntry" (id, "tenantId", "userId", "postId", "spaceId", "rankScore") VALUES ($1, $2, $3, $4, $5, 1)`, [id, tenant, `user_${id}`, `post_${id}`, `space_${RUN}`]],
         OutboxMessage: [`INSERT INTO "OutboxMessage" (id, "tenantId", topic, "eventType", "aggregateId", payload) VALUES ($1, $2, 'community.feed', 'PostCreated', $3, '{}'::jsonb)`, [id, tenant, `post_${RUN}`]],
       };
@@ -195,7 +195,7 @@ async function main() {
     const added = await asTenant(
       app,
       TENANT,
-      `INSERT INTO "ModerationAction" (id, "tenantId", "actorId", "targetType", "targetId", action) VALUES ($1, $2, 'mod', 'POST', 'post', 'UNHIDE')`,
+      `INSERT INTO "ModerationAction" (id, "tenantId", "spaceId", "actorId", "targetType", "targetId", action) VALUES ($1, $2, 'space', 'mod', 'POST', 'post', 'UNHIDE')`,
       [`mod_second_${RUN}`, TENANT],
     );
     check(added.code === null, `CONTROL: but it can be added to, so the refusals are the grants (${added.code ?? 'allowed'})`);
