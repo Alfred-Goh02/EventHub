@@ -26,14 +26,15 @@ const env = z
   .parse(process.env);
 
 async function main(): Promise<void> {
+  const logger = createLogger('notification-sweep-once');
   const pool = attachPoolErrorHandler(
     new pg.Pool({ connectionString: env.SWEEPER_DATABASE_URL, application_name: 'notification-sweep-once', max: 1 }),
-    createLogger('notification-sweep-once'),
+    logger,
     'notification-sweep-once',
   );
   try {
-    await assertSweeperIsLeastPrivilege(pool);
-    const result = await sweepOnce(pool, { stuckAfterMs: env.SWEEP_STUCK_AFTER_MS, batchSize: env.SWEEP_BATCH_SIZE });
+    await assertSweeperIsLeastPrivilege(pool, logger);
+    const result = await sweepOnce(pool, logger, { stuckAfterMs: env.SWEEP_STUCK_AFTER_MS, batchSize: env.SWEEP_BATCH_SIZE });
     console.log(
       `abandoned ${result.swept} deliver${result.swept === 1 ? 'y' : 'ies'} claimed more than ${env.SWEEP_STUCK_AFTER_MS} ms ago` +
         `${result.more ? ' (the batch filled, so run it again)' : ''}; oldest still pending: ` +

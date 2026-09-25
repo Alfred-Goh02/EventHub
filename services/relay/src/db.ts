@@ -22,14 +22,37 @@ import type { Logger } from '@eventhub/logger';
  *
  * Swallowed on purpose. This fires for a client sitting IDLE in the pool, so no
  * query is in flight and no caller is waiting; pg has already discarded the
- * client, and the next checkout opens a fresh one. An error on a client that is
- * CHECKED OUT does not arrive here — it rejects that query() instead, where
- * drainOnce's own error handling takes it and the attempt rolls back.
+ * client, and the next checkout opens a fresh one.
  *
- * Ticketing carries its own copy of this, in services/ticketing/src/pool.ts,
- * because the two services share no database package. Both are named the same
- * thing so scripts/verify-pool-resilience.mjs can require that EVERY
- * `new pg.Pool(` in this repository is wrapped in a call to it.
+ * IT DOES NOT COVER A CHECKED-OUT CLIENT, and the comment here used to say it
+ * did — "an error on a client that is CHECKED OUT does not arrive here, it
+ * rejects that query() instead". That is true only while a query is in flight.
+ * pg-pool attaches its idle listener on release and REMOVES it on checkout, so
+ * between two queries a checked-out client has no 'error' listener at all, and
+ * pg's Client emits there rather than on the pool. Node then throws.
+ *
+ * The one error this role's configuration is designed to produce lands in
+ * exactly that gap. db/init/01-bootstrap.sql sets
+ * `idle_in_transaction_session_timeout = '30s'` on every relay role, and
+ * "idle in transaction" MEANS no query is in flight — so there is no query()
+ * promise to reject. Measured against this file before withClient existed, with
+ * the drain holding its transaction across a publish:
+ *
+ *   node:events:487
+ *         throw er; // Unhandled 'error' event
+ *   error: terminating connection due to idle-in-transaction timeout
+ *     at Client._handleErrorEvent (pg/lib/client.js:417:10)
+ *   severity: 'FATAL', code: '25P03'
+ *
+ * The relay exited 1 mid-drain and left the row unpublished with lastError
+ * null, because it never got far enough to record one. That gap is what
+ * withClient() below closes; this handler keeps the idle half.
+ *
+ * Ticketing carries its own copy of this, in services/ticketing/src/pool.ts, as
+ * does Notification in services/notification/src/pool.ts, because the three
+ * services share no database package. All are named the same thing so
+ * scripts/verify-pool-resilience.mjs can require that EVERY `new pg.Pool(` in
+ * this repository is wrapped in a call to it.
  */
 function attachPoolErrorHandler(pool: pg.Pool, logger: Logger, name: string): pg.Pool {
   pool.on('error', (err) => {
@@ -48,6 +71,73 @@ function attachPoolErrorHandler(pool: pg.Pool, logger: Logger, name: string): pg
     );
   });
   return pool;
+}
+
+/**
+ * Checks a client out with an 'error' listener on it for the whole checkout.
+ *
+ * THE GAP THIS CLOSES. pg-pool removes its idle listener when a client is
+ * handed out and re-attaches it on release, so for the duration of a checkout
+ * the Client is an EventEmitter with no 'error' listener. pg's Client emits
+ * 'error' there only when NO query is in flight — with one in flight it rejects
+ * that query instead, which every caller here already handles. So the uncovered
+ * case is precisely "checked out, between queries", and that is the case this
+ * relay's own role configuration manufactures on a schedule: an open
+ * transaction that goes idle past idle_in_transaction_session_timeout is
+ * terminated by the server with a FATAL 25P03, with nothing to reject.
+ *
+ * Reproduced before this existed, and reproduced again by deleting the two
+ * listener lines below: the process exits 1 on an unhandled 'error' event.
+ *
+ * DESTROYED, NOT RETURNED. If the listener fired, the connection is gone —
+ * `release(err)` makes pg drop the client instead of putting a dead socket back
+ * in the pool for the next caller to trip over.
+ *
+ * REMOVING THE LISTENER IS NOT TIDINESS. pg reuses Client objects across
+ * checkouts, so a listener added per checkout and never removed accumulates on
+ * the same object: eleven checkouts of one connection and Node prints
+ * MaxListenersExceededWarning, which is the pool quietly telling you it is
+ * leaking. scripts/verify-relay-idle-in-transaction.mjs counts the listeners
+ * after repeated checkouts for exactly that reason.
+ *
+ * NOT SWALLOWED INTO SILENCE. The error is logged at warn with its SQLSTATE,
+ * because an operator seeing a drain retry needs to know the connection was
+ * terminated rather than that Kafka was slow. What it does not do is rethrow:
+ * the caller's next query() on the dead client rejects on its own, and the
+ * caller's existing ROLLBACK-and-rethrow is the right place for that. A throw
+ * from inside an event handler would be the uncaught exception again.
+ */
+export async function withClient<T>(
+  pool: pg.Pool,
+  logger: Logger,
+  name: string,
+  fn: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+
+  let poisoned: Error | null = null;
+  const onError = (err: Error): void => {
+    poisoned = err;
+    // Fields, not the error object — pg's DatabaseError carries a `client`, and
+    // serialising it walks the socket and pg's whole type table. Same reason as
+    // attachPoolErrorHandler above.
+    const e = err as NodeJS.ErrnoException & { code?: string };
+    logger.warn(
+      { pool: name, code: e.code, reason: e.message },
+      'the database terminated a connection that was checked out; it will not be reused',
+    );
+  };
+
+  client.on('error', onError);
+
+  try {
+    return await fn(client);
+  } finally {
+    client.removeListener('error', onError);
+    // release(err) destroys; release() returns it to the pool.
+    if (poisoned) client.release(poisoned);
+    else client.release();
+  }
 }
 
 /**
@@ -94,10 +184,10 @@ export function createPool(connectionString: string, logger: Logger): pg.Pool {
  */
 export async function assertRelayIsLeastPrivilege(
   pool: pg.Pool,
+  logger: Logger,
   forbiddenTable: string,
 ): Promise<void> {
-  const client = await pool.connect();
-  try {
+  await withClient(pool, logger, 'eventhub-relay', async (client) => {
     const who = await client.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
       'SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user',
     );
@@ -152,7 +242,5 @@ export async function assertRelayIsLeastPrivilege(
           'be able to read tenant data.',
       );
     }
-  } finally {
-    client.release();
-  }
+  });
 }

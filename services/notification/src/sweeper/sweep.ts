@@ -1,4 +1,6 @@
 import type pg from 'pg';
+import type { Logger } from '@eventhub/logger';
+import { withClient } from '../pool.js';
 
 /**
  * Ends deliveries that were claimed and never finished.
@@ -30,9 +32,12 @@ export interface SweepResult {
 /** Said in the row itself, because "FAILED" with no reason is the same puzzle one layer down. */
 export const ABANDONED = 'abandoned: claimed but never completed';
 
-export async function sweepOnce(pool: pg.Pool, opts: { stuckAfterMs: number; batchSize: number }): Promise<SweepResult> {
-  const client = await pool.connect();
-  try {
+export async function sweepOnce(
+  pool: pg.Pool,
+  logger: Logger,
+  opts: { stuckAfterMs: number; batchSize: number },
+): Promise<SweepResult> {
+  return withClient(pool, logger, 'notification-sweeper', async (client) => {
     // The subselect bounds what one statement locks, and takes the oldest first so a
     // backlog is worked through in the order the rows went stale.
     const swept = await client.query(
@@ -57,9 +62,7 @@ export async function sweepOnce(pool: pg.Pool, opts: { stuckAfterMs: number; bat
       oldestPendingMs: ms === null || ms === undefined ? null : Math.round(Number(ms)),
       more: count >= opts.batchSize,
     };
-  } finally {
-    client.release();
-  }
+  });
 }
 
 /**
@@ -70,9 +73,8 @@ export async function sweepOnce(pool: pg.Pool, opts: { stuckAfterMs: number; bat
  * more dangerous. This role crosses every tenant, so its reach is bounded by grants
  * and by its policy, and both are worth proving at startup rather than in review.
  */
-export async function assertSweeperIsLeastPrivilege(pool: pg.Pool): Promise<void> {
-  const client = await pool.connect();
-  try {
+export async function assertSweeperIsLeastPrivilege(pool: pg.Pool, logger: Logger): Promise<void> {
+  await withClient(pool, logger, 'notification-sweeper', async (client) => {
     const who = await client.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
       'SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user',
     );
@@ -147,7 +149,5 @@ export async function assertSweeperIsLeastPrivilege(pool: pg.Pool): Promise<void
           'claim mail went out that never did.',
       );
     }
-  } finally {
-    client.release();
-  }
+  });
 }
