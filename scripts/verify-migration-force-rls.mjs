@@ -94,6 +94,23 @@ const ALLOWED = [
   },
 ];
 
+/**
+ * Applied migrations that lift FORCE outside an explicit transaction.
+ *
+ * PRISMA DOES NOT RUN A MIGRATION FILE AS ONE TRANSACTION: it sends the statements one
+ * at a time. Measured on community's 20260925000000 with its backfill broken so the
+ * deploy failed part-way: without BEGIN, the statements before the failure stayed
+ * applied; with BEGIN and COMMIT, none did. So a file that lifts FORCE and then fails
+ * before restoring it leaves the table without FORCE — the owner then bypasses its own
+ * policies until someone notices. Each of these applied cleanly, so nothing was left
+ * lifted; they are history, and an applied migration is never edited.
+ */
+const UNGUARDED_ALLOWED = [
+  'services/event/prisma/migrations/20260825145733_harden_outbox/migration.sql',
+  'services/ticketing/prisma/migrations/20260828130157_add_payment_and_price_capture/migration.sql',
+  'services/ticketing/prisma/migrations/20260906130000_reconciler_ordered_scan/migration.sql',
+];
+
 // ---------------------------------------------------------------------------
 // Reading SQL
 // ---------------------------------------------------------------------------
@@ -324,6 +341,10 @@ function walk() {
   const writes = [];
   const problems = [];
   const snapshots = new Map();
+  /** Top-level NO FORCE statements, and whether an explicit transaction was open. */
+  const lifts = [];
+  /** Tables a migration ended with FORCE lifted: `${migration.id} "${table}"`. */
+  const leftLifted = [];
   let migrationCount = 0;
   let functionBodies = 0;
 
@@ -410,11 +431,21 @@ function walk() {
       }
     };
 
+    /** Whether the migration being walked has an explicit transaction open. */
+    const tx = { open: false };
+
     const walkScript = (sql, migration, { inDo }) => {
       for (const stmt of statements(sql)) {
         // Rendered, not the first code token: comments split the code into pieces,
         // and the first piece of a commented statement is the blank line above it.
         const head = render(stmt, { mask: true });
+        if (!inDo) {
+          if (/^\s*(?:BEGIN|START\s+TRANSACTION)\b/i.test(head)) tx.open = true;
+          else if (/^\s*(?:COMMIT|END)\b/i.test(head)) tx.open = false;
+          // A lift inside a DO block is one statement with its restore, so only a
+          // top-level lift depends on the file being one transaction.
+          if (/\bNO\s+FORCE\s+ROW\s+LEVEL\s+SECURITY\b/i.test(head)) lifts.push({ migration, guarded: tx.open });
+        }
         if (!inDo && /^\s*DO\b/i.test(head)) {
           const body = stmt.find((t) => t.kind === 'dollar' || t.kind === 'string');
           if (!body) {
@@ -442,20 +473,25 @@ function walk() {
         continue;
       }
       migrationCount += 1;
+      tx.open = false;
       try {
         walkScript(readFileSync(path, 'utf8'), migration, { inDo: false });
       } catch (err) {
         problems.push(`${migration.id} could not be read as SQL: ${err.message}`);
       }
+      if (tx.open) problems.push(`${migration.id} opens a transaction it never commits`);
+      // A lift that is never restored leaves the owner outside its own policies for
+      // every migration after this one, and every psql session as the owner.
+      for (const [name, t] of tables) if (t.everForced && !t.force) leftLifted.push(`${migration.id} "${name}"`);
       snapshots.set(migration.id, new Map([...tables].map(([name, t]) => [name, t.force])));
     }
   }
 
-  return { services, migrationCount, functionBodies, writes, problems, snapshots };
+  return { services, migrationCount, functionBodies, writes, problems, snapshots, lifts, leftLifted };
 }
 
 function main() {
-  const { services, migrationCount, functionBodies, writes, problems, snapshots } = walk();
+  const { services, migrationCount, functionBodies, writes, problems, snapshots, lifts, leftLifted } = walk();
 
   // -------------------------------------------------------------------------
   console.log('  the walk has to have found something');
@@ -580,6 +616,41 @@ function main() {
           `lifted; it ${redo.length === 0 ? 'has no UPDATE or DELETE this walk found' : 'does not'}`,
     );
   }
+
+  // -------------------------------------------------------------------------
+  console.log('');
+  console.log('  a lift is inside an explicit transaction, and FORCE is back by the end of the file');
+  // -------------------------------------------------------------------------
+  /**
+   * Prisma sends a migration's statements one at a time, so without BEGIN a failure
+   * between the lift and the restore leaves the table without FORCE. See
+   * UNGUARDED_ALLOWED above for the measurement.
+   */
+  const guarded = lifts.filter((l) => l.guarded);
+  check(guarded.length > 0, `CONTROL: ${guarded.length} of ${lifts.length} top-level lift(s) were read inside BEGIN ... COMMIT`);
+  const unguardedFiles = new Set(lifts.filter((l) => !l.guarded).map((l) => l.migration.file));
+  for (const file of unguardedFiles) {
+    const allowed = UNGUARDED_ALLOWED.includes(file);
+    check(
+      allowed,
+      allowed
+        ? `${file} lifts FORCE outside a transaction. Allowed: applied history that completed`
+        : `${file} lifts FORCE outside an explicit transaction. Prisma does not make a migration one: ` +
+            'a failure before the restore leaves the table without FORCE. Wrap the file in BEGIN; ... COMMIT;',
+    );
+  }
+  for (const file of UNGUARDED_ALLOWED) {
+    check(
+      unguardedFiles.has(file),
+      unguardedFiles.has(file) ? `  ${file} -- allowance matched` : `${file} is allowed to lift FORCE unguarded but no longer does. A stale allowance is a hole: remove it`,
+    );
+  }
+  check(
+    leftLifted.length === 0,
+    leftLifted.length === 0
+      ? 'every table that was ever under FORCE has it back by the end of each migration'
+      : `these migrations end with FORCE lifted: ${leftLifted.join('; ')}`,
+  );
 
   console.log('');
   if (failures > 0) {
