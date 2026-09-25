@@ -634,6 +634,13 @@ jobs:
       - name: Assert every outbox has a relay in compose
         run: node scripts/verify-outbox-relays.mjs
 
+      # A service with no stop_grace_period gets whatever the engine picks, and
+      # Docker Desktop before 4.81 picks one second: Kafka was killed mid-shutdown
+      # and recovered 87 logs on its next start. This runner's engine gives 10 s,
+      # so nothing else here can see it. Every service must set its own.
+      - name: Assert every compose service sets its own stop grace period
+        run: node scripts/verify-stop-grace-periods.mjs
+
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
       # `authorization` carried no `*.authorization` while all six of its
