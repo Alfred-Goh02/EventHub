@@ -38,8 +38,23 @@ const THREAD_LIMIT = env.THREAD_PAGE_LIMIT;
  * PRE-update row: the caller adding a reaction passes `"reactionCount" + 1`, or the
  * score lands one behind for ever.
  */
+/**
+ * EVERY INTERPOLATED FRAGMENT IS PARENTHESISED, and that is not style.
+ *
+ * Without the brackets these arguments are pasted in as text and Postgres applies its
+ * own precedence. The caller adding a comment passes `"commentCount" + 1`, and
+ * `2 * ${comments}` became `2 * "commentCount" + 1` — so a comment was worth 1 instead
+ * of 2, and the FIRST comment moved the score not at all: greatest(0 + 1, 1) and
+ * greatest(0, 1) are both 1.
+ *
+ * It hid for a whole part because the verifier recomputed the formula from the stored
+ * columns and compared, which agreed with itself, and because the reaction path
+ * happens to be unaffected — `rc + 1 + 2 * cc` parses the same either way. It was
+ * found by asking a different question: did the number I am about to compare actually
+ * move?
+ */
 const rankScore = (reactions: Prisma.Sql, comments: Prisma.Sql, createdAt: Prisma.Sql) =>
-  Prisma.sql`ln(greatest(${reactions} + 2 * ${comments}, 1) + 1) + extract(epoch from ${createdAt}) / 45000.0`;
+  Prisma.sql`ln(greatest((${reactions}) + 2 * (${comments}), 1) + 1) + extract(epoch from ${createdAt}) / 45000.0`;
 
 /**
  * THE REACTION KINDS ARE A CLOSED SET, and that is a ranking control, not tidiness.

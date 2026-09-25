@@ -48,6 +48,13 @@ const JOINS_PER_MINUTE = 3;
 
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
+  /**
+   * No consumer. This run exercises the HTTP side only, and a consumer started here
+   * would join the shared group and commit offsets for messages belonging to other
+   * runs and to compose. This file imports no Kafka client, so it could not clean up a
+   * throwaway group either. The fan-out is proved in verify-community-feed-fanout.mjs.
+   */
+  FEED_CONSUMER_ENABLED: 'false',
   RATE_LIMIT_JOIN_PER_MINUTE: String(JOINS_PER_MINUTE),
   /**
    * Generous, because the fixture below creates ten spaces with one owner to have

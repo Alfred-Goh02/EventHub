@@ -70,6 +70,13 @@ const communityEnv = serviceEnv(ROOT, 'community', {
   RATE_LIMIT_POST_PER_MINUTE: String(POSTS_PER_MINUTE),
   THREAD_PAGE_LIMIT: String(THREAD_PAGE_LIMIT),
   RATE_LIMIT_SPACE_PER_MINUTE: String(SPACES_PER_MINUTE),
+  /**
+   * No consumer. This run proves the write path and the outbox; the fan-out is
+   * verify-community-feed-fanout.mjs's job. Left on, the consumer spawned here joins
+   * the shared group, commits offsets for other runs' messages, and writes FeedEntry
+   * rows as a side effect — five of them survived one pass before this was set.
+   */
+  FEED_CONSUMER_ENABLED: 'false',
   AUTH_PUBLIC_KEY_B64: Buffer.from(readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem'), 'utf8')).toString('base64'),
 });
 const relayEnv = serviceEnv(ROOT, 'relay', {
@@ -348,6 +355,32 @@ async function main() {
       `the API nests them in one pass over path order (${thread.body?.count} rows, ${top?.replies?.length ?? 0} reply, ${top?.replies?.[0]?.replies?.length ?? 0} deeper, truncated ${thread.body?.truncated})`,
     );
 
+    /**
+     * A COMMENT MUST MOVE THE SCORE, not merely leave it equal to the formula.
+     *
+     * Everything else here recomputes the formula from the stored columns and compares,
+     * which agrees with itself whatever the formula is. `rankScore` pasted its
+     * arguments in unparenthesised, so `2 * ${comments}` with `"commentCount" + 1`
+     * became `2 * "commentCount" + 1`: a comment was worth 1 instead of 2, and the
+     * first comment moved the score by exactly nothing, because greatest(1, 1) and
+     * greatest(0, 1) are both 1. Three comments existed above and none of them proved
+     * anything about it.
+     */
+    const scoredThread = await inTenant(
+      owner,
+      TENANT,
+      `SELECT "rankScore", "commentCount",
+              ln(greatest("reactionCount" + 2 * "commentCount", 1) + 1) + extract(epoch from "createdAt") / 45000.0 AS expected
+         FROM "Post" WHERE id = $1`,
+      [postId],
+    );
+    check(
+      Number(scoredThread.rows[0].commentCount) > 0 &&
+        Math.abs(Number(scoredThread.rows[0].rankScore) - Number(scoredThread.rows[0].expected)) < 1e-9 &&
+        Number(scoredThread.rows[0].rankScore) !== Number(scored.rows[0].rankScore),
+      `and commenting MOVED it, not just kept it equal to the formula (${scored.rows[0].rankScore} -> ${scoredThread.rows[0].rankScore} over ${scoredThread.rows[0].commentCount} comment(s))`,
+    );
+
     const otherPost = await api(`/spaces/${spaceId}/posts`, { method: 'POST', bearer: asAuthor, body: { body: 'another' } });
     const foreignParent = await api(`/posts/${otherPost.body?.id}/comments`, { method: 'POST', bearer: asAuthor, body: { body: 'x', parentId: first.body?.id } });
     check(foreignParent.status === 404, `a parent from another post is refused by the database, not by a separate check (${foreignParent.status})`);
@@ -510,7 +543,10 @@ async function main() {
   } finally {
     service.child.kill();
     for (const tenant of [TENANT, OTHER_TENANT]) {
-      for (const table of ['Reaction', 'Comment', 'Post', 'OutboxMessage', 'Membership', 'CommunitySpace']) {
+      // FeedEntry is in this list because the service this run spawns now carries the
+      // fan-out consumer, so posting here writes feed rows as a side effect. Without
+      // it this run leaves them behind — measured, five rows after one pass.
+      for (const table of ['FeedEntry', 'Reaction', 'Comment', 'Post', 'OutboxMessage', 'Membership', 'CommunitySpace']) {
         try {
           await owner.query('BEGIN');
           await owner.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
