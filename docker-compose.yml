@@ -474,8 +474,13 @@ services:
 
         # Seeded users get no card from /register, so they are queued here. Only
         # users who never had one: a second `up` queues nothing.
+        #
+        # PORT is given although the command listens on nothing: Auth's db.ts validates
+        # the whole base environment, and PORT has no default there. Without it the
+        # command died with "PORT: Expected number, received nan" — in this job only,
+        # because the verifier runs it with Auth's full environment.
         echo "setup: queueing contact cards"
-        DATABASE_URL="$$AUTH_DATABASE_URL" APP_DATABASE_URL="$$AUTH_APP_DATABASE_URL" pnpm --filter @eventhub/auth run contact-cards:publish
+        PORT=3001 DATABASE_URL="$$AUTH_DATABASE_URL" APP_DATABASE_URL="$$AUTH_APP_DATABASE_URL" pnpm --filter @eventhub/auth run contact-cards:publish
 
         # Not optional: the broker runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
         # on purpose, so nothing will create these on first publish.
