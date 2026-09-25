@@ -1001,6 +1001,18 @@ jobs:
       - name: Assert a post, its thread and its reactions, and the event they commit with
         run: node scripts/verify-community-posts.mjs
 
+      # The write half of the hybrid feed. A post in a small space reaches every
+      # ACTIVE member and nobody else; a space past the threshold is left to the read
+      # path, with a small space in the same run as the control so "no rows" cannot
+      # pass by nothing having worked. The same message republished writes nothing
+      # twice, and the score is COPIED from the post rather than adjusted by a delta —
+      # asserted by applying the same message again and requiring nothing to move,
+      # because `rankScore + x` survives every other check and is wrong by exactly x
+      # the first time a partition replays. A message that can never be applied goes
+      # to community.feed.dlq and the partition carries on.
+      - name: Assert a post reaches the right feeds, exactly once
+        run: node scripts/verify-community-feed-fanout.mjs
+
       # The dev token sink writes live invite and password-reset credentials to
       # the log so a developer can click them while there is no mail service.
       # That is exactly the leak the hash-only storage design exists to prevent,
@@ -1709,6 +1721,30 @@ jobs:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
         run: node scripts/verify-relay-ordering.mjs
 
+      # A connection the database kills while it is CHECKED OUT must not kill
+      # the process. It did: the relay exited 1 mid-drain on
+      #
+      #   error: terminating connection due to idle-in-transaction timeout
+      #   Emitted 'error' event on Client instance
+      #
+      # which is the one error its role's idle_in_transaction_session_timeout
+      # exists to produce. pg-pool forwards errors only from IDLE clients, and
+      # pg's Client emits (rather than rejecting a query) only when no query is
+      # in flight -- so "checked out, transaction open, idle" had no listener.
+      # withClient() closes it in all three services that carry a pool helper.
+      #
+      # Forces the case with a per-session 1s timeout rather than waiting 30s.
+      # Its negative control runs every time: a child process doing the
+      # unguarded checkout must die of exactly that unhandled 'error'. Also
+      # counts listeners across twelve checkouts of one Client, drives the
+      # shipped drain through a termination mid-publish, and ratchets every
+      # pool.connect() in services/ into a withClient.
+      - name: Assert a connection terminated while checked out is not fatal
+        env:
+          EVENT_APP_DATABASE_URL: ${{ env.EVENT_APP_DATABASE_URL }}
+          RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
+        run: node scripts/verify-relay-idle-in-transaction.mjs
+
       - name: Verify outbox to Kafka end to end
         env:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
@@ -1903,6 +1939,27 @@ jobs:
             || { echo "TICKETING_APP_DATABASE_URL does not reach its own database"; exit 1; }
           echo "  connected via TICKETING_APP_DATABASE_URL"
 
+      # The other half of what db/init settles per role: the relays and sweepers
+      # are given idle_in_transaction_session_timeout and statement_timeout, and
+      # until now nothing asserted they arrive. services/relay/src/db.ts names
+      # them in the comment on its pool -- an open transaction pins xmin and
+      # blocks VACUUM across the WHOLE cluster, so a relay that hangs mid-batch
+      # degrades every database, and the timeout is what ends it.
+      #
+      # Its failure is silent and slow. A role dropped and recreated by a later
+      # migration loses the ALTER ROLE with nothing raised, every test stays
+      # green, and the symptom is table bloat somewhere else, weeks later.
+      #
+      # DERIVED, NOT LISTED, like the step above: the roles, the settings and
+      # the values are read out of db/init, so a seventh role given a timeout is
+      # covered the moment it is bootstrapped. Checked on the role in
+      # pg_db_role_setting AND in a session opened as that role, because the
+      # catalog row and a backend actually starting with the value are different
+      # claims -- and against a role the file does not alter, so 15s cannot be
+      # read back from a cluster default and mistaken for the setting.
+      - name: Assert the relay and sweeper roles carry their timeouts
+        run: node scripts/verify-role-timeouts.mjs
+
       # The sent-log's claim and its row-level security, checked against the
       # table. The coverage step above proves the flags are set; this proves the
       # policy does what the flags promise, and that concurrent claims of one key
@@ -1931,11 +1988,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # THE SAME DISK FIX AS THE build JOB, which this job never had.
+      #
+      # This job builds the application image and pulls every infrastructure
+      # image onto a runner that still carries the preinstalled SDKs. A run on
+      # #120 measured the root filesystem at 83% before `compose up`, and the
+      # `setup` container then died in bootstrap:index with
+      #   index_create_block_exception: blocked by: [FORBIDDEN/10/cluster
+      #   create-index blocked (api)]
+      # — OpenSearch's 90% high watermark, the exact error the build job's step
+      # below was written for. The same commit's compose job had passed an hour
+      # earlier, so it was variance whether the build crossed the line; every PR
+      # that adds an image or a service makes crossing it more likely.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h /
+
       # The whole file this time, not a named subset. --wait returns only when
       # every container is HEALTHY, so this step passing is already the claim:
       # a non-zero exit means the one-command start does not work.
       - name: docker compose up -d --wait
         run: docker compose up -d --wait --wait-timeout 600
+
+      # Measured after the build, because the build is what fills the disk. If
+      # this job ever starts failing on OpenSearch again, this line says how
+      # close it came rather than leaving it to be rediscovered from a 403.
+      - name: Report disk after the stack is up
+        if: always()
+        run: df -h /
 
       - name: Show what came up
         if: always()

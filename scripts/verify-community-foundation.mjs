@@ -41,6 +41,9 @@ const PORT = 3812;
 
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
+  // No consumer: this run is about the database's own rules, and a consumer started
+  // here would join the shared group and commit other runs' offsets.
+  FEED_CONSUMER_ENABLED: 'false',
   // Generated rather than configured, so .env.example leaves it empty.
   AUTH_PUBLIC_KEY_B64: Buffer.from(readFileSync(join(ROOT, 'services', 'auth', 'keys', 'public.pem'), 'utf8')).toString('base64'),
 });

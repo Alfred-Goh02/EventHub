@@ -48,6 +48,13 @@ const JOINS_PER_MINUTE = 3;
 
 const communityEnv = serviceEnv(ROOT, 'community', {
   PORT: String(PORT),
+  /**
+   * No consumer. This run exercises the HTTP side only, and a consumer started here
+   * would join the shared group and commit offsets for messages belonging to other
+   * runs and to compose. This file imports no Kafka client, so it could not clean up a
+   * throwaway group either. The fan-out is proved in verify-community-feed-fanout.mjs.
+   */
+  FEED_CONSUMER_ENABLED: 'false',
   RATE_LIMIT_JOIN_PER_MINUTE: String(JOINS_PER_MINUTE),
   /**
    * Generous, because the fixture below creates ten spaces with one owner to have
@@ -280,6 +287,28 @@ async function main() {
     check(crossJoin.status === 404, `and joining it is a 404 (${crossJoin.status})`);
     const unauthenticated = await api(`/spaces/${publicSpace}`);
     check(unauthenticated.status === 401, `CONTROL: with no token at all it is a 401 (${unauthenticated.status})`);
+
+    /**
+     * AND ANOTHER TENANT CANNOT POISON THIS TENANT'S MEMBERSHIP CACHE.
+     *
+     * The cache key was `member:${spaceId}:${userId}`, with no tenant. Redis sees every
+     * tenant; row security only guards Postgres. So a request from another tenant under
+     * the SAME user id found no membership in its own tenant, cached that `null` under
+     * the shared key, and the real member was then refused their own space until the
+     * entry expired. The victim here joins first, which clears their cache entry, so the
+     * other tenant's lookup is the one that writes it.
+     *
+     * Watched red on the old key: the real member's leave answered 404.
+     */
+    const VICTIM = `u_victim_${RUN}`;
+    const asVictim = token(TENANT, VICTIM);
+    const joinedVictim = await api(`/spaces/${publicSpace}/join`, { method: 'POST', bearer: asVictim });
+    const poison = await api(`/spaces/${publicSpace}/members/me`, { method: 'DELETE', bearer: token(OTHER_TENANT, VICTIM) });
+    const victimLeaves = await api(`/spaces/${publicSpace}/members/me`, { method: 'DELETE', bearer: asVictim });
+    check(
+      joinedVictim.status === 200 && poison.status === 404 && victimLeaves.status === 204,
+      `another tenant under the same user id is refused (${poison.status}) and leaves nothing behind: the real member still acts in their space (${victimLeaves.status})`,
+    );
   } catch (err) {
     check(false, `the run stopped early: ${err instanceof Error ? err.message : String(err)}`);
     console.error(`  Community's output:\n${excerpt(service.log())}`);

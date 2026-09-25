@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import type { Logger } from '@eventhub/logger';
+import { withClient } from './db.js';
 
 export interface PruneResult {
   /** Rows removed this pass. */
@@ -69,9 +70,16 @@ export async function pruneOnce(
 ): Promise<PruneResult> {
   const result: PruneResult = { deleted: 0, batches: 0, moreToDo: false };
 
-  for (let batch = 0; batch < opts.maxBatches; batch += 1) {
-    const client = await pool.connect();
-
+  /**
+   * One batch, on a client withClient owns.
+   *
+   * Returns whether to run another. It used to `break` out of the loop below
+   * from inside the try, which a callback cannot do — so the two stopping
+   * conditions ("nothing eligible" and "a short batch") say so by returning
+   * false instead. The transaction is still wholly inside here: the client goes
+   * back committed or rolled back, never mid-transaction.
+   */
+  const pruneBatch = async (client: pg.PoolClient, batch: number): Promise<boolean> => {
     try {
       await client.query('BEGIN');
 
@@ -107,7 +115,7 @@ export async function pruneOnce(
 
       if (candidates === 0) {
         await client.query('COMMIT');
-        break;
+        return false;
       }
 
       /**
@@ -144,15 +152,21 @@ export async function pruneOnce(
       result.batches += 1;
 
       // A short batch means the candidates ran out, not that the ceiling was hit.
-      if (removed < opts.batchSize) break;
+      if (removed < opts.batchSize) return false;
 
       if (batch === opts.maxBatches - 1) result.moreToDo = true;
+      return true;
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;
-    } finally {
-      client.release();
     }
+  };
+
+  for (let batch = 0; batch < opts.maxBatches; batch += 1) {
+    const again = await withClient(pool, logger, 'eventhub-relay', (client) =>
+      pruneBatch(client, batch),
+    );
+    if (!again) break;
   }
 
   if (result.deleted > 0) {
