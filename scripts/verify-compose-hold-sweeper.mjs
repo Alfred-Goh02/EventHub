@@ -104,8 +104,7 @@ const asSuperuser = (sql) =>
 
 const row = (line) => line.split('|');
 
-async function state() {
-  const out = await asTenant(`
+const STATE_SQL = `
     SELECT
       (SELECT status FROM "Reservation" WHERE id = '${LAPSED}'),
       (SELECT status FROM "Reservation" WHERE id = '${LIVE}'),
@@ -116,7 +115,9 @@ async function state() {
       (SELECT count(*) FROM "OutboxMessage"
         WHERE "eventType" = 'reservation.expired' AND payload->>'reservationId' = '${LAPSED}'),
       (SELECT count(*) FROM "OutboxMessage"
-        WHERE "eventType" = 'reservation.expired' AND payload->>'reservationId' = '${LIVE}');`);
+        WHERE "eventType" = 'reservation.expired' AND payload->>'reservationId' = '${LIVE}');`;
+
+function parseState(out) {
   const [lapsed, live, lapsedIsPast, remaining, held, sold, lapsedMsgs, liveMsgs] = row(out);
   return {
     lapsed,
@@ -129,6 +130,8 @@ async function state() {
     liveMsgs: Number(liveMsgs),
   };
 }
+
+const state = async () => parseState(await asTenant(STATE_SQL));
 
 /**
  * Which containers hold a `hold-sweeper` connection, by address.
@@ -158,8 +161,17 @@ async function sweeperContainers() {
   return { addrs, containers: addrs.map((a) => byAddr.get(a)).filter(Boolean) };
 }
 
+/**
+ * Seeds the holds and reads them back in the same transaction.
+ *
+ * The lapsed hold is past its expiry the moment it is committed, and the running
+ * sweeper can take it before a separate read: CI once read it EXPIRED with its
+ * seats already back, and failed the fixture check on a stack that worked. Read
+ * inside the seeding transaction, the answer is what was seeded, because the
+ * sweeper cannot see an uncommitted row.
+ */
 async function seed() {
-  await asTenant(`
+  const out = await asTenant(`
     INSERT INTO "EventProjection"
       (id, "tenantId", title, slug, status, capacity, "startsAt", "endsAt", "organiserId", "sourceVersion", "updatedAt")
     VALUES ('${EVENT_ID}', '${TENANT}', 'Sweep probe', 'sweep-probe-${RUN}', 'PUBLISHED', ${TOTAL},
@@ -173,7 +185,9 @@ async function seed() {
            ('${LIVE}',   '${TENANT}', '${EVENT_ID}', 'u_sweepprobe', 'HELD', now() + interval '1 hour',   now());
     INSERT INTO "ReservationItem" (id, "tenantId", "reservationId", "ticketTypeId", quantity, "unitPriceCents")
     VALUES ('${LAPSED}_i', '${TENANT}', '${LAPSED}', '${TICKET_TYPE_ID}', ${LAPSED_QTY}, ${PRICE_CENTS}),
-           ('${LIVE}_i',   '${TENANT}', '${LIVE}',   '${TICKET_TYPE_ID}', ${LIVE_QTY},   ${PRICE_CENTS});`);
+           ('${LIVE}_i',   '${TENANT}', '${LIVE}',   '${TICKET_TYPE_ID}', ${LIVE_QTY},   ${PRICE_CENTS});
+    ${STATE_SQL}`);
+  return parseState(out);
 }
 
 /**
@@ -224,11 +238,10 @@ async function main() {
   );
 
   try {
-    await seed();
+    const before = await seed();
 
     console.log('');
     console.log('  before: the seats are taken');
-    const before = await state();
     check(before.lapsed === 'HELD' && before.lapsedIsPast, `the lapsed hold is HELD and past its expiry (${before.lapsed}, past=${before.lapsedIsPast})`);
     check(
       before.remaining === TOTAL - LAPSED_QTY - LIVE_QTY && before.held === LAPSED_QTY + LIVE_QTY,
