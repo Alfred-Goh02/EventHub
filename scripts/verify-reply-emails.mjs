@@ -17,14 +17,21 @@
  *   - The unsubscribe link taken from the received email, POSTed, stops the next reply.
  *     The whole loop, not its parts.
  *   - Nothing is sent when Community named nobody, when the reply is to yourself, for a
- *     message that is not a reply, for a reply older than REPLY_MAX_AGE_MS, to someone
- *     who turned replies off, to someone with no card or a card that does not open, or
- *     to a suppressed address. Each has its own counter as the control that the message
- *     was read — "no email" alone is also what a stalled consumer produces.
+ *     message that is not a reply, to someone who turned replies off, to someone with
+ *     no card or a card that does not open, or to a suppressed address. Each has its own
+ *     counter as the control that the message was read — "no email" alone is also what
+ *     a stalled consumer produces.
+ *   - Past REPLY_MAX_AGE_MS a reply is not sent, and the age is Postgres's to judge. The
+ *     service runs an hour fast (scripts/lib/skewed-clock.mjs) with a limit of 45
+ *     minutes, a value nothing else uses: a reply 30 minutes old must go out, which a
+ *     comparison on the process's clock would call 90 minutes old, and one 50 minutes old
+ *     must not, which a limit wired to any hour-long setting would let through.
  *   - The event-type header is read before the value: a post whose bytes cannot be
- *     decoded is skipped, not dead-lettered.
+ *     decoded is skipped, not dead-lettered. A header present with a null value is read
+ *     as absent, rather than crashing the consumer on every redelivery.
  *   - A message that can never be a reply is dead-lettered WITHOUT its value, and the
- *     documented replay command says so rather than replaying nothing.
+ *     replay command, run exactly as the README documents it, says so rather than
+ *     replaying nothing.
  *   - A reply carrying a pending password reset's message id does not touch the reset's
  *     delivery row.
  *   - A store outage in front of the send is retried, not dropped: the reply goes to the
@@ -36,8 +43,9 @@
  *   - A reply retried from a tier is handled as a reply. The tiers carry every route's
  *     messages; without routing by the original topic it would be decoded as a password
  *     reset and dead-lettered.
- *   - A reply stuck on its store does not hold up a password reset: the reset arrives
- *     while the reply is still on its first attempt.
+ *   - A reply stuck on its store does not hold up a password reset, on the main topics or
+ *     on the retry tiers: with one reply stuck on each, a reset and a reset's retry both
+ *     arrive while both replies are still waiting.
  *   - A reply already on the topic before the service first started is never sent: the
  *     replies group starts at `latest` whatever the reset path does, and the reset path
  *     runs `earliest` here, as compose runs it, so a route that took the reset path's
@@ -67,7 +75,7 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
@@ -92,6 +100,9 @@ const PORT = 3985;
 const APP_URL = `https://app-${RUN}.replies.example`;
 /** Short, so a retried reply comes back within the run. */
 const DELAYS_MS = [3000, 3000, 3000];
+/** Forty-five minutes: a limit no other setting shares, so a limit wired to another would show. */
+const MAX_AGE_MS = 2_700_000;
+const MINUTE = 60_000;
 
 /** Everyone in the run, and the address their card holds. */
 const who = (name) => ({ id: `user_${name}_${RUN}`, email: `reply-${name}-${RUN}@mailcheck.example` });
@@ -109,13 +120,19 @@ const C = who('cardoutage');
 const V = who('prefoutage');
 const P = who('declined');
 const L = who('stuck');
+const L2 = who('stuckretry');
 const W = who('resetter');
+const W2 = who('resetretry');
+const Y = who('recent');
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
   KAFKA_CONSUMER_GROUP: GROUP,
   CONTACTS_CONSUMER_GROUP: `${GROUP}-contacts`,
   DISPATCH_RETRY_DELAYS_MS: DELAYS_MS.join(','),
+  REPLY_MAX_AGE_MS: String(MAX_AGE_MS),
+  // An hour fast, so a comparison made on this process's clock is visible.
+  NODE_OPTIONS: `--import=${pathToFileURL(join(ROOT, 'scripts', 'lib', 'skewed-clock.mjs')).href}`,
   // The link in the email points at THIS instance, so the loop below can follow it.
   NOTIFICATION_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
   PUBLIC_APP_URL: APP_URL,
@@ -207,7 +224,7 @@ async function main() {
   const kafka = new Kafka({ clientId: `verify-replies-${RUN}`, brokers: notificationEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING });
   const admin = kafka.admin();
   await admin.connect();
-  const busy = await busyGroups(admin, [realGroup, `${realGroup}-retry`, `${realGroup}-replies`]);
+  const busy = await busyGroups(admin, [realGroup, `${realGroup}-retry`, `${realGroup}-replies`, `${realGroup}-replies-retry`]);
   if (busy.length > 0) {
     console.error(`FAIL: ${busy.join(' and ')} has active members, so another Notification is sending. Stop it first (in compose: docker compose stop notification).`);
     process.exitCode = 1;
@@ -290,10 +307,14 @@ async function main() {
     });
   };
 
-  /** A password reset as Auth requests one: signed by Auth, sealed to Notification. */
-  async function requestReset(user) {
+  /**
+   * A password reset as Auth requests one: signed by Auth, sealed to Notification. Two
+   * hours out, because the service's clock runs one hour fast. Onto auth.email-requested,
+   * or straight onto a tier as a retry of one.
+   */
+  async function requestReset(user, { topic = RESET_TOPIC, headers = {} } = {}) {
     const messageId = randomUUID();
-    const expiresAt = new Date(Date.now() + 10 * 60_000);
+    const expiresAt = new Date(Date.now() + 120 * MINUTE);
     const jws = await new SignJWT({ tenantId: TENANT, email: user.email, link: `https://app.example/reset-password?token=${RUN}`, kind: 'PASSWORD_RESET' })
       .setProtectedHeader({ alg: 'RS256', typ: 'auth-email+jwt' })
       .setSubject(user.id)
@@ -304,7 +325,7 @@ async function main() {
       .setExpirationTime(expiresAt)
       .sign(authSigning);
     await producer.send({
-      topic: RESET_TOPIC,
+      topic,
       messages: [
         {
           key: user.id,
@@ -317,12 +338,19 @@ async function main() {
             expiresAt: expiresAt.toISOString(),
             sealed: await seal(jws),
           }),
-          headers: { 'message-id': messageId },
+          headers: { 'message-id': messageId, ...headers },
         },
       ],
     });
     return messageId;
   }
+  /** The headers forward() puts on a first retry, due now. */
+  const firstRetryOf = (originalTopic) => ({
+    'retry-original-topic': originalTopic,
+    'retry-attempt': '1',
+    'retry-not-before': String(Date.now()),
+    'retry-first-failed-at': new Date().toISOString(),
+  });
 
   const scanGroups = [];
   /** Every message on `topic` carrying this message id, read from the beginning. */
@@ -361,13 +389,13 @@ async function main() {
       [TENANT, messageId],
     )).rows;
 
-  const everyone = [ACTOR, R, U, O, N, S, T, E, K, X, C, V, P, L, W];
+  const everyone = [ACTOR, R, U, O, N, S, T, E, K, X, C, V, P, L, L2, W, W2, Y];
   let service = null;
   let log = '';
 
   try {
     console.log('  the fixture, before the service starts');
-    for (const user of [R, U, O, S, T, E, K, C, V, P, L]) await storeCard(user);
+    for (const user of [R, U, O, S, T, E, K, C, V, P, L, L2, Y]) await storeCard(user);
     // Sealed to nobody: a card that was stored and no longer opens.
     await storeCard(X, 'not-a-jwe');
     await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'COMMUNITY_REPLY', 'EMAIL', false)`, [TENANT, O.id]);
@@ -397,14 +425,15 @@ async function main() {
     const ready = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT}/ready`)).ok, 60_000, 500);
     check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${PORT}` : `it never became ready:\n${excerpt(log)}`);
     if (!ready) return;
-    // Every group: the retry tiers' group and the replies group both matter below, and
-    // a check would otherwise pass or fail on whether one had joined in time.
-    const groups = [GROUP, `${GROUP}-retry`, `${GROUP}-replies`];
+    check(log.includes('clock skewed by +3600s'), 'CONTROL: its clock runs an hour fast, so a check on it would show');
+    // Every group: each retry group and the replies group matter below, and a check would
+    // otherwise pass or fail on whether one had joined in time.
+    const groups = [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`];
     const joined = await waitFor(async () => {
       const { groups: described } = await admin.describeGroups(groups);
       return described.length === groups.length && described.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
-    check(Boolean(joined), 'CONTROL: its reset group, its retry group and its replies group have all joined');
+    check(Boolean(joined), 'CONTROL: its reset group, its replies group and each one\'s retry group have all joined');
     // A canary on this run's key until one is counted: the replies group started at
     // latest, so anything produced before it held the partition was never going to be read.
     const reading = await waitFor(async () => produceAndWait(activity({ kind: 'POST_CREATED', recipientId: null }), 'notAReplyTotal', undefined, 5_000), 60_000, 500);
@@ -473,13 +502,13 @@ async function main() {
 
     console.log('');
     console.log('  and nobody it should not');
-    const hoursAgo = (h) => new Date(Date.now() - h * 3_600_000).toISOString();
+    const minutesAgo = (m) => new Date(Date.now() - m * MINUTE).toISOString();
     const cases = [
       ['Community named nobody', activity({ recipientId: null }), 'nobodyToTellTotal', null],
       ['a reply to yourself', activity({ actorId: R.id }), 'toSelfTotal', R],
       // No event-type header, so the value's own kind is what is judged.
       ['a reaction, which is not a reply', activity({ kind: 'REACTION_ADDED' }), 'notAReplyTotal', R, { eventType: null }],
-      ['a reply two hours old, past REPLY_MAX_AGE_MS', activity({ occurredAt: hoursAgo(2) }), 'tooOldTotal', R],
+      [`a reply 50 minutes old, past a limit of ${MAX_AGE_MS / MINUTE}`, activity({ occurredAt: minutesAgo(50) }), 'tooOldTotal', R],
       ['someone who turned replies off', activity({ recipientId: O.id }), 'optedOutTotal', O],
       ['someone with no contact card', activity({ recipientId: N.id }), 'noAddressTotal', N],
     ];
@@ -490,6 +519,31 @@ async function main() {
       const expected = target === R ? 2 : 0;
       check(Boolean(moved) && mails === expected, `${what}: read, and nothing sent (${counter} moved: ${Boolean(moved)}; inbox ${mails})`);
     }
+    /**
+     * A header present with a NULL value. kafkajs decodes one from the wire (length -1)
+     * but will not produce one, so the service's own function is asked directly: it must
+     * read as absent, not throw the TypeError kafkajs treats as unrecoverable, which
+     * crashed the consumer on every redelivery of such a message.
+     */
+    const { header } = await import(pathToFileURL(join(ROOT, 'services', 'notification', 'dist', 'dispatch', 'retry.js')).href);
+    const readNull = (headers, name) => {
+      try {
+        return header(headers, name);
+      } catch (err) {
+        return err;
+      }
+    };
+    const nulls = [readNull({ 'event-type': null }, 'event-type'), readNull({ 'event-type': [null] }, 'event-type')];
+    check(
+      nulls.every((r) => r === undefined),
+      `a header present with a null value reads as absent (${nulls.map((r) => (r instanceof Error ? r.message : String(r))).join('; ')})`,
+    );
+
+    // The other side of the age limit, and the one a clock mistake breaks: 30 minutes by
+    // the database, 90 by this service's own clock.
+    await produce(activity({ recipientId: Y.id, occurredAt: minutesAgo(30), body: 'thirty minutes old' }));
+    const recent = await waitFor(async () => ((await inbox(Y.email)).length === 1 ? true : null), 45_000);
+    check(Boolean(recent), `a reply 30 minutes old, inside the limit by the database's clock, is sent`);
 
     // A card that does not open is the keys' fault, not the reply's: nothing sent, and
     // nothing dead-lettered, since replaying the reply would not fix the card.
@@ -532,8 +586,16 @@ async function main() {
       Boolean(dead) && dead.value === null && deadHeaders['dlq-value-withheld'] === 'true' && deadHeaders['dlq-original-topic'] === TOPIC,
       `with no value, marked withheld, and still saying where it came from (value ${dead?.value === null ? 'null' : `${dead?.value?.length} bytes`})`,
     );
+    // Exactly as the README documents it, `--` included: pnpm hands the script that `--`
+    // on every shell but PowerShell, and a script that did not strip it would look up a
+    // message whose id is "--".
     const replay = await new Promise((done) => {
-      const child = spawn(process.execPath, ['dist/scripts/dlq-replay.js', poison.messageId], { cwd: join(ROOT, 'services', 'notification'), env: notificationEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(`pnpm --filter @eventhub/notification run dlq:replay -- ${poison.messageId}`, {
+        cwd: ROOT,
+        env: notificationEnv,
+        shell: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
       let out = '';
       child.stdout.on('data', (d) => (out += d));
       child.stderr.on('data', (d) => (out += d));
@@ -560,6 +622,9 @@ async function main() {
     );
     await produce(activity({ messageId: resetId, recipientId: K.id, body: 'same id as a reset' }));
     const kMail = await waitFor(async () => ((await inbox(K.email)).length === 1 ? true : null), 45_000);
+    // The email can reach Mailpit a moment before SENT is committed after it, so the rows
+    // are read once the reply's own row says SENT, or after waiting for it.
+    await waitFor(async () => (await deliveries(resetId)).some((r) => r.templateKey === 'community-reply' && r.status === 'SENT'), 10_000);
     const kRows = await deliveries(resetId);
     const resetRow = kRows.find((r) => r.idempotencyKey === resetKey);
     const replyRow = kRows.find((r) => r.templateKey === 'community-reply');
@@ -648,41 +713,51 @@ async function main() {
     console.log('');
     console.log('  a reply stuck on its store does not hold up a password reset');
     /**
-     * The card table is locked, so the reply waits on it inside its first attempt; the
-     * reset reads no card. On one consumer for both, the reset could only be read once
-     * the reply's attempt ended — by the lock going, or by its transaction timing out,
-     * which sends it to a tier. So the reset must arrive while the reply is still on its
-     * first attempt: nothing moved to a tier yet.
+     * The card table is locked, so a reply waits on it inside its attempt; a reset reads
+     * no card. One reply is sent the ordinary way and one straight onto the first tier,
+     * so a reply is stuck on each of the replies consumers; then a reset is requested,
+     * and a reset's retry put on the same tier. On a consumer shared with replies, a reset
+     * could only be read once the reply in front of it finished — by the lock going, or
+     * by failing and moving to a tier. So both resets must arrive while both replies are
+     * still stuck: two backends waiting on the lock, and nothing moved to a tier.
      */
     {
       const locker = new pg.Client({ connectionString: notificationEnv.DATABASE_URL });
       await locker.connect();
       const { pid } = (await locker.query('SELECT pg_backend_pid() AS pid')).rows[0];
-      const blockedByLock = async () =>
-        (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))', [pid])).rows[0].n > 0;
-      let blocked = false;
-      let arrivedWhileStuck = false;
+      const waitingOnLock = async () =>
+        (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))', [pid])).rows[0].n;
+      let blocked = 0;
+      let stillBlocked = 0;
+      let arrived = false;
       let retriedMeanwhile = null;
       await locker.query('BEGIN');
       try {
         await locker.query('LOCK TABLE "ContactCard" IN ACCESS EXCLUSIVE MODE');
         const before = (await metrics()).dispatch.retriedTotal;
         await produce(activity({ recipientId: L.id, body: 'held up' }));
-        blocked = Boolean(await waitFor(blockedByLock, 20_000, 50));
+        await produce(activity({ recipientId: L2.id, body: 'held up on a tier' }), { topic: TIERS[0], headers: firstRetryOf(TOPIC) });
+        blocked =
+          (await waitFor(async () => {
+            const n = await waitingOnLock();
+            return n >= 2 ? n : null;
+          }, 20_000, 50)) ?? (await waitingOnLock());
         await requestReset(W);
-        arrivedWhileStuck = Boolean(await waitFor(async () => (await inbox(W.email)).length === 1, 20_000, 100));
+        await requestReset(W2, { topic: TIERS[0], headers: firstRetryOf(RESET_TOPIC) });
+        arrived = Boolean(await waitFor(async () => (await inbox(W.email)).length === 1 && (await inbox(W2.email)).length === 1, 20_000, 100));
+        stillBlocked = await waitingOnLock();
         retriedMeanwhile = (await metrics()).dispatch.retriedTotal - before;
       } finally {
         await locker.query('ROLLBACK').catch(() => {});
         await locker.end().catch(() => {});
       }
-      check(blocked, 'CONTROL: the reply was waiting on the locked card table');
+      check(blocked >= 2, `CONTROL: both replies were waiting on the locked card table (${blocked} waiting)`);
       check(
-        arrivedWhileStuck && retriedMeanwhile === 0,
-        `the reset arrived while the reply was still on its first attempt (arrived: ${arrivedWhileStuck}; moved to a tier meanwhile: ${retriedMeanwhile})`,
+        arrived && stillBlocked >= 2 && retriedMeanwhile === 0,
+        `the reset and the reset's retry arrived while both replies were still stuck (arrived: ${arrived}; still waiting: ${stillBlocked}; moved to a tier meanwhile: ${retriedMeanwhile})`,
       );
-      const released = await waitFor(async () => ((await inbox(L.email)).length === 1 ? true : null), 45_000);
-      check(Boolean(released), 'and once the table was free, the reply arrived too');
+      const released = await waitFor(async () => ((await inbox(L.email)).length === 1 && (await inbox(L2.email)).length === 1 ? true : null), 45_000);
+      check(Boolean(released), 'and once the table was free, both replies arrived too');
     }
 
     console.log('');
@@ -708,7 +783,7 @@ async function main() {
       await fetch(`${MAILPIT}/api/v1/messages`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ IDs: ids }) }).catch(() => {});
     }
     check(removed > 0 && Number(left) === 0, `cleanup: this run's rows are gone (${removed} deleted, ${left} left), and ${ids.length} email(s) removed from Mailpit`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-contacts`, ...scanGroups]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, `${GROUP}-contacts`, ...scanGroups]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), owner.end()]);
   }

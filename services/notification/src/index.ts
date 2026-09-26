@@ -26,7 +26,7 @@ import { preferenceRoutes } from './preferences/routes.js';
  */
 const logger = createLogger('notification-service');
 
-/** Names the replies consumer group: `${KAFKA_CONSUMER_GROUP}-replies`. */
+/** Names the replies consumer groups: `${KAFKA_CONSUMER_GROUP}-replies`, and `-replies-retry` on the tiers. */
 const REPLIES_ROUTE = 'replies';
 
 const channel = createSmtpChannel({ host: env.SMTP_HOST, port: env.SMTP_PORT, from: env.EMAIL_FROM });
@@ -53,16 +53,17 @@ const bounded = <T>(work: Promise<T>): Promise<T | { error: string }> =>
  * brokers, so it is cached for five seconds and bounded at two, as Analytics'
  * ingest does: a /metrics request must never be the thing that hangs when Kafka does.
  */
-let slow: { at: number; lag: unknown; retryLag: unknown; contactsLag: unknown; repliesLag: unknown } | null = null;
+let slow: { at: number; lag: unknown; retryLag: unknown; contactsLag: unknown; repliesLag: unknown; repliesRetryLag: unknown } | null = null;
 app.get('/metrics', async (_req, res) => {
   if (dispatcher && (slow === null || Date.now() - slow.at > 5_000)) {
-    const [lag, retryLag, contactsLag, repliesLag] = await Promise.all([
+    const [lag, retryLag, contactsLag, repliesLag, repliesRetryLag] = await Promise.all([
       bounded(dispatcher.lag()),
       bounded(dispatcher.retryLag()),
       contacts ? bounded(contacts.lag()) : Promise.resolve(null),
       bounded(dispatcher.routeLag(REPLIES_ROUTE)),
+      bounded(dispatcher.routeLag(`${REPLIES_ROUTE}-retry`)),
     ]);
-    slow = { at: Date.now(), lag, retryLag, contactsLag, repliesLag };
+    slow = { at: Date.now(), lag, retryLag, contactsLag, repliesLag, repliesRetryLag };
   }
   res.json({
     dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null },
@@ -70,7 +71,7 @@ app.get('/metrics', async (_req, res) => {
     // Why each community message ended as it did. What was sent is in dispatch's
     // counters, which replies share with password resets; the lag is the replies
     // group's own, on community.feed.
-    replies: { ...replyMetrics(), lag: slow?.repliesLag ?? null },
+    replies: { ...replyMetrics(), lag: slow?.repliesLag ?? null, retryLag: slow?.repliesRetryLag ?? null },
     // Straight from memory: the sweep keeps its own counts and asks the database on
     // its own clock, so a /metrics request never waits on it.
     sweep: sweeper?.metrics() ?? null,

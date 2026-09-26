@@ -71,11 +71,16 @@ export const DLQ_HEADERS = {
   valueWithheld: 'dlq-value-withheld',
 } as const;
 
-/** One header's value as a string. */
+/**
+ * One header's value as a string. A header can be present with a NULL value — kafkajs
+ * encodes null as length -1 and decodes it back to null — and that is read as absent:
+ * calling toString() on it threw a TypeError, which kafkajs treats as unrecoverable, so
+ * one such header on a message crashed its consumer on every redelivery.
+ */
 export function header(headers: IHeaders | undefined, name: string): string | undefined {
   const value = headers?.[name];
   const one = Array.isArray(value) ? value[0] : value;
-  return one === undefined ? undefined : one.toString();
+  return one == null ? undefined : one.toString();
 }
 
 /** A message's own headers, without the bookkeeping of any earlier retry or dead-letter. */
