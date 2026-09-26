@@ -14,7 +14,12 @@ export interface OutboxRow {
   aggregateId: string;
   payload: Record<string, unknown>;
   attempts: number;
-  createdAt: Date;
+  /**
+   * createdAt as ISO-8601 UTC text, rendered by Postgres in the claim. A string
+   * on purpose: pg parses the timestamp-without-time-zone column as LOCAL time,
+   * so a Date here is off by the process's UTC offset. See claim-sql.ts.
+   */
+  occurredAt: string;
 }
 
 export interface DrainResult {

@@ -158,10 +158,15 @@ export function createPublisher(opts: {
        * occurredAt is createdAt, i.e. when the state change COMMITTED — not when
        * it was published, which after a backlog can be much later. A consumer
        * ordering by publish time would see history in the wrong order.
+       *
+       * It arrives as text Postgres rendered, and is passed through untouched.
+       * It was `row.createdAt.toISOString()`, on a Date pg had parsed as local
+       * time, so every relay outside a UTC process shifted it by its offset --
+       * eight hours early on a UTC+8 host. claim-sql.ts has the measurement.
        */
       const message = {
         messageId: row.id,
-        occurredAt: row.createdAt.toISOString(),
+        occurredAt: row.occurredAt,
         ...row.payload,
       };
 
