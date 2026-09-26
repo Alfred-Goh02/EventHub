@@ -19,6 +19,12 @@
  * one partition" is a property of a topic holding one event, not of a correct
  * system: it goes red on any topic carrying several. Both are per key now.
  *
+ * And the ordering check is scoped to the RELAY's messages. Read over the whole
+ * topic, it failed on the stale snapshots verify-search-indexer.mjs publishes on
+ * purpose -- but only on runs where the log cleaner had not yet compacted them
+ * away, so it was red or green by the cleaner's timing. The comment on that
+ * check has the reproduction and the watched fail.
+ *
  * RENAMED from consume-events-activity.mjs, because what it does changed. It
  * was a thing you ran to look at the topic; it is now a thing CI runs to
  * assert. scripts/verify-readme-setup.mjs is what noticed -- it treats any
@@ -160,13 +166,63 @@ async function main() {
    * Offset order, because that is the order the BROKER assigned. Arrival order
    * in `seen` is the order this process happened to decode them in, and
    * kafkajs runs partitions concurrently.
+   *
+   * THEN IT FAILED ON WHAT A TEST PUT THERE, WHENEVER THE LOG CLEANER WAS LATE.
+   *
+   * scripts/verify-search-indexer.mjs publishes straight to this topic, out of
+   * order on purpose -- v2 then v1, v4 then v3 -- because proving the indexer
+   * refuses a stale snapshot takes one. That is correct, and the pair stays on
+   * the topic. Whether this check then SAW it was up to a background thread:
+   * the topic is compacted, the cleaner only rewrites CLOSED segments, a segment
+   * closes on the first append after segment.ms (60 s here), and the cleaner
+   * gets round to it when it gets round to it. CI run 35524988941 read the pair
+   * uncompacted and failed a PR that touched only Community (54 messages read);
+   * run 35524768512, minutes earlier, found its own run's pair already compacted
+   * down to the closing v99, and passed (39 read).
+   *
+   * Reproduced on a scratch topic with this topic's configs. v2, v1, v3 on one
+   * key, no header: red. 83 s later with nothing appended: still red, because
+   * the active segment is never cleaned. One append to roll it, the cleaner
+   * rewrote the closed segment within 16 s, and the same check read the same
+   * topic green.
+   *
+   * SO IT IS SCOPED TO WHAT IT EXISTS TO TEST: THE RELAY'S ORDERING. Per key, the
+   * messages carrying the relay's message-id header are compared with each
+   * other, and only with each other. A direct publish between two of them is
+   * skipped, not treated as a break, so relay v3, test v103, relay v1 is still
+   * caught. Compaction cannot make this flaky: it only removes messages, and
+   * removing messages from a sequence that never goes backwards leaves one that
+   * never goes backwards. It can hide a relay reordering; it cannot invent one.
+   *
+   * THE LIMIT, stated rather than hidden: a producer that omits the header is
+   * not held to this. The relay is the only thing in services/ that produces to
+   * events.activity, and verify-relay-e2e.mjs fails if it stops setting the
+   * header. And if no message here carries it at all, the check below that
+   * counts them fails, rather than this one passing on nothing.
+   *
+   * WATCHED FAIL, on scratch topics:
+   *
+   *   relay v2, relay v1 on one key, beside     red, naming only the relay key;
+   *   direct v2, v1, v3 on another              the direct pair reported
+   *   relay v3, direct v103, relay v1           red: v3 (relay) then v1 (relay)
+   *   relay v1, direct v103, relay v2           green -- the e2e replay's shape
+   *   direct v2, v1, v3, uncompacted, and one   green, the pair reported; the
+   *   relay message on another key              old check was red on this
+   *   direct v2, v1, v3 and nothing else        red: the relay published nothing
    */
+  const where = (m) =>
+    `v${m.value.version} at p${m.partition}/${m.offset} (${m.headerId ? 'relay' : 'direct publish'})`;
+
   const outOfOrder = [];
+  const directBackwards = [];
+  const relayKeysCompared = new Set();
+  let relayPairs = 0;
   for (const [key, messages] of byKey) {
-    for (let i = 1; i < messages.length; i += 1) {
-      const before = messages[i - 1];
-      const after = messages[i];
-      if (after.value.version < before.value.version) {
+    const relayed = messages.filter((m) => m.headerId);
+    for (let i = 1; i < relayed.length; i += 1) {
+      relayPairs += 1;
+      relayKeysCompared.add(key);
+      if (relayed[i].value.version < relayed[i - 1].value.version) {
         /**
          * Named in full, with offsets and provenance.
          *
@@ -176,15 +232,21 @@ async function main() {
          * scripts that publish to this topic directly do not, so the header is
          * what separates "the relay has a bug" from "a test put that there".
          */
-        outOfOrder.push(
-          `key ${key}: v${before.value.version} at p${before.partition}/${before.offset} ` +
-            `(${before.headerId ? 'relay' : 'direct publish'}) then ` +
-            `v${after.value.version} at p${after.partition}/${after.offset} ` +
-            `(${after.headerId ? 'relay' : 'direct publish'})`,
-        );
+        outOfOrder.push(`key ${key}: ${where(relayed[i - 1])} then ${where(relayed[i])}`);
+      }
+    }
+
+    // Every OTHER backwards step, in full offset order: at least one side is a
+    // direct publish. Printed below, never failed -- see the comment above.
+    for (let i = 1; i < messages.length; i += 1) {
+      const before = messages[i - 1];
+      const after = messages[i];
+      if (after.value.version < before.value.version && !(before.headerId && after.headerId)) {
+        directBackwards.push(`key ${key}: ${where(before)} then ${where(after)}`);
       }
     }
   }
+  const relayPublished = seen.filter((m) => m.headerId).length;
 
   /**
    * And the partition check. "All messages on one partition" was true only
@@ -241,28 +303,66 @@ async function main() {
       ok: split.length === 0,
       detail: `spans partitions: ${split.join('; ')} -- that aggregate's updates are ordered by nothing`,
     },
+    /**
+     * The control for the one after it. The ordering check only reads messages
+     * carrying the relay's header, so with none on the topic -- or a relay that
+     * stopped setting it -- it would compare nothing and say yes.
+     */
     {
-      label: 'versions never go backwards within a key',
+      label: 'the relay published messages here',
+      ok: relayPublished > 0,
+      detail:
+        `none of ${seen.length} carries the relay's message-id header, so the ordering check ` +
+        'below compared nothing',
+    },
+    {
+      label: "the relay's versions never go backwards per key",
       ok: outOfOrder.length === 0,
       detail: `went backwards at ${outOfOrder.join('; ')} -- this reverts the projection`,
     },
   ];
 
   for (const prop of properties) {
-    console.log(`  ${prop.label.padEnd(44)}${prop.ok ? 'yes' : 'NO'}`);
+    console.log(`  ${prop.label.padEnd(50)}${prop.ok ? 'yes' : 'NO'}`);
+    // Here, where it fails, not only in the summary below.
+    if (!prop.ok) process.exitCode = 1;
   }
+
+  /**
+   * Printed every run, because "yes" above means as much as what it compared.
+   *
+   * Zero pairs is reported, not failed. It happens when every key holds at most
+   * one relay-published message, which is what the cleaner leaves behind once it
+   * has compacted a segment -- so failing on it would make this check depend on
+   * the cleaner's timing again, which is the flake the scoping above removed.
+   */
+  console.log('');
+  console.log(
+    `  (ordering compared ${relayPairs} same-key pair(s) of relay-published messages, ` +
+      `across ${relayKeysCompared.size} key(s); ${relayPublished} of ${seen.length} messages carry the header)`,
+  );
 
   /**
    * Reported, not asserted. A message with no header is not wrong: the header is
    * an optimisation, and scripts/verify-projection-e2e.mjs deliberately publishes
    * without one because it is exercising the payload path. Failing on it would be
    * failing on correct traffic. But a sudden change in the count is worth seeing,
-   * so it prints.
+   * so it prints. The count now matters for another reason too: these are the
+   * messages the ordering check does not hold to the relay's guarantee.
    */
   if (headerless > 0) {
     console.log('');
-    console.log(`  (${headerless} of ${seen.length} carry no message-id header -- not a failure;`);
-    console.log('   the header is an optimisation and the e2e replay omits it on purpose)');
+    console.log(`  (${headerless} of ${seen.length} carry no message-id header -- not a failure, and not held`);
+    console.log("   to the relay's ordering: verifiers publish here directly, and the e2e replay");
+    console.log('   omits the header on purpose)');
+  }
+
+  if (directBackwards.length > 0) {
+    console.log('');
+    console.log(`  (${directBackwards.length} backwards step(s) involve a direct publish -- not a failure;`);
+    console.log('   verify-search-indexer.mjs publishes stale snapshots on purpose, and whether they');
+    console.log('   are still here depends on when the log cleaner last reached their segment)');
+    for (const d of directBackwards) console.log(`     ${d}`);
   }
 
   if (undecodable.length > 0) {

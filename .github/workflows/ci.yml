@@ -1839,6 +1839,11 @@ jobs:
       # only because the topic held one event's updates when it was written, and
       # go red on any topic with several -- correct traffic reported as broken.
       #
+      # The ordering check reads only what the RELAY published. Over the whole
+      # topic it failed on the stale snapshots verify-search-indexer.mjs
+      # publishes on purpose, red or green by whether the log cleaner had
+      # compacted them yet -- run 35524988941 failed a Community-only PR on it.
+      #
       # Placed after the relay e2e so there is real relayed traffic to read.
       - name: Assert the wire holds the properties the projection depends on
         run: node scripts/verify-events-activity.mjs
