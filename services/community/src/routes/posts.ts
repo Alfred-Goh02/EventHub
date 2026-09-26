@@ -283,15 +283,22 @@ export function postRoutes(
          * see who may read what, so a consumer is told the answer rather than left to
          * guess it. Never the commenter themselves.
          *
-         * In the same transaction as the comment, so it is judged against the same
-         * snapshot the comment was written in.
+         * And only if what they wrote can still be seen. The post and the parent were
+         * checked earlier, but each statement here reads a newer snapshot, so a hide
+         * that commits in between is missed — and the author of hidden content would be
+         * emailed a reply nobody can read in the space. So they are checked again HERE,
+         * after `UPDATE "Post"` above took the post's row lock. Every hide takes that
+         * lock too — a post's directly, a comment's through recountComments — so any
+         * hide that committed first is seen by this statement, and any that did not
+         * waits for this comment to commit, and comes after it.
          */
         const answered = await tx.$queryRaw<Array<{ recipientId: string }>>`
           SELECT r.author AS "recipientId"
             FROM (SELECT CASE WHEN ${parentId}::text IS NULL THEN p."authorId" ELSE c."authorId" END AS author
                     FROM "Post" p
                     LEFT JOIN "Comment" c ON c.id = ${parentId} AND c."postId" = p.id
-                   WHERE p.id = ${postId}) r
+                          AND c.status = 'VISIBLE'::"ContentStatus" AND NOT ${hiddenAbove('c')}
+                   WHERE p.id = ${postId} AND p.status = 'VISIBLE'::"ContentStatus") r
             JOIN "CommunitySpace" s ON s.id = ${spaceId}
             LEFT JOIN "Membership" m ON m."spaceId" = s.id AND m."userId" = r.author
            WHERE r.author IS NOT NULL AND r.author <> ${userId}

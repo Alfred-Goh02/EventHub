@@ -574,6 +574,73 @@ async function main() {
       `and recipientId survives the registered schema onto the topic (${onTopic.map((r) => (r === undefined ? 'MISSING' : r)).join(', ')})`,
     );
 
+    /**
+     * A HIDE THAT COMMITS WHILE THE COMMENT IS BEING WRITTEN.
+     *
+     * The route checks the post and the parent before its transaction, and decides the
+     * recipient later, after taking the post's row lock. Each case holds a hide open on
+     * that row, sends the comment — which passes every earlier check, because the hide is
+     * not committed, and then waits on the lock — and commits the hide while it waits.
+     * The comment is still written; nobody may be told about it. `blocked` is the
+     * control: a comment that never waited on the hide raced nothing.
+     */
+    async function hiddenWhileWriting(hide, write) {
+      const locker = new pg.Client({ connectionString: communityEnv.DATABASE_URL });
+      await locker.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query("SELECT set_config('app.tenant_id', $1, true)", [TENANT]);
+        const { pid } = (await locker.query('SELECT pg_backend_pid() AS pid')).rows[0];
+        for (const [sql, params] of hide) await locker.query(sql, params);
+        const pending = write();
+        const blocked = await waitFor(
+          async () => (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))', [pid])).rows[0].n > 0,
+          10_000,
+          50,
+        );
+        await locker.query('COMMIT');
+        return { id: await pending, blocked: Boolean(blocked) };
+      } catch (err) {
+        await locker.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        await locker.end().catch(() => {});
+      }
+    }
+    // Users of their own, so no earlier section's rate-limit budget is in play.
+    const RACE_AUTHOR = `u_race_author_${RUN}`;
+    const asRaceA = token(TENANT, `u_race_a_${RUN}`);
+    const asRaceB = token(TENANT, `u_race_b_${RUN}`);
+    for (const t of [token(TENANT, RACE_AUTHOR), asRaceA, asRaceB]) await api(`/spaces/${spaceId}/join`, { method: 'POST', bearer: t });
+    const racePost = (await api(`/spaces/${spaceId}/posts`, { method: 'POST', bearer: token(TENANT, RACE_AUTHOR), body: { body: `raced ${RUN}` } })).body?.id;
+    const toHide = await comment(asRaceB, `about to be hidden ${RUN}`, null, racePost);
+    const grand = await comment(asRaceA, `a grandparent about to be hidden ${RUN}`, null, racePost);
+    const underGrand = await comment(asRaceB, `under the grandparent ${RUN}`, grand, racePost);
+    const touchPost = ['UPDATE "Post" SET "commentCount" = "commentCount" WHERE id = $1', [racePost]];
+    const hideComment = (id) => ['UPDATE "Comment" SET status = \'HIDDEN\'::"ContentStatus" WHERE id = $1', [id]];
+    const races = [
+      ['the parent is hidden while the reply waits', await hiddenWhileWriting([hideComment(toHide), touchPost], () => comment(asRaceA, `answers a hidden parent ${RUN}`, toHide, racePost))],
+      ['a comment above the parent is hidden while the reply waits', await hiddenWhileWriting([hideComment(grand), touchPost], () => comment(asRaceA, `answers under a hidden grandparent ${RUN}`, underGrand, racePost))],
+      ['the post is hidden while the comment waits', await hiddenWhileWriting([['UPDATE "Post" SET status = \'HIDDEN\'::"ContentStatus" WHERE id = $1', [racePost]]], () => comment(asRaceA, `on a hidden post ${RUN}`, null, racePost))],
+    ];
+    const raced = Object.fromEntries(
+      (await inTenant(
+        owner,
+        TENANT,
+        `SELECT payload->>'commentId' AS "commentId", payload->>'recipientId' AS "recipientId"
+           FROM "OutboxMessage" WHERE "tenantId" = $1 AND payload->>'commentId' = ANY($2)`,
+        [TENANT, races.map(([, r]) => r.id).filter(Boolean)],
+      )).rows.map((r) => [r.commentId, r.recipientId]),
+    );
+    check(
+      Boolean(racePost && toHide && grand && underGrand),
+      'CONTROL: the race fixture — a post, a comment to hide, a grandparent to hide and a comment under it',
+    );
+    for (const [what, r] of races) {
+      const got = r.id && r.id in raced ? raced[r.id] : 'MISSING';
+      check(r.blocked && got === null, `${what}: nobody is told (waited on the hide: ${r.blocked}; ${got === null ? 'nobody' : got})`);
+    }
+
     console.log('');
     console.log('  the limiter covers posting too');
     // A fresh user, so the budget is whole: everyone above has spent some of theirs.
@@ -616,32 +683,37 @@ async function main() {
     console.error(`  Community's output:\n${excerpt(service.log())}`);
   } finally {
     service.child.kill();
-    for (const tenant of [TENANT, OTHER_TENANT]) {
-      // FeedEntry is in this list because the service this run spawns now carries the
-      // fan-out consumer, so posting here writes feed rows as a side effect. Without
-      // it this run leaves them behind — measured, five rows after one pass.
-      for (const table of ['FeedEntry', 'Reaction', 'Comment', 'Post', 'OutboxMessage', 'Membership', 'CommunitySpace']) {
-        try {
-          await owner.query('BEGIN');
-          await owner.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
-          await owner.query(`DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]);
-          await owner.query('COMMIT');
-        } catch (err) {
-          await owner.query('ROLLBACK').catch(() => {});
-          console.error(`  cleanup of ${table} failed: ${err.message}`);
-        }
-      }
-    }
+    /**
+     * FeedEntry is in this list because the service this run spawns carries the fan-out
+     * consumer, so posting here writes feed rows as a side effect — measured, five rows
+     * after one pass. ModerationAction because the recipient section bans someone, and a
+     * ban is audited: without it every run left one row, eight of them before anyone
+     * counted.
+     *
+     * Both the deletes and the count run INSIDE the tenant. The count used to run
+     * outside it, where FORCE row security shows the owner nothing, so it said "0 left"
+     * whatever was left. The deleted count is the control: "0 deleted, 0 left" is the bug.
+     */
+    const tables = ['FeedEntry', 'Reaction', 'ModerationAction', 'Comment', 'Post', 'OutboxMessage', 'Membership', 'CommunitySpace'];
+    let deleted = 0;
     let left = 0;
-    for (const table of ['Reaction', 'Comment', 'Post', 'OutboxMessage', 'Membership', 'CommunitySpace']) {
-      const rows = await owner
-        .query(`SELECT count(*)::int AS n FROM "${table}" WHERE "tenantId" = ANY($1)`, [[TENANT, OTHER_TENANT]])
-        .catch(() => ({ rows: [{ n: -1 }] }));
-      left += rows.rows[0].n;
+    for (const tenant of [TENANT, OTHER_TENANT]) {
+      for (const table of tables) {
+        deleted += await inTenant(owner, tenant, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]).then(
+          (r) => r.rowCount ?? 0,
+          (err) => (console.error(`  cleanup of ${table} failed: ${err.message}`), 0),
+        );
+      }
+      for (const table of tables) {
+        left += (await inTenant(owner, tenant, `SELECT count(*)::int AS n FROM "${table}" WHERE "tenantId" = $1`, [tenant]).catch(() => ({ rows: [{ n: -1 }] }))).rows[0].n;
+      }
     }
     const groupsLeft = await deleteGroupsWhenEmpty(admin, scanGroups);
     await admin.disconnect().catch(() => {});
-    check(left === 0, `cleanup: this run's rows are gone (${left} left); consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`);
+    check(
+      deleted > 0 && left === 0,
+      `cleanup: this run's rows are gone (${deleted} deleted, ${left} left); consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`,
+    );
     await owner.end().catch(() => {});
   }
 
