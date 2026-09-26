@@ -36,7 +36,7 @@ import pg from 'pg';
 import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { serviceEnv } from './lib/service-env.mjs';
-import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { busyGroups, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -175,6 +175,28 @@ async function main() {
   );
   if (taken) {
     console.error(`FAIL: something already answers on :${PORT}. Stop it before running this.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  /**
+   * NOR MAY THE REAL COMMUNITY BE CONSUMING community.feed. Its feed consumer reads the
+   * same topic with its own threshold — 5000 members — so it fans out every post this
+   * run makes in a space meant to be too large for fan-out, and "no feed rows were
+   * written for it" then fails on code that is right. Found when the compose image was
+   * rebuilt with a consumer in it: until then compose's Community was too old to have
+   * one, and this passed by accident. The group is the one Community's .env.example
+   * names, which is the one compose runs.
+   */
+  const realGroup = serviceEnv(ROOT, 'community').FEED_CONSUMER_GROUP;
+  const probe = new Kafka({ clientId: `verify-feed-probe-${RUN}`, brokers: relayEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING }).admin();
+  await probe.connect();
+  const busy = await busyGroups(probe, [realGroup]).finally(() => probe.disconnect().catch(() => {}));
+  if (busy.length > 0) {
+    console.error(
+      `FAIL: ${busy.join(', ')} has active members, so another Community is fanning out community.feed with its own ` +
+        'threshold. Stop it first (in compose: docker compose stop community).',
+    );
     process.exitCode = 1;
     return;
   }
