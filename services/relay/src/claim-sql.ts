@@ -51,6 +51,23 @@
  * only in production. Returning false is the design: the aggregate is somebody
  * else's this pass, and this relay picks it up on the next one.
  *
+ * occurredAt IS RENDERED HERE, AS TEXT, AND NEVER BECOMES A JS DATE.
+ *
+ * "createdAt" is a Prisma DateTime, so `timestamp WITHOUT time zone`, holding
+ * the UTC wall time of the commit (the database runs UTC, and the column
+ * defaults to now()). node-postgres parses that type as LOCAL time. The relay
+ * used to select the bare column and publish `row.createdAt.toISOString()`,
+ * which is correct only in a process whose own zone is UTC. Compose runs UTC,
+ * so it looked right; a relay pass on a UTC+8 host published every occurredAt
+ * eight hours early. Measured with the shipped drain on this repository's dev
+ * machine: createdAt 2026-09-26T10:39:17.474, occurredAt 2026-09-26T02:39:17.474Z.
+ *
+ * to_char on a timestamp WITHOUT time zone converts nothing -- it does not read
+ * the session's TimeZone either -- so this string is the column's own wall time
+ * with a Z appended, in exactly the shape toISOString produced. Nothing in the
+ * process's environment can move it. scripts/verify-relay-occurred-at.mjs runs
+ * the drain in a non-UTC zone and compares the published string with this one.
+ *
  * The parameter is the batch size.
  */
 export const CLAIM_SQL =
@@ -91,7 +108,8 @@ export const CLAIM_SQL =
             FOR UPDATE SKIP LOCKED
        )
        SELECT id, seq::text AS "seq", "tenantId", topic, "eventType", "schemaVersion",
-              "aggregateId", payload, attempts, "createdAt"
+              "aggregateId", payload, attempts,
+              to_char(c."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "occurredAt"
          FROM claimable c
         -- ONE RELAY AT A TIME PER AGGREGATE.
         --
