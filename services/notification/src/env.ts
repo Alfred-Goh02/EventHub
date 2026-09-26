@@ -31,7 +31,31 @@ const notificationEnvSchema = z.object({
    * every unsubscribe link already sent, which the law requires to keep working.
    */
   UNSUBSCRIBE_SECRET: z.string().min(32),
-  /** One group per deployment. Verifiers run their own, so they never take its partitions. */
+  /**
+   * Where this service answers /unsubscribe, as a reader's mail client reaches it:
+   * the origin every unsubscribe link and List-Unsubscribe header points at.
+   */
+  NOTIFICATION_PUBLIC_URL: z.string().url().default('http://localhost:3007'),
+  /** Where the web app shows a post, for the link in a reply email. Auth's reset links use the same name. */
+  PUBLIC_APP_URL: z.string().url().default('http://localhost:3000'),
+  /**
+   * Where a new replies group starts on community.feed. latest, unlike password
+   * resets: on first deploy, earliest would email everyone about a week of replies
+   * that were long since read.
+   */
+  COMMUNITY_START_FROM: z.enum(['earliest', 'latest']).default('latest'),
+  /**
+   * Past this age, in milliseconds, a reply is not emailed at all: who is told was
+   * decided when the comment was written, and a reply caught up on much later may have
+   * been hidden since. An hour: well past the retry tiers (about twenty minutes), well
+   * short of a notification nobody wants any more.
+   */
+  REPLY_MAX_AGE_MS: z.coerce.number().int().positive().default(3_600_000),
+  /**
+   * One group per deployment. Verifiers run their own, so they never take its partitions.
+   * The retry tiers are read by `<this>-retry`, and replies from community.feed by
+   * `<this>-replies`, so a verifier's own group brings its own of each.
+   */
   KAFKA_CONSUMER_GROUP: z.string().min(1).default('notification-dispatch'),
   /**
    * The group that keeps the contact-card copy, from auth.user-contact. Its own, so a
@@ -102,6 +126,20 @@ if (!parsed.success) {
  */
 if (base.NODE_ENV === 'production' && parsed.data.UNSUBSCRIBE_SECRET.startsWith('dev-only-')) {
   throw new Error('refusing to start: UNSUBSCRIBE_SECRET is the development value from .env.example');
+}
+
+/**
+ * The same for the two public origins. Both default to localhost, which is right on a
+ * laptop and wrong everywhere else: a production process that forgot them would send
+ * every reply with an unsubscribe link pointing at the reader's own machine — and replies
+ * are on by default, so nobody could turn them off from the email. RFC 8058 also
+ * requires one-click unsubscribe over https. So production requires https for both.
+ */
+if (base.NODE_ENV === 'production') {
+  const plain = (['NOTIFICATION_PUBLIC_URL', 'PUBLIC_APP_URL'] as const).filter((name) => new URL(parsed.data[name]).protocol !== 'https:');
+  if (plain.length > 0) {
+    throw new Error(`refusing to start: ${plain.join(' and ')} must be https in production (the defaults point at localhost)`);
+  }
 }
 
 export const env = Object.freeze({ ...base, ...parsed.data });

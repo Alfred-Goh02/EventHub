@@ -1,4 +1,5 @@
-import { Kafka, logLevel, type Consumer, type KafkaMessage } from 'kafkajs';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { Kafka, logLevel, type Consumer, type EachMessagePayload, type KafkaMessage } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { z, ZodError } from 'zod';
 import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
@@ -7,7 +8,7 @@ import { PermanentSendError, type EmailChannel } from '../channels/types.js';
 import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
 import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
-import { renderPasswordReset } from './templates.js';
+import { renderPasswordReset, type RenderedEmail } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
 
@@ -64,7 +65,7 @@ export function dispatchHealth(): { consuming: boolean; failing: boolean; stoppe
 }
 
 /** Network and registry failures that are not the message's fault. The same rule as Analytics' ingest. */
-function isTransient(err: unknown): boolean {
+export function isTransient(err: unknown): boolean {
   const text = err instanceof Error ? `${err.name} ${err.message}` : String(err);
   const status = (err as { status?: number })?.status;
   return (
@@ -74,7 +75,7 @@ function isTransient(err: unknown): boolean {
 }
 
 /** One line for an operator; well-formed, because part of it can be the message's own bytes. */
-const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 500).toWellFormed();
+export const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 500).toWellFormed();
 
 const envelopeSchema = z.object({
   messageId: z.string().min(1),
@@ -92,6 +93,11 @@ export type Outcome =
   | { kind: 'rejected' }
   /** The address is on the suppression list. Recorded, and nothing sent. */
   | { kind: 'suppressed' }
+  /**
+   * Nothing to send, by design: a message on a shared topic that is not for this
+   * service, or a reply to someone who asked not to be told. Final, and committed.
+   */
+  | { kind: 'skipped'; why: string }
   /** Will never succeed. Straight to the dead-letter topic. */
   | { kind: 'poison'; reason: string }
   /** May succeed later. To the next retry tier. */
@@ -102,6 +108,98 @@ export interface MessageHandlerOptions {
   open: (envelope: EmailRequestEnvelope) => Promise<OpenedEmailRequest>;
   channel: EmailChannel;
   logger: Logger;
+}
+
+/** What the dispatcher knows about a message besides its bytes. */
+export interface HandlerContext {
+  /** Read from a retry tier: an earlier attempt failed, and may have claimed the delivery. */
+  retried: boolean;
+  /** The message's event-type header, which the relay stamps from the outbox row. */
+  eventType: string | undefined;
+}
+
+export type MessageHandler = (value: Buffer | null, ctx: HandlerContext) => Promise<Outcome>;
+
+/** One message, decoded to the point of knowing whom to send what. See deliver(). */
+export interface PreparedDelivery {
+  key: DeliveryKey;
+  /** For the sent-log. */
+  category: string;
+  to: string;
+  email: RenderedEmail;
+  headers: Record<string, string>;
+  /** Identifiers only — never an address or a link — for every log line about it. */
+  ids: Record<string, string>;
+  /** What the log says once it is sent. */
+  sentMessage: string;
+}
+
+/**
+ * Claim, check the suppression list, send, record: the half of every email that does
+ * not depend on what kind of email it is. One copy, so a reply and a password reset
+ * cannot drift apart on the part that decides whether mail goes out twice.
+ *
+ * THE ORDER IS THE DESIGN, and createMessageHandler explains it; this is steps 3 to 5.
+ */
+export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel; logger: Logger }): Promise<Outcome> {
+  const transient = (err: unknown): Outcome => {
+    counters.transientFailures += 1;
+    return { kind: 'transient', error: describe(err) };
+  };
+
+  let claim;
+  try {
+    claim = await claimDelivery({ ...p.key, category: p.category });
+  } catch (err) {
+    return transient(err);
+  }
+  if (!claim.claimed && claim.status !== 'PENDING') {
+    counters.duplicates += 1;
+    opts.logger.info({ ...p.ids, status: claim.status }, 'already delivered; skipped');
+    return { kind: 'duplicate' };
+  }
+
+  let suppressed: boolean;
+  try {
+    suppressed = await suppressIfListed(p.key, p.to);
+  } catch (err) {
+    return transient(err);
+  }
+  if (suppressed) {
+    counters.suppressed += 1;
+    opts.logger.warn(p.ids, 'the address is on the suppression list; recorded SUPPRESSED and not sent');
+    return { kind: 'suppressed' };
+  }
+
+  try {
+    const result = await opts.channel.send({ to: p.to, ...p.email, headers: p.headers });
+    await markSent(p.key, result.providerMessageId);
+    counters.sent += 1;
+    opts.logger.info(p.ids, p.sentMessage);
+    return { kind: 'sent' };
+  } catch (err) {
+    if (err instanceof PermanentSendError) {
+      let recorded: { suppressionAdded: boolean };
+      try {
+        recorded = await markFailed(
+          p.key,
+          describe(err),
+          err.addressDoesNotExist && err.status ? { address: p.to, status: err.status } : undefined,
+        );
+      } catch (recordErr) {
+        return transient(recordErr);
+      }
+      counters.rejected += 1;
+      if (recorded.suppressionAdded) counters.suppressionsAdded += 1;
+      opts.logger.warn(
+        { ...p.ids, reason: describe(err), suppressionAdded: recorded.suppressionAdded },
+        'the provider refused the email; recorded as FAILED',
+      );
+      return { kind: 'rejected' };
+    }
+    await recordAttempt(p.key, describe(err)).catch(() => {});
+    return transient(err);
+  }
 }
 
 /**
@@ -133,7 +231,7 @@ export interface MessageHandlerOptions {
  *
  * Nothing logged here carries the address or the link: ids only.
  */
-export function createMessageHandler(opts: MessageHandlerOptions): (value: Buffer | null) => Promise<Outcome> {
+export function createMessageHandler(opts: MessageHandlerOptions): MessageHandler {
   const transient = (err: unknown): Outcome => {
     counters.transientFailures += 1;
     return { kind: 'transient', error: describe(err) };
@@ -177,72 +275,55 @@ export function createMessageHandler(opts: MessageHandlerOptions): (value: Buffe
       return transient(err);
     }
 
-    const key: DeliveryKey = {
-      tenantId: opened.tenantId,
-      sourceMessageId: envelope.messageId,
-      recipientId: opened.userId,
-      channel: 'email',
-    };
-
-    let claim;
-    try {
-      claim = await claimDelivery({ ...key, category: 'account', templateKey: 'password-reset' });
-    } catch (err) {
-      return transient(err);
-    }
-    if (!claim.claimed && claim.status !== 'PENDING') {
-      counters.duplicates += 1;
-      opts.logger.info({ ...ids, status: claim.status }, 'already delivered; skipped');
-      return { kind: 'duplicate' };
-    }
-
-    let suppressed: boolean;
-    try {
-      suppressed = await suppressIfListed(key, opened.email);
-    } catch (err) {
-      return transient(err);
-    }
-    if (suppressed) {
-      counters.suppressed += 1;
-      opts.logger.warn(ids, 'the address is on the suppression list; recorded SUPPRESSED and not sent');
-      return { kind: 'suppressed' };
-    }
-
-    const email = renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt });
-    try {
-      const result = await opts.channel.send({
+    return deliver(
+      {
+        key: {
+          tenantId: opened.tenantId,
+          sourceMessageId: envelope.messageId,
+          recipientId: opened.userId,
+          channel: 'email',
+          templateKey: 'password-reset',
+        },
+        category: 'account',
         to: opened.email,
-        ...email,
+        email: renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt }),
         headers: { 'X-EventHub-Message-Id': envelope.messageId },
-      });
-      await markSent(key, result.providerMessageId);
-      counters.sent += 1;
-      opts.logger.info(ids, 'password reset email sent');
-      return { kind: 'sent' };
-    } catch (err) {
-      if (err instanceof PermanentSendError) {
-        let recorded: { suppressionAdded: boolean };
-        try {
-          recorded = await markFailed(
-            key,
-            describe(err),
-            err.addressDoesNotExist && err.status ? { address: opened.email, status: err.status } : undefined,
-          );
-        } catch (recordErr) {
-          return transient(recordErr);
-        }
-        counters.rejected += 1;
-        if (recorded.suppressionAdded) counters.suppressionsAdded += 1;
-        opts.logger.warn(
-          { ...ids, reason: describe(err), suppressionAdded: recorded.suppressionAdded },
-          'the provider refused the email; recorded as FAILED',
-        );
-        return { kind: 'rejected' };
-      }
-      await recordAttempt(key, describe(err)).catch(() => {});
-      return transient(err);
-    }
+        ids,
+        sentMessage: 'password reset email sent',
+      },
+      opts,
+    );
   };
+}
+
+/**
+ * A topic other than password resets that this dispatcher sends email for.
+ *
+ * EACH IS READ BY A CONSUMER AND A GROUP OF ITS OWN, `${groupId}-${name}`. One consumer
+ * for everything handles one message at a time, and a fetch waits for the last one to
+ * finish: a backlog of replies after an outage — each a few database round trips, an
+ * unseal and an SMTP connection — would sit in front of every password reset published
+ * behind it, long enough for the reset's thirty-minute link to die unsent. Before
+ * replies, a reset only ever queued behind other resets, and that is kept.
+ *
+ * ITS RETRIES ARE ITS OWN TOO. The retry tiers are shared topics, but each tier is read
+ * by the reset path's retry group AND by one retry group per route,
+ * `${groupId}-${name}-retry`, and each acts only on its own messages and steps over the
+ * rest. With one retry consumer for everything, replies that failed in an outage would
+ * be retried in front of the resets that failed with them.
+ *
+ * They still share the sent-log, the tiers and the dead-letter topic with password
+ * resets — one pipeline for whether mail goes out twice — and each route is started
+ * after the reset path is running, retrying on its own with a growing wait, so a route
+ * that cannot start or keeps crashing never stops a password reset from being read.
+ */
+export interface Route {
+  /** Names its consumer groups, `${groupId}-${name}` and `${groupId}-${name}-retry`, and its log lines. */
+  name: string;
+  topic: string;
+  /** Where its group starts when it has no committed offset. */
+  startFrom: 'earliest' | 'latest';
+  make: (decode: MessageHandlerOptions['decode']) => MessageHandler;
 }
 
 export function createDispatcher(opts: {
@@ -255,6 +336,7 @@ export function createDispatcher(opts: {
   logger: Logger;
   open: MessageHandlerOptions['open'];
   channel: EmailChannel;
+  routes?: Route[];
   /** Called when kafkajs stops a consumer for good. The caller exits. */
   onFatal: (err: unknown) => void;
 }) {
@@ -270,16 +352,35 @@ export function createDispatcher(opts: {
   const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1 });
   const admin = kafka.admin();
   const resumeTimers = new Set<NodeJS.Timeout>();
+  const restartTimers = new Set<NodeJS.Timeout>();
+  /** Bumped by every start and stop, so a route still starting from an earlier start gives up. */
+  let generation = 0;
 
-  const handle = createMessageHandler({
-    decode: async (value) => {
-      if (value === null) throw new Error('null value (a tombstone)');
-      return registry.decode(value);
-    },
-    open: opts.open,
-    channel: opts.channel,
-    logger: opts.logger,
-  });
+  const decode: MessageHandlerOptions['decode'] = async (value) => {
+    if (value === null) throw new Error('null value (a tombstone)');
+    return registry.decode(value);
+  };
+
+  const routes = (opts.routes ?? []).map((r) => ({ ...r, handle: r.make(decode) }));
+  const routeTopics = new Set(routes.map((r) => r.topic));
+
+  /**
+   * One handler per topic. A message is handled by the handler for the topic it
+   * ORIGINALLY came from — the retry tiers carry messages from every route, and a reply
+   * retried from a tier must not be decoded as a password reset.
+   */
+  const handlers = new Map<string, MessageHandler>([
+    [DISPATCH_TOPIC, createMessageHandler({ decode, open: opts.open, channel: opts.channel, logger: opts.logger })],
+    ...routes.map((r): [string, MessageHandler] => [r.topic, r.handle]),
+  ]);
+  async function handle(originalTopic: string, value: Buffer | null, ctx: HandlerContext): Promise<Outcome> {
+    const handler = handlers.get(originalTopic);
+    if (!handler) {
+      counters.poison += 1;
+      return { kind: 'poison', reason: `no handler for messages from ${originalTopic}` };
+    }
+    return handler(value, ctx);
+  }
 
   /**
    * Hands a failed message on: to the next retry tier, or to the dead-letter topic
@@ -291,9 +392,10 @@ export function createDispatcher(opts: {
     source: { topic: string; partition: number; message: KafkaMessage },
     outcome: Extract<Outcome, { kind: 'poison' | 'transient' }>,
     consumerGroup: string,
+    /** As process() decided it, so the handler that ran and the header written agree. */
+    originalTopic: string,
   ): Promise<void> {
     const { message } = source;
-    const originalTopic = header(message.headers, RETRY_HEADERS.originalTopic) ?? source.topic;
     const failedAttempts = Number(header(message.headers, RETRY_HEADERS.attempt) ?? '0') + 1;
     const firstFailedAt = header(message.headers, RETRY_HEADERS.firstFailedAt) ?? new Date().toISOString();
     const base = originalHeaders(message.headers);
@@ -326,14 +428,26 @@ export function createDispatcher(opts: {
 
     const reason =
       outcome.kind === 'poison' ? outcome.reason : `retries exhausted after ${failedAttempts} attempts: ${outcome.error}`;
+    /**
+     * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value is ciphertext
+     * only this service can open. Anything else — a reply, carrying the reply's words and
+     * who wrote them — would outlive, in a topic kept forever, the author's delete and a
+     * moderator's hide, which change only Community's database; and replaying it would
+     * put those words back on the topic it came from, for every consumer of that topic.
+     * So the dead-letter copy keeps the headers — message id, reason, where it came
+     * from — and not the value: the count an operator is paged on still moves, and the
+     * words go when their own topic's retention takes them.
+     */
+    const keepValue = originalTopic === DISPATCH_TOPIC;
     await producer.send({
       topic: DLQ_TOPIC,
       messages: [
         {
           key: message.key,
-          value: message.value,
+          value: keepValue ? message.value : null,
           headers: {
             ...base,
+            ...(keepValue ? {} : { [DLQ_HEADERS.valueWithheld]: 'true' }),
             [DLQ_HEADERS.reason]: reason,
             [DLQ_HEADERS.consumerGroup]: consumerGroup,
             [DLQ_HEADERS.originalTopic]: originalTopic,
@@ -350,22 +464,204 @@ export function createDispatcher(opts: {
     opts.logger.error({ messageId, reason }, 'sent to notification.dlq');
   }
 
-  /** Handle, forward if it failed, and only then commit. A throw leaves the offset where it was. */
-  async function process(consumer: Consumer, consumerGroup: string, topic: string, partition: number, message: KafkaMessage) {
+  const isTier = (topic: string) => tiers.some((t) => t.topic === topic);
+
+  /**
+   * Where a message first came from. forward() always stamps it on a message it moves
+   * to a tier; one on a tier WITHOUT it predates routes, when everything on the tiers
+   * was a password reset, and is handled as one — the retry and suppression verifiers'
+   * canaries are exactly that, and failed their control until this fallback existed.
+   * One copy, read by process() and by the tier consumers deciding whose it is.
+   */
+  const originalTopicOf = (topic: string, message: KafkaMessage): string =>
+    header(message.headers, RETRY_HEADERS.originalTopic) ?? (isTier(topic) ? DISPATCH_TOPIC : topic);
+
+  /** A committed offset is the NEXT one to read, hence the + 1. */
+  const next = (message: KafkaMessage) => (BigInt(message.offset) + 1n).toString();
+
+  /**
+   * Handle, forward if it failed, and only then commit. A throw leaves the offset where
+   * it was. `state` is whose health a failure marks: a route's own, so a route in
+   * trouble does not report the password-reset path as failing.
+   */
+  async function process(
+    consumer: Consumer,
+    consumerGroup: string,
+    topic: string,
+    partition: number,
+    message: KafkaMessage,
+    state: { failing: boolean; lastError: string | null } = health,
+  ) {
     try {
-      const outcome = await handle(message.value);
+      // Decided once, here, and handed to forward(), so a message that fails again is
+      // stamped with the topic it was handled as.
+      const originalTopic = originalTopicOf(topic, message);
+      const outcome = await handle(originalTopic, message.value, { retried: isTier(topic), eventType: header(message.headers, 'event-type') });
       if (outcome.kind === 'poison' || outcome.kind === 'transient') {
-        await forward({ topic, partition, message }, outcome, consumerGroup);
+        await forward({ topic, partition, message }, outcome, consumerGroup, originalTopic);
       }
-      // A committed offset is the NEXT one to read, hence the + 1. Spelled out,
-      // because a commit that waits for an interval never happens with autoCommit off.
-      await consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
-      health.failing = false;
+      // Spelled out, because a commit that waits for an interval never happens with
+      // autoCommit off.
+      await consumer.commitOffsets([{ topic, partition, offset: next(message) }]);
+      state.failing = false;
     } catch (err) {
-      health.failing = true;
-      health.lastError = describe(err);
+      state.failing = true;
+      state.lastError = describe(err);
       throw err;
     }
+  }
+
+  /**
+   * What a retry consumer runs for each tier message. Every tier message is read by the
+   * reset path's retry group and by each route's; `owns` says which are this consumer's,
+   * and the rest are stepped over — committed, not handled — so each consumer waits only
+   * on its own messages, and not on another's that are not due yet.
+   */
+  function onTier(
+    consumer: Consumer,
+    consumerGroup: string,
+    owns: (originalTopic: string) => boolean,
+    state: { failing: boolean; lastError: string | null } = health,
+  ) {
+    return async ({ topic, partition, message }: EachMessagePayload): Promise<void> => {
+      if (!owns(originalTopicOf(topic, message))) {
+        await consumer.commitOffsets([{ topic, partition, offset: next(message) }]);
+        return;
+      }
+      const waitMs = Number(header(message.headers, RETRY_HEADERS.notBefore) ?? '0') - Date.now();
+      if (waitMs > 0) {
+        /**
+         * NOT DUE YET, AND NO SLEEPING HERE. Sleeping in the handler would stop the poll
+         * loop, heartbeats with it, and get the member thrown out of its group. Instead:
+         * pause this partition, seek back to this message, and resume when it is due.
+         * kafkajs marks the message done when this returns, but the seek moves the fetch
+         * position back before the next fetch, and nothing is committed, so it is read
+         * again rather than skipped.
+         */
+        consumer.pause([{ topic, partitions: [partition] }]);
+        consumer.seek({ topic, partition, offset: message.offset });
+        const timer = setTimeout(() => {
+          resumeTimers.delete(timer);
+          try {
+            consumer.resume([{ topic, partitions: [partition] }]);
+          } catch (err) {
+            // A rebalance may have moved the partition elsewhere while it waited.
+            opts.logger.warn({ err, topic, partition }, 'could not resume a retry partition');
+          }
+        }, waitMs);
+        resumeTimers.add(timer);
+        return;
+      }
+      await process(consumer, consumerGroup, topic, partition, message, state);
+    };
+  }
+
+  /**
+   * A consumer a route runs: one on the route's topic, one on its share of the tiers.
+   *
+   * RUNNING MEANS JOINED. kafkajs's run() resolves even when joining the group fails —
+   * it reports that as a crash instead — so "run() returned" is no evidence of anything.
+   * `running` is set by GROUP_JOIN and cleared by a crash or a stop.
+   *
+   * A FRESH CONSUMER PER START. A loop still starting from an earlier start, or a crash
+   * restart already in flight when stop() ran, then acts on a consumer nothing else
+   * uses, and one that was started under an older generation gives up rather than
+   * joining after the dispatcher stopped.
+   */
+  interface Runner {
+    name: string;
+    groupId: string;
+    topics: string[];
+    fromBeginning: boolean;
+    eachMessage: (consumer: Consumer, state: Runner['state']) => (payload: EachMessagePayload) => Promise<void>;
+    consumer: Consumer | null;
+    /** The generation it was last started under. */
+    gen: number;
+    state: { running: boolean; failing: boolean; lastError: string | null; crashes: number };
+  }
+  const newState = (): Runner['state'] => ({ running: false, failing: false, lastError: null, crashes: 0 });
+  const runners: Runner[] = routes.flatMap((r): Runner[] => [
+    {
+      name: r.name,
+      groupId: `${opts.groupId}-${r.name}`,
+      topics: [r.topic],
+      fromBeginning: r.startFrom === 'earliest',
+      eachMessage: (consumer, state) => ({ topic, partition, message }) =>
+        process(consumer, `${opts.groupId}-${r.name}`, topic, partition, message, state),
+      consumer: null,
+      gen: 0,
+      state: newState(),
+    },
+    {
+      name: `${r.name}-retry`,
+      groupId: `${opts.groupId}-${r.name}-retry`,
+      topics: tiers.map((t) => t.topic),
+      // Where the route itself starts: on first deploy the tiers hold no message of this
+      // route's, and after that the group has offsets of its own.
+      fromBeginning: r.startFrom === 'earliest',
+      eachMessage: (consumer, state) => onTier(consumer, `${opts.groupId}-${r.name}-retry`, (origin) => origin === r.topic, state),
+      consumer: null,
+      gen: 0,
+      state: newState(),
+    },
+  ]);
+
+  /** Retried, with a growing wait, until it runs or the dispatcher is stopped or restarted. Never awaited by start(). */
+  async function startRunner(x: Runner, gen: number): Promise<void> {
+    const current = () => gen === generation;
+    let mine: Consumer | null = null;
+    for (let attempt = 1; current(); attempt++) {
+      const consumer = kafka.consumer({ groupId: x.groupId, sessionTimeout: 30_000 });
+      mine = consumer;
+      x.consumer = consumer;
+      x.gen = gen;
+      consumer.on(consumer.events.GROUP_JOIN, () => {
+        if (x.consumer !== consumer) return;
+        x.state.running = true;
+        x.state.crashes = 0;
+        opts.logger.info({ group: x.groupId, topics: x.topics }, `${x.name} running`);
+      });
+      consumer.on(consumer.events.CRASH, ({ payload }) => {
+        if (x.consumer !== consumer) return;
+        counters.crashes += 1;
+        x.state.running = false;
+        x.state.lastError = describe(payload.error);
+        if (payload.restart) {
+          opts.logger.error({ err: payload.error, consumer: x.name }, 'consumer crashed; kafkajs is restarting it');
+          return;
+        }
+        // kafkajs has given up on it. Start it again — never at once: a crash that
+        // recurs, a group the broker refuses or a message that throws every time, would
+        // otherwise be a loop with no wait in it.
+        if (x.gen !== generation) return;
+        x.state.crashes += 1;
+        const waitMs = Math.min(30_000, 1_000 * 2 ** x.state.crashes);
+        opts.logger.error({ err: payload.error, consumer: x.name, waitMs }, `${x.name} stopped; password resets are unaffected; starting it again`);
+        const timer = setTimeout(() => {
+          restartTimers.delete(timer);
+          if (x.gen === generation) void startRunner(x, x.gen);
+        }, waitMs);
+        restartTimers.add(timer);
+      });
+      try {
+        await consumer.connect();
+        if (!current()) break;
+        await consumer.subscribe({ topics: x.topics, fromBeginning: x.fromBeginning });
+        if (!current()) break;
+        await consumer.run({ autoCommit: false, eachMessage: x.eachMessage(consumer, x.state) });
+        if (!current()) break;
+        return;
+      } catch (err) {
+        x.state.lastError = describe(err);
+        const waitMs = Math.min(30_000, 1_000 * 2 ** attempt);
+        opts.logger.error({ err, consumer: x.name, attempt, waitMs }, `${x.name} failed to start; password resets are unaffected; retrying`);
+        await consumer.disconnect().catch(() => {});
+        await sleep(waitMs);
+      }
+    }
+    // Stopped or restarted while starting: leave nothing of this start connected. Its
+    // own consumer, which a newer start has already replaced in `x` if there is one.
+    if (mine) await mine.disconnect().catch(() => {});
   }
 
   function watch(consumer: Consumer, name: string) {
@@ -386,6 +682,7 @@ export function createDispatcher(opts: {
 
   return {
     async start(): Promise<void> {
+      const gen = ++generation;
       await Promise.all([admin.connect(), producer.connect(), main.connect(), retry.connect()]);
       watch(main, 'dispatch');
       watch(retry, 'retry');
@@ -398,43 +695,17 @@ export function createDispatcher(opts: {
         eachMessage: ({ topic, partition, message }) => process(main, opts.groupId, topic, partition, message),
       });
 
-      await retry.run({
-        autoCommit: false,
-        eachMessage: async ({ topic, partition, message }) => {
-          const waitMs = Number(header(message.headers, RETRY_HEADERS.notBefore) ?? '0') - Date.now();
-          if (waitMs > 0) {
-            /**
-             * NOT DUE YET, AND NO SLEEPING HERE. Sleeping in the handler would stop the
-             * poll loop, heartbeats with it, and get the member thrown out of its group.
-             * Instead: pause this partition, seek back to this message, and resume when
-             * it is due. kafkajs marks the message done when this returns, but the seek
-             * moves the fetch position back before the next fetch, and nothing is
-             * committed, so it is read again rather than skipped.
-             */
-            retry.pause([{ topic, partitions: [partition] }]);
-            retry.seek({ topic, partition, offset: message.offset });
-            const timer = setTimeout(() => {
-              resumeTimers.delete(timer);
-              try {
-                retry.resume([{ topic, partitions: [partition] }]);
-              } catch (err) {
-                // A rebalance may have moved the partition elsewhere while it waited.
-                opts.logger.warn({ err, topic, partition }, 'could not resume a retry partition');
-              }
-            }, waitMs);
-            resumeTimers.add(timer);
-            return;
-          }
-          await process(retry, retryGroupId, topic, partition, message);
-        },
-      });
+      // Password resets' retries, and anything on a tier from a topic no route claims,
+      // which is handled here and dead-lettered as having no handler.
+      await retry.run({ autoCommit: false, eachMessage: onTier(retry, retryGroupId, (origin) => !routeTopics.has(origin)) });
 
-      opts.logger.info(
-        { group: opts.groupId, retryGroup: retryGroupId, tiers, startFrom: opts.startFrom },
-        'dispatch running',
-      );
+      opts.logger.info({ group: opts.groupId, retryGroup: retryGroupId, tiers }, 'dispatch running');
+
+      // Last, and not awaited: password resets are flowing before any route is asked for.
+      for (const x of runners) void startRunner(x, gen);
     },
 
+    /** Password resets' backlog: the main group reads nothing else. */
     lag(): Promise<ConsumerLag> {
       return consumerLag(admin, opts.groupId, [DISPATCH_TOPIC]);
     },
@@ -443,11 +714,28 @@ export function createDispatcher(opts: {
       return consumerLag(admin, retryGroupId, tiers.map((t) => t.topic));
     },
 
+    /** One route consumer's backlog, in its own group: `replies`, or `replies-retry` across the tiers. */
+    routeLag(name: string): Promise<ConsumerLag> {
+      const x = runners.find((r) => r.name === name);
+      if (!x) return Promise.reject(new Error(`no route consumer named ${name}`));
+      return consumerLag(admin, x.groupId, x.topics);
+    },
+
+    /** Reported by /ready, never required by it: a route in trouble must not stop password resets being served. */
+    routeHealth(): Array<{ name: string; running: boolean; failing: boolean; lastError: string | null }> {
+      return runners.map((x) => ({ name: x.name, running: x.state.running, failing: x.state.failing, lastError: x.state.lastError }));
+    },
+
     async stop(): Promise<void> {
+      generation += 1;
       health.subscribed = false;
-      for (const timer of resumeTimers) clearTimeout(timer);
+      for (const timer of [...resumeTimers, ...restartTimers]) clearTimeout(timer);
       resumeTimers.clear();
-      await Promise.all([main.disconnect(), retry.disconnect()].map((p) => p.catch(() => {})));
+      restartTimers.clear();
+      await Promise.all(
+        [main.disconnect(), retry.disconnect(), ...runners.map((x) => x.consumer?.disconnect())].map((p) => Promise.resolve(p).catch(() => {})),
+      );
+      for (const x of runners) x.state.running = false;
       await producer.disconnect().catch(() => {});
       await admin.disconnect().catch(() => {});
     },
