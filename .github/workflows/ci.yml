@@ -2223,6 +2223,15 @@ jobs:
       - name: Prove the stack returns an expired seat hold
         run: node scripts/verify-compose-hold-sweeper.mjs
 
+      # Chapter 9's end-to-end smoke, in the containers. Auth's token is verified by
+      # Community with the jwt-public volume's key; relay-community publishes this
+      # run's three outbox rows; Community's own consumer, on the real group, fans the
+      # posts out; and the reader pages the feed with its cursor. The fan-out is
+      # asserted on the FeedEntry rows and the posts' flag, because the feed alone
+      # serves unfanned posts too and would look the same with Kafka broken.
+      - name: Prove Community works across the whole stack
+        run: node scripts/verify-compose-community.mjs
+
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
       # issued, and the symptom is a 401 with no explanation.
