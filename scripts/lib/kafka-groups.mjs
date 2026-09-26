@@ -23,6 +23,25 @@ export async function deleteGroupsWhenEmpty(admin, groupIds, { timeoutMs = 45_00
   }
 }
 
+/**
+ * The groups among these that still have members once they have had time to empty.
+ *
+ * For a verifier that must not run beside a real consumer of the same topic: that
+ * consumer takes the run's messages, or acts on them with its own settings, and the
+ * checks then fail — or pass — on code the run never started. A consumer stopped a
+ * moment ago stays a member until its session times out, so each group gets that long
+ * to empty before it counts as busy. A group the cluster does not know is not busy.
+ */
+export async function busyGroups(admin, groupIds, { timeoutMs = 40_000, stepMs = 2_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { groups } = await admin.describeGroups([...new Set(groupIds)]);
+    const busy = groups.filter((g) => g.members.length > 0).map((g) => g.groupId);
+    if (busy.length === 0 || Date.now() >= deadline) return busy;
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+}
+
 /** The groups among these that the cluster still lists. An unanswered listing counts all of them as still there. */
 async function listed(admin, groupIds) {
   try {
