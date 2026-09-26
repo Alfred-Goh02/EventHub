@@ -8,6 +8,7 @@ import { createSmtpChannel } from './channels/smtp.js';
 import { createCardOpener, createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
 import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/consumer.js';
 import { contactsMetrics, createContactsConsumer } from './contacts/consumer.js';
+import { COMMUNITY_TOPIC, createReplyHandler, replyMetrics } from './dispatch/replies.js';
 import { createSweeper } from './sweeper/index.js';
 import { preferenceRoutes } from './preferences/routes.js';
 
@@ -62,6 +63,9 @@ app.get('/metrics', async (_req, res) => {
   res.json({
     dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null },
     contacts: { ...contactsMetrics(), lag: slow?.contactsLag ?? null },
+    // Why each community message ended as it did. What was sent is in dispatch's
+    // counters, which replies share with password resets.
+    replies: replyMetrics(),
     // Straight from memory: the sweep keeps its own counts and asks the database on
     // its own clock, so a /metrics request never waits on it.
     sweep: sweeper?.metrics() ?? null,
@@ -187,6 +191,22 @@ async function main(): Promise<void> {
     logger,
     open: createSealOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
     channel,
+    routes: [
+      {
+        topic: COMMUNITY_TOPIC,
+        startFrom: env.COMMUNITY_START_FROM,
+        make: (decode) =>
+          createReplyHandler({
+            decode,
+            openCard: createCardOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
+            channel,
+            logger,
+            unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
+            publicUrl: env.NOTIFICATION_PUBLIC_URL,
+            appUrl: env.PUBLIC_APP_URL,
+          }),
+      },
+    ],
     onFatal: (err) => {
       logger.fatal({ err }, 'the dispatch consumer stopped for good; exiting so the process is restarted');
       void prisma.$disconnect().finally(() => process.exit(1));

@@ -1000,6 +1000,18 @@ jobs:
       - name: Assert every address reaches Notification sealed, newest first, and nothing forged gets in
         run: node scripts/verify-contact-cards.mjs
 
+      # Reply emails. A reply Community named someone for reaches the address in their
+      # contact card, once — the same message again is read (the duplicate counter
+      # moves) and sends nothing — with List-Unsubscribe and List-Unsubscribe-Post,
+      # and a token checked against the secret for this tenant, user and category. The
+      # reply's markup arrives escaped. The link taken from the received email, POSTed,
+      # stops the next one. Nobody named, a reply to yourself, a reaction, replies
+      # turned off, no card and a suppressed address each send nothing, each with its
+      # own counter as proof it was read. A reply retried from a tier is routed as a
+      # reply, not decoded as a password reset.
+      - name: Assert a reply reaches the person it answers, once, with a way out
+        run: node scripts/verify-reply-emails.mjs
+
       # A delivery is claimed PENDING before anything is sent, and the ones whose
       # message was dead-lettered stay that way for ever. The sweep ends them, on a
       # credential that crosses tenants and may do nothing else: it cannot create a

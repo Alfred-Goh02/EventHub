@@ -7,7 +7,7 @@ import { PermanentSendError, type EmailChannel } from '../channels/types.js';
 import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
 import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
-import { renderPasswordReset } from './templates.js';
+import { renderPasswordReset, type RenderedEmail } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
 
@@ -64,7 +64,7 @@ export function dispatchHealth(): { consuming: boolean; failing: boolean; stoppe
 }
 
 /** Network and registry failures that are not the message's fault. The same rule as Analytics' ingest. */
-function isTransient(err: unknown): boolean {
+export function isTransient(err: unknown): boolean {
   const text = err instanceof Error ? `${err.name} ${err.message}` : String(err);
   const status = (err as { status?: number })?.status;
   return (
@@ -74,7 +74,7 @@ function isTransient(err: unknown): boolean {
 }
 
 /** One line for an operator; well-formed, because part of it can be the message's own bytes. */
-const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 500).toWellFormed();
+export const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 500).toWellFormed();
 
 const envelopeSchema = z.object({
   messageId: z.string().min(1),
@@ -92,6 +92,11 @@ export type Outcome =
   | { kind: 'rejected' }
   /** The address is on the suppression list. Recorded, and nothing sent. */
   | { kind: 'suppressed' }
+  /**
+   * Nothing to send, by design: a message on a shared topic that is not for this
+   * service, or a reply to someone who asked not to be told. Final, and committed.
+   */
+  | { kind: 'skipped'; why: string }
   /** Will never succeed. Straight to the dead-letter topic. */
   | { kind: 'poison'; reason: string }
   /** May succeed later. To the next retry tier. */
@@ -102,6 +107,89 @@ export interface MessageHandlerOptions {
   open: (envelope: EmailRequestEnvelope) => Promise<OpenedEmailRequest>;
   channel: EmailChannel;
   logger: Logger;
+}
+
+/** One message, decoded to the point of knowing whom to send what. See deliver(). */
+export interface PreparedDelivery {
+  key: DeliveryKey;
+  /** For the sent-log. */
+  category: string;
+  templateKey: string;
+  to: string;
+  email: RenderedEmail;
+  headers: Record<string, string>;
+  /** Identifiers only — never an address or a link — for every log line about it. */
+  ids: Record<string, string>;
+  /** What the log says once it is sent. */
+  sentMessage: string;
+}
+
+/**
+ * Claim, check the suppression list, send, record: the half of every email that does
+ * not depend on what kind of email it is. One copy, so a reply and a password reset
+ * cannot drift apart on the part that decides whether mail goes out twice.
+ *
+ * THE ORDER IS THE DESIGN, and createMessageHandler explains it; this is steps 3 to 5.
+ */
+export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel; logger: Logger }): Promise<Outcome> {
+  const transient = (err: unknown): Outcome => {
+    counters.transientFailures += 1;
+    return { kind: 'transient', error: describe(err) };
+  };
+
+  let claim;
+  try {
+    claim = await claimDelivery({ ...p.key, category: p.category, templateKey: p.templateKey });
+  } catch (err) {
+    return transient(err);
+  }
+  if (!claim.claimed && claim.status !== 'PENDING') {
+    counters.duplicates += 1;
+    opts.logger.info({ ...p.ids, status: claim.status }, 'already delivered; skipped');
+    return { kind: 'duplicate' };
+  }
+
+  let suppressed: boolean;
+  try {
+    suppressed = await suppressIfListed(p.key, p.to);
+  } catch (err) {
+    return transient(err);
+  }
+  if (suppressed) {
+    counters.suppressed += 1;
+    opts.logger.warn(p.ids, 'the address is on the suppression list; recorded SUPPRESSED and not sent');
+    return { kind: 'suppressed' };
+  }
+
+  try {
+    const result = await opts.channel.send({ to: p.to, ...p.email, headers: p.headers });
+    await markSent(p.key, result.providerMessageId);
+    counters.sent += 1;
+    opts.logger.info(p.ids, p.sentMessage);
+    return { kind: 'sent' };
+  } catch (err) {
+    if (err instanceof PermanentSendError) {
+      let recorded: { suppressionAdded: boolean };
+      try {
+        recorded = await markFailed(
+          p.key,
+          describe(err),
+          err.addressDoesNotExist && err.status ? { address: p.to, status: err.status } : undefined,
+        );
+      } catch (recordErr) {
+        return transient(recordErr);
+      }
+      counters.rejected += 1;
+      if (recorded.suppressionAdded) counters.suppressionsAdded += 1;
+      opts.logger.warn(
+        { ...p.ids, reason: describe(err), suppressionAdded: recorded.suppressionAdded },
+        'the provider refused the email; recorded as FAILED',
+      );
+      return { kind: 'rejected' };
+    }
+    await recordAttempt(p.key, describe(err)).catch(() => {});
+    return transient(err);
+  }
 }
 
 /**
@@ -177,71 +265,19 @@ export function createMessageHandler(opts: MessageHandlerOptions): (value: Buffe
       return transient(err);
     }
 
-    const key: DeliveryKey = {
-      tenantId: opened.tenantId,
-      sourceMessageId: envelope.messageId,
-      recipientId: opened.userId,
-      channel: 'email',
-    };
-
-    let claim;
-    try {
-      claim = await claimDelivery({ ...key, category: 'account', templateKey: 'password-reset' });
-    } catch (err) {
-      return transient(err);
-    }
-    if (!claim.claimed && claim.status !== 'PENDING') {
-      counters.duplicates += 1;
-      opts.logger.info({ ...ids, status: claim.status }, 'already delivered; skipped');
-      return { kind: 'duplicate' };
-    }
-
-    let suppressed: boolean;
-    try {
-      suppressed = await suppressIfListed(key, opened.email);
-    } catch (err) {
-      return transient(err);
-    }
-    if (suppressed) {
-      counters.suppressed += 1;
-      opts.logger.warn(ids, 'the address is on the suppression list; recorded SUPPRESSED and not sent');
-      return { kind: 'suppressed' };
-    }
-
-    const email = renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt });
-    try {
-      const result = await opts.channel.send({
+    return deliver(
+      {
+        key: { tenantId: opened.tenantId, sourceMessageId: envelope.messageId, recipientId: opened.userId, channel: 'email' },
+        category: 'account',
+        templateKey: 'password-reset',
         to: opened.email,
-        ...email,
+        email: renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt }),
         headers: { 'X-EventHub-Message-Id': envelope.messageId },
-      });
-      await markSent(key, result.providerMessageId);
-      counters.sent += 1;
-      opts.logger.info(ids, 'password reset email sent');
-      return { kind: 'sent' };
-    } catch (err) {
-      if (err instanceof PermanentSendError) {
-        let recorded: { suppressionAdded: boolean };
-        try {
-          recorded = await markFailed(
-            key,
-            describe(err),
-            err.addressDoesNotExist && err.status ? { address: opened.email, status: err.status } : undefined,
-          );
-        } catch (recordErr) {
-          return transient(recordErr);
-        }
-        counters.rejected += 1;
-        if (recorded.suppressionAdded) counters.suppressionsAdded += 1;
-        opts.logger.warn(
-          { ...ids, reason: describe(err), suppressionAdded: recorded.suppressionAdded },
-          'the provider refused the email; recorded as FAILED',
-        );
-        return { kind: 'rejected' };
-      }
-      await recordAttempt(key, describe(err)).catch(() => {});
-      return transient(err);
-    }
+        ids,
+        sentMessage: 'password reset email sent',
+      },
+      opts,
+    );
   };
 }
 
@@ -255,6 +291,17 @@ export function createDispatcher(opts: {
   logger: Logger;
   open: MessageHandlerOptions['open'];
   channel: EmailChannel;
+  /**
+   * Other topics this dispatcher sends email for, each with its own handler and its
+   * own starting point. They share the sent-log, the retry tiers and the dead-letter
+   * topic with password resets — one pipeline, so they cannot drift apart on whether
+   * mail goes out twice.
+   */
+  routes?: Array<{
+    topic: string;
+    startFrom: 'earliest' | 'latest';
+    make: (decode: MessageHandlerOptions['decode']) => (value: Buffer | null) => Promise<Outcome>;
+  }>;
   /** Called when kafkajs stops a consumer for good. The caller exits. */
   onFatal: (err: unknown) => void;
 }) {
@@ -271,15 +318,29 @@ export function createDispatcher(opts: {
   const admin = kafka.admin();
   const resumeTimers = new Set<NodeJS.Timeout>();
 
-  const handle = createMessageHandler({
-    decode: async (value) => {
-      if (value === null) throw new Error('null value (a tombstone)');
-      return registry.decode(value);
-    },
-    open: opts.open,
-    channel: opts.channel,
-    logger: opts.logger,
-  });
+  const decode: MessageHandlerOptions['decode'] = async (value) => {
+    if (value === null) throw new Error('null value (a tombstone)');
+    return registry.decode(value);
+  };
+
+  /**
+   * One handler per topic this dispatcher reads. A message is handled by the handler
+   * for the topic it ORIGINALLY came from — the retry tiers carry messages from every
+   * route, and a reply retried from a tier must not be decoded as a password reset.
+   */
+  const routes = [
+    { topic: DISPATCH_TOPIC, startFrom: opts.startFrom, handle: createMessageHandler({ decode, open: opts.open, channel: opts.channel, logger: opts.logger }) },
+    ...(opts.routes ?? []).map((r) => ({ topic: r.topic, startFrom: r.startFrom, handle: r.make(decode) })),
+  ];
+  const handlers = new Map(routes.map((r) => [r.topic, r.handle]));
+  async function handle(originalTopic: string, value: Buffer | null): Promise<Outcome> {
+    const handler = handlers.get(originalTopic);
+    if (!handler) {
+      counters.poison += 1;
+      return { kind: 'poison', reason: `no handler for messages from ${originalTopic}` };
+    }
+    return handler(value);
+  }
 
   /**
    * Hands a failed message on: to the next retry tier, or to the dead-letter topic
@@ -353,7 +414,16 @@ export function createDispatcher(opts: {
   /** Handle, forward if it failed, and only then commit. A throw leaves the offset where it was. */
   async function process(consumer: Consumer, consumerGroup: string, topic: string, partition: number, message: KafkaMessage) {
     try {
-      const outcome = await handle(message.value);
+      /**
+       * Where the message first came from. forward() always stamps it on a message it
+       * moves to a tier; one on a tier WITHOUT it predates routes, when everything on
+       * the tiers was a password reset, and is handled as one — the retry and
+       * suppression verifiers' canaries are exactly that, and failed their control
+       * until this fallback existed.
+       */
+      const originalTopic =
+        header(message.headers, RETRY_HEADERS.originalTopic) ?? (tiers.some((t) => t.topic === topic) ? DISPATCH_TOPIC : topic);
+      const outcome = await handle(originalTopic, message.value);
       if (outcome.kind === 'poison' || outcome.kind === 'transient') {
         await forward({ topic, partition, message }, outcome, consumerGroup);
       }
@@ -389,7 +459,10 @@ export function createDispatcher(opts: {
       await Promise.all([admin.connect(), producer.connect(), main.connect(), retry.connect()]);
       watch(main, 'dispatch');
       watch(retry, 'retry');
-      await main.subscribe({ topic: DISPATCH_TOPIC, fromBeginning: opts.startFrom === 'earliest' });
+      // One subscribe per route, because each chooses where a new group starts: a reset
+      // queued before the service first ran is still worth sending, a week of old
+      // replies on first deploy is not.
+      for (const r of routes) await main.subscribe({ topic: r.topic, fromBeginning: r.startFrom === 'earliest' });
       await retry.subscribe({ topics: tiers.map((t) => t.topic), fromBeginning: opts.startFrom === 'earliest' });
       health.subscribed = true;
 
@@ -430,13 +503,14 @@ export function createDispatcher(opts: {
       });
 
       opts.logger.info(
-        { group: opts.groupId, retryGroup: retryGroupId, tiers, startFrom: opts.startFrom },
+        { group: opts.groupId, retryGroup: retryGroupId, tiers, routes: routes.map((r) => `${r.topic} (${r.startFrom})`) },
         'dispatch running',
       );
     },
 
+    /** Across every topic the main group reads: it is one group, so one backlog. */
     lag(): Promise<ConsumerLag> {
-      return consumerLag(admin, opts.groupId, [DISPATCH_TOPIC]);
+      return consumerLag(admin, opts.groupId, routes.map((r) => r.topic));
     },
 
     retryLag(): Promise<ConsumerLag> {

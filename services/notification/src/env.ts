@@ -31,6 +31,19 @@ const notificationEnvSchema = z.object({
    * every unsubscribe link already sent, which the law requires to keep working.
    */
   UNSUBSCRIBE_SECRET: z.string().min(32),
+  /**
+   * Where this service answers /unsubscribe, as a reader's mail client reaches it:
+   * the origin every unsubscribe link and List-Unsubscribe header points at.
+   */
+  NOTIFICATION_PUBLIC_URL: z.string().url().default('http://localhost:3007'),
+  /** Where the web app shows a post, for the link in a reply email. Auth's reset links use the same name. */
+  PUBLIC_APP_URL: z.string().url().default('http://localhost:3000'),
+  /**
+   * Where a new dispatch group starts on community.feed. latest, unlike password
+   * resets: on first deploy, earliest would email everyone about a week of replies
+   * that were long since read.
+   */
+  COMMUNITY_START_FROM: z.enum(['earliest', 'latest']).default('latest'),
   /** One group per deployment. Verifiers run their own, so they never take its partitions. */
   KAFKA_CONSUMER_GROUP: z.string().min(1).default('notification-dispatch'),
   /**
