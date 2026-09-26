@@ -15,7 +15,10 @@
  *   - A tampered token is refused and changes nothing — another user's id under the
  *     original signature, a changed signature, a correctly signed token for a password
  *     reset, and garbage. The control is the untampered token working.
- *   - A production process refuses to start with the public development secret.
+ *   - A production process refuses to start with the public development secret, and
+ *     with either public origin on plain http — the example's, which is localhost. Its
+ *     message names each one it refused, and the control is the same process starting
+ *     once both are https and the secret is its own.
  *
  * Tokens are signed here with the working tree's keys and the example secret, the
  * same way Auth and Notification make them.
@@ -252,11 +255,34 @@ async function main() {
     exitCode !== 'still running' && exitCode !== 0 && production.log().includes('UNSUBSCRIBE_SECRET is the development value'),
     `it refuses to start, and says why (exit ${exitCode})`,
   );
-  const control = start({ ...notificationEnv, NODE_ENV: 'production', PORT: String(PORT + 1), UNSUBSCRIBE_SECRET: randomBytes(32).toString('hex') });
+  const ownSecret = randomBytes(32).toString('hex');
+
+  // The example's origins are http://localhost: every unsubscribe link would point at
+  // the reader's own machine, in mail that is on by default.
+  console.log('  nor with public origins a reader cannot reach');
+  const plain = start({ ...notificationEnv, NODE_ENV: 'production', PORT: String(PORT + 1), UNSUBSCRIBE_SECRET: ownSecret });
+  const plainExit = await Promise.race([plain.exited, sleep(30_000).then(() => 'still running')]);
+  if (plainExit === 'still running') plain.child.kill();
+  // Anchored on "Error:": the stack trace also prints the throwing line of source, whose
+  // template text would match a looser pattern and name nothing.
+  const refusal = plain.log().match(/Error: refusing to start: (.+?) must be https/)?.[1] ?? '';
+  check(
+    plainExit !== 'still running' && plainExit !== 0 && refusal.includes('NOTIFICATION_PUBLIC_URL') && refusal.includes('PUBLIC_APP_URL'),
+    `it refuses to start, naming both (exit ${plainExit}: ${refusal || 'no such message'})`,
+  );
+
+  const control = start({
+    ...notificationEnv,
+    NODE_ENV: 'production',
+    PORT: String(PORT + 1),
+    UNSUBSCRIBE_SECRET: ownSecret,
+    NOTIFICATION_PUBLIC_URL: 'https://notify.example',
+    PUBLIC_APP_URL: 'https://app.example',
+  });
   const controlUp = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT + 1}/health`)).ok, 60_000, 500);
   control.child.kill();
   await control.exited;
-  check(Boolean(controlUp), 'CONTROL: with a secret of its own, the same production process starts');
+  check(Boolean(controlUp), 'CONTROL: with a secret of its own and https origins, the same production process starts');
 
   let deleted = 0;
   for (const tenant of [TENANT, OTHER]) {
