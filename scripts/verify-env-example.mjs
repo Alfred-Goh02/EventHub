@@ -29,6 +29,11 @@
  * step. Supplying it here is the same thing the setup instructions tell a human
  * to do. Every other variable comes from the example file untouched.
  *
+ * AND THE OTHER DIRECTION, FOR AUTH: the example is a laptop's configuration, and
+ * Auth run from it as production must refuse. Its PUBLIC_APP_URL is localhost,
+ * and a production Auth that kept it would email every password-reset link
+ * pointing at the reader's own machine. See authInProduction below.
+ *
  * Run: node scripts/verify-env-example.mjs
  */
 
@@ -65,7 +70,10 @@ const KEY_PATH = join('services', 'auth', 'keys', 'public.pem');
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -170,6 +178,115 @@ async function bootFromExample(svc, publicKeyB64) {
   await sleep(500);
 }
 
+/** Away from the scratch ports above, so a straggler there cannot answer for it. */
+const AUTH_PRODUCTION_PORT = 3911;
+
+/** Auth from its .env.example and nothing else, as production, plus `overrides`. */
+function startAuthInProduction(overrides) {
+  const dir = join('services', 'auth');
+  const child = spawn(process.execPath, ['dist/index.js'], {
+    cwd: dir,
+    env: {
+      PATH: process.env['PATH'],
+      SystemRoot: process.env['SystemRoot'],
+      ...parseEnvFile(join(dir, '.env.example')),
+      NODE_ENV: 'production',
+      PORT: String(AUTH_PRODUCTION_PORT),
+      ...overrides,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (c) => (output += c));
+  child.stderr.on('data', (c) => (output += c));
+  const proc = { child, code: undefined, log: () => output };
+  // 'close', not 'exit': it fires once the output has been read to the end, so the
+  // refusal is in log() by the time anything looks for it.
+  proc.exited = new Promise((resolve) =>
+    child.on('close', (code) => {
+      proc.code = code;
+      resolve(code);
+    }),
+  );
+  return proc;
+}
+
+/** Whichever comes first: the process exits, or it answers /health. */
+async function exitOrListen(proc, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (proc.code !== undefined) return { exit: proc.code };
+    try {
+      if ((await fetch(`http://localhost:${AUTH_PRODUCTION_PORT}/health`)).ok) return { listening: true };
+    } catch {
+      // not listening
+    }
+    await sleep(250);
+  }
+  return {};
+}
+
+/**
+ * Auth, as production, from the same example: it must refuse the example's origin.
+ *
+ * PUBLIC_APP_URL is where every invite and password-reset link points, and the
+ * example's is http://localhost:3000 -- right on a laptop. A production Auth that
+ * forgot to set it would start, seal every reset link to the reader's own machine,
+ * and email it; password reset would be broken for everyone, and nothing would say
+ * so. So Auth refuses to start under NODE_ENV=production unless it is https, and
+ * this boots it exactly the way a forgetful deployment would: the example, and
+ * NODE_ENV=production, and nothing else.
+ *
+ * The control is the same process given an https origin, which must start. Without
+ * it, a guard that refused every production boot, for any reason, would pass.
+ */
+async function authInProduction() {
+  const example = parseEnvFile(join('services', 'auth', '.env.example'));
+
+  /**
+   * The control below is "something answered /health on this port", so first make
+   * sure nothing already does. A leftover process here would make a refusal look
+   * like a start, and a broken start look like a working control.
+   */
+  const taken = await fetch(`http://localhost:${AUTH_PRODUCTION_PORT}/health`).then(() => true, () => false);
+  check(!taken, taken ? `something is already listening on :${AUTH_PRODUCTION_PORT} -- stop it, then rerun` : `:${AUTH_PRODUCTION_PORT} is free`);
+  if (taken) return;
+
+  const refused = startAuthInProduction({});
+  try {
+    const outcome = await exitOrListen(refused, 30_000);
+    // Anchored on "Error:". The stack trace also prints the throwing line of source,
+    // and a looser pattern would match that instead of the message.
+    const named = refused.log().match(/Error: refusing to start: (.+?) must be https/)?.[1] ?? '';
+    check(
+      outcome.exit !== undefined && outcome.exit !== 0 && named.includes('PUBLIC_APP_URL'),
+      `with the example's PUBLIC_APP_URL (${example['PUBLIC_APP_URL'] ?? 'absent'}), a production auth refuses to ` +
+        `start and names it (${outcome.listening ? 'it STARTED' : `exit ${outcome.exit ?? 'none'}`}: ${named || 'no such message'})`,
+    );
+  } finally {
+    refused.child.kill();
+    await refused.exited;
+  }
+
+  const control = startAuthInProduction({ PUBLIC_APP_URL: 'https://app.eventhub.example' });
+  try {
+    const outcome = await exitOrListen(control, 30_000);
+    // Still ours: it answered, and it is the process this started, still running.
+    const ours = outcome.listening === true && control.code === undefined;
+    const lines = control.log().trim().split(/\r?\n/);
+    const reason = lines.find((l) => /^(Error|[A-Za-z]*Error):/.test(l.trim())) ?? lines.slice(0, 3).join(' | ');
+    check(
+      ours,
+      ours
+        ? 'CONTROL: with an https PUBLIC_APP_URL, the same production process starts'
+        : `CONTROL: with an https PUBLIC_APP_URL, the production process did NOT start (exit ${outcome.exit ?? 'none'}): ${reason}`,
+    );
+  } finally {
+    control.child.kill();
+    await control.exited;
+  }
+}
+
 async function main() {
   console.log('  booting every service from its .env.example and nothing else');
   console.log('');
@@ -215,11 +332,17 @@ async function main() {
   }
 
   console.log('');
+  console.log("  and auth, as production, refuses the example's localhost origin");
+  console.log('');
+  await authInProduction();
+
+  console.log('');
   if (failures > 0) {
     console.error(`FAIL: ${failures} assertion(s) failed`);
     process.exit(1);
   }
-  console.log('every service starts from the configuration its .env.example documents');
+  console.log('every service starts from the configuration its .env.example documents,');
+  console.log("and auth will not run in production on the example's origin");
 }
 
 main().catch((err) => {

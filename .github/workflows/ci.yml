@@ -1108,15 +1108,23 @@ jobs:
       # A comment saying "never enable this in production" is not a control.
       # Refusing to boot is. Same shape as the relay and ticketing refuse-to-start
       # checks.
+      #
+      # PUBLIC_APP_URL is https so that the sink is the only reason left to refuse:
+      # production also refuses a plain-http origin, and without one this step went
+      # green on THAT refusal with the sink's check deleted. The grep names the sink
+      # for the same reason. timeout, so a service that starts fails the step rather
+      # than hanging it.
       - name: Assert the dev token sink cannot run in production
         working-directory: services/auth
         run: |
           set +e
-          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PORT=3098 node dist/index.js > /tmp/sink.log 2>&1
+          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PUBLIC_APP_URL=https://app.eventhub.example PORT=3098 \
+            timeout 60 node dist/index.js > /tmp/sink.log 2>&1
           CODE=$?
           set -e
-          test "$CODE" != "0" || { echo "the service started with the dev sink enabled in production"; exit 1; }
-          grep -q "refusing to start" /tmp/sink.log \
+          test "$CODE" != "0" && test "$CODE" != "124" \
+            || { echo "the service started with the dev sink enabled in production:"; cat /tmp/sink.log; exit 1; }
+          grep -q "Error: refusing to start: AUTH_DEV_TOKEN_SINK" /tmp/sink.log \
             || { echo "exited non-zero but not for the right reason:"; cat /tmp/sink.log; exit 1; }
           echo "correctly refused to start"
 
@@ -1837,6 +1845,19 @@ jobs:
           RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
         run: node scripts/verify-relay-e2e.mjs
 
+      # occurredAt is the outbox row's createdAt, whatever zone the relay runs in.
+      # It was not: pg parses the timestamp-without-time-zone column as LOCAL time
+      # and the relay published toISOString() of that, so a relay pass on a UTC+8
+      # host stamped every message eight hours early. This runner is UTC, where the
+      # two agree, so the pass runs in a child with TZ=Asia/Kathmandu and asserts it
+      # really ran at +05:45 -- without that, this step could never go red here.
+      # Compared with Postgres's own rendering, as a string and in SQL.
+      - name: Assert the relay publishes createdAt as occurredAt in any time zone
+        env:
+          EVENT_APP_DATABASE_URL: ${{ env.EVENT_APP_DATABASE_URL }}
+          RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@localhost:5432/eventhub_event
+        run: node scripts/verify-relay-occurred-at.mjs
+
       # Reads back everything on events.activity and asserts, on the WIRE, the
       # four properties the projection's safety rests on. This was a hand-run
       # demo script; nothing invoked it, and one of its checks could not fail.
@@ -1850,6 +1871,11 @@ jobs:
       # which is the only scope Kafka's ordering guarantee has. They were true
       # only because the topic held one event's updates when it was written, and
       # go red on any topic with several -- correct traffic reported as broken.
+      #
+      # The ordering check reads only what the RELAY published. Over the whole
+      # topic it failed on the stale snapshots verify-search-indexer.mjs
+      # publishes on purpose, red or green by whether the log cleaner had
+      # compacted them yet -- run 35524988941 failed a Community-only PR on it.
       #
       # Placed after the relay e2e so there is real relayed traffic to read.
       - name: Assert the wire holds the properties the projection depends on
