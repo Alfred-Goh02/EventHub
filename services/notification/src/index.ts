@@ -5,8 +5,9 @@ import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
 import { createSmtpChannel } from './channels/smtp.js';
-import { createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
+import { createCardOpener, createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
 import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/consumer.js';
+import { contactsMetrics, createContactsConsumer } from './contacts/consumer.js';
 import { createSweeper } from './sweeper/index.js';
 import { preferenceRoutes } from './preferences/routes.js';
 
@@ -17,11 +18,16 @@ import { preferenceRoutes } from './preferences/routes.js';
  * this service's private key and believed only if Auth's signature verifies. The
  * delivery is claimed in the sent-log before anything is sent, and the email goes
  * out over SMTP, which is Mailpit locally.
+ *
+ * It also keeps a copy of every user's contact card from auth.user-contact — sealed
+ * the same way, verified the same way, and stored still sealed — for the emails that
+ * are not credentials and so carry no address of their own.
  */
 const logger = createLogger('notification-service');
 
 const channel = createSmtpChannel({ host: env.SMTP_HOST, port: env.SMTP_PORT, from: env.EMAIL_FROM });
 let dispatcher: ReturnType<typeof createDispatcher> | null = null;
+let contacts: ReturnType<typeof createContactsConsumer> | null = null;
 let sweeper: ReturnType<typeof createSweeper> | null = null;
 
 const app = express();
@@ -43,14 +49,19 @@ const bounded = <T>(work: Promise<T>): Promise<T | { error: string }> =>
  * brokers, so it is cached for five seconds and bounded at two, as Analytics'
  * ingest does: a /metrics request must never be the thing that hangs when Kafka does.
  */
-let slow: { at: number; lag: unknown; retryLag: unknown } | null = null;
+let slow: { at: number; lag: unknown; retryLag: unknown; contactsLag: unknown } | null = null;
 app.get('/metrics', async (_req, res) => {
   if (dispatcher && (slow === null || Date.now() - slow.at > 5_000)) {
-    const [lag, retryLag] = await Promise.all([bounded(dispatcher.lag()), bounded(dispatcher.retryLag())]);
-    slow = { at: Date.now(), lag, retryLag };
+    const [lag, retryLag, contactsLag] = await Promise.all([
+      bounded(dispatcher.lag()),
+      bounded(dispatcher.retryLag()),
+      contacts ? bounded(contacts.lag()) : Promise.resolve(null),
+    ]);
+    slow = { at: Date.now(), lag, retryLag, contactsLag };
   }
   res.json({
     dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null },
+    contacts: { ...contactsMetrics(), lag: slow?.contactsLag ?? null },
     // Straight from memory: the sweep keeps its own counts and asks the database on
     // its own clock, so a /metrics request never waits on it.
     sweep: sweeper?.metrics() ?? null,
@@ -83,6 +94,13 @@ app.get('/ready', async (_req, res) => {
     ready,
     database,
     consumer: consuming,
+    /**
+     * REPORTED, NOT REQUIRED. A stalled contact-card copy leaves addresses stale for
+     * emails that are not credentials; password resets carry their own sealed address
+     * and do not read it. Refusing all traffic over it would turn a degradation into
+     * an outage of the one email that must always go.
+     */
+    contacts: contactsMetrics().running,
     smtp: smtp.ok,
     smtpError: smtp.error,
     failing,
@@ -104,15 +122,19 @@ const errorHandler: express.ErrorRequestHandler = (err, _req, res, _next) => {
   res.status(500).json({ error: 'internal error' });
 };
 
-async function startDispatcher(d: NonNullable<typeof dispatcher>): Promise<void> {
+/**
+ * Started, not awaited into the listen, and retried for ever: a broker slow to answer
+ * at boot must not leave a consumer dead behind a process that looks healthy.
+ */
+async function startConsumer(name: string, c: { start(): Promise<void>; stop(): Promise<void> }): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
-      await d.start();
+      await c.start();
       return;
     } catch (err) {
       const waitMs = Math.min(30_000, 1_000 * 2 ** attempt);
-      logger.error({ err, attempt, waitMs }, 'dispatch failed to start; retrying');
-      await d.stop();
+      logger.error({ err, attempt, waitMs }, `${name} failed to start; retrying`);
+      await c.stop();
       await sleep(waitMs);
     }
   }
@@ -125,8 +147,8 @@ async function shutdown(signal: string): Promise<void> {
   // database connection goes. Each step is timed: compose kills the container after
   // its grace period, and a consumer killed that way stays in its group until its
   // session times out.
-  await dispatcher?.stop();
-  logger.info({ ms: Date.now() - started }, 'dispatch consumers stopped');
+  await Promise.all([dispatcher?.stop(), contacts?.stop()]);
+  logger.info({ ms: Date.now() - started }, 'dispatch and contact consumers stopped');
   await sweeper?.stop();
   await prisma.$disconnect().catch(() => {});
   logger.info({ ms: Date.now() - started }, 'shut down');
@@ -171,6 +193,14 @@ async function main(): Promise<void> {
     },
   });
 
+  contacts = createContactsConsumer({
+    brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),
+    registryUrl: env.SCHEMA_REGISTRY_URL,
+    groupId: env.CONTACTS_CONSUMER_GROUP,
+    logger,
+    openCard: createCardOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
+  });
+
   sweeper = createSweeper({
     databaseUrl: env.SWEEPER_DATABASE_URL,
     intervalMs: env.SWEEP_INTERVAL_MS,
@@ -182,7 +212,8 @@ async function main(): Promise<void> {
   app.listen(env.PORT, () => {
     logger.info(`notification-service listening on port ${env.PORT}`);
   });
-  void startDispatcher(dispatcher);
+  void startConsumer('dispatch', dispatcher);
+  void startConsumer('the contact card consumer', contacts);
   // Awaited, so a sweeper credential that can do more than sweep stops the service
   // here rather than being discovered by someone reading grants later.
   await sweeper.start();

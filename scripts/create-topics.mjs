@@ -96,6 +96,37 @@ const TOPICS = [
     note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
   },
   {
+    topic: 'auth.user-contact',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // COMPACTED: the latest contact card per user, kept for as long as the user has
+    // one, so a consumer deployed later reads every card from the beginning instead
+    // of only those issued inside a retention window.
+    //
+    // Keyed by tenantId:userId, never the user id alone. Compaction keeps the last
+    // record PER KEY, so a key without the tenant would let one tenant's card erase
+    // another's under a colliding id, silently and only after the cleaner ran.
+    //
+    // delete.retention.ms is how long a tombstone survives compaction. A withdrawn
+    // card must reach a consumer that was down when it happened, so a week — the
+    // same weekend-sized outage community.feed allows — not the broker's one day.
+    configEntries: [
+      { name: 'cleanup.policy', value: 'compact' },
+      { name: 'delete.retention.ms', value: '604800000' },
+    ],
+    note: "Sealed contact cards from Auth, for Notification. Keyed by tenantId:userId; the latest card per user.",
+  },
+  {
+    topic: 'auth.user-contact.dlq',
+    numPartitions: 3,
+    replicationFactor: 1,
+    // Kept forever, like every dead-letter topic here: a card Notification can never
+    // accept — a seal that does not open, a signature that does not verify — is for
+    // a person to look at, and there are only ever as many as there are forgeries.
+    configEntries: [{ name: 'retention.ms', value: '-1' }],
+    note: 'Contact cards Notification could never accept. Inspect them; a forged card is a security event.',
+  },
+  {
     topic: 'community.feed',
     numPartitions: 3,
     replicationFactor: 1,
