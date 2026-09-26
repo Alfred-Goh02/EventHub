@@ -181,10 +181,10 @@ async function main() {
    * down to the closing v99, and passed (39 read).
    *
    * Reproduced on a scratch topic with this topic's configs. v2, v1, v3 on one
-   * key, no header: red. 83 s later with nothing appended: still red, because
-   * the active segment is never cleaned. One append to roll it, the cleaner
-   * rewrote the closed segment within 16 s, and the same check read the same
-   * topic green.
+   * key, no header: red. 83 s later with nothing appended, all three were still
+   * there, because the active segment is never cleaned. One append to roll it,
+   * the cleaner rewrote the closed segment within 16 s, and the same check read
+   * the same topic green.
    *
    * SO IT IS SCOPED TO WHAT IT EXISTS TO TEST: THE RELAY'S ORDERING. Per key, the
    * messages carrying the relay's message-id header are compared with each
