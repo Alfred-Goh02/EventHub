@@ -501,6 +501,80 @@ async function main() {
     );
 
     console.log('');
+    console.log('  a comment names whom it answers, and only someone who can still read it');
+    /**
+     * Every "nobody" case below has a "somebody" case beside it: a service that never
+     * set recipientId at all would pass every null check, so the ones that must be a
+     * person are what make the nulls mean anything.
+     */
+    const comment = async (bearer, body, parentId, onPost = postId) =>
+      (await api(`/posts/${onPost}/comments`, { method: 'POST', bearer, body: { body, ...(parentId ? { parentId } : {}) } })).body?.id;
+    const B = `u_banned_${RUN}`;
+    const L = `u_leaver_${RUN}`;
+    for (const who of [B, L]) await api(`/spaces/${spaceId}/join`, { method: 'POST', bearer: token(TENANT, who) });
+    const toPost = await comment(asReader, `answers the post ${RUN}`);
+    const toReader = await comment(asAuthor, `answers the reader ${RUN}`, toPost);
+    const toSelf = await comment(asReader, `answers themselves ${RUN}`, toPost);
+    const byBanned = await comment(token(TENANT, B), `before the ban ${RUN}`);
+    const byLeaver = await comment(token(TENANT, L), `before leaving ${RUN}`);
+    const banned = await api(`/spaces/${spaceId}/members/${B}`, { method: 'PATCH', bearer: asAuthor, body: { status: 'BANNED' } });
+    const left = await api(`/spaces/${spaceId}/members/me`, { method: 'DELETE', bearer: token(TENANT, L) });
+    const toBanned = await comment(asAuthor, `answers the banned ${RUN}`, byBanned);
+    const toLeaver = await comment(asAuthor, `answers the one who left a public space ${RUN}`, byLeaver);
+
+    // A private space: its owner, and a member added the only way a private space has
+    // one today — there is no invite yet — who comments, is answered, then leaves.
+    const P_OWNER = `u_private_owner_${RUN}`;
+    const P_MEMBER = `u_private_member_${RUN}`;
+    const asPOwner = token(TENANT, P_OWNER);
+    const privateSpace = (await api('/spaces', { method: 'POST', bearer: asPOwner, body: { slug: `private-${RUN}`, name: 'Private', visibility: 'PRIVATE' } })).body?.id;
+    await inTenant(owner, TENANT, `INSERT INTO "Membership" (id, "tenantId", "spaceId", "userId", role, status) VALUES ($1, $2, $3, $4, 'MEMBER', 'ACTIVE')`, [`m_private_${RUN}`, TENANT, privateSpace, P_MEMBER]);
+    const privatePost = (await api(`/spaces/${privateSpace}/posts`, { method: 'POST', bearer: asPOwner, body: { body: `private ${RUN}` } })).body?.id;
+    const byMember = await comment(token(TENANT, P_MEMBER), `a member speaks ${RUN}`, null, privatePost);
+    const toMember = await comment(asPOwner, `answers the member ${RUN}`, byMember, privatePost);
+    const memberLeft = await api(`/spaces/${privateSpace}/members/me`, { method: 'DELETE', bearer: token(TENANT, P_MEMBER) });
+    const toFormerMember = await comment(asPOwner, `answers them after they left ${RUN}`, byMember, privatePost);
+    check(
+      [toPost, toReader, toSelf, byBanned, byLeaver, toBanned, toLeaver, privateSpace, privatePost, byMember, toMember, toFormerMember].every(Boolean) &&
+        banned.status === 200 && left.status === 204 && memberLeft.status === 204,
+      `CONTROL: the fixture — comments written, one member banned, one left a public space, one left a private one (${banned.status}, ${left.status}, ${memberLeft.status})`,
+    );
+
+    const recipients = Object.fromEntries(
+      (await inTenant(
+        owner,
+        TENANT,
+        `SELECT payload->>'commentId' AS "commentId", payload->>'recipientId' AS "recipientId", id
+           FROM "OutboxMessage" WHERE "tenantId" = $1 AND "eventType" = 'community.comment_created'`,
+        [TENANT],
+      )).rows.map((r) => [r.commentId, r]),
+    );
+    const expected = [
+      ['a top-level comment answers the post\'s author', toPost, AUTHOR],
+      ['a reply answers the comment\'s author', toReader, READER],
+      ['answering yourself tells nobody', toSelf, null],
+      ['a banned author is told nothing', toBanned, null],
+      ['someone who left a PUBLIC space can still read it, so is told', toLeaver, L],
+      ['a private space\'s member is told while a member', toMember, P_MEMBER],
+      ['and not once they have left', toFormerMember, null],
+    ];
+    for (const [what, id, who] of expected) {
+      const got = recipients[id]?.recipientId ?? null;
+      check(Boolean(recipients[id]) && got === who, `${what} (${got === null ? 'nobody' : got === who ? 'yes' : got})`);
+    }
+
+    // Through Kafka, not just the outbox: a field the registered schema does not declare
+    // is dropped by the encoder without an error, so the row is not the evidence.
+    await relayOnce();
+    const answeredIds = [recipients[toPost]?.id, recipients[toReader]?.id].filter(Boolean);
+    const decodedAnswers = await readFeed(answeredIds);
+    const onTopic = answeredIds.map((id) => decodedAnswers.get(id)?.value?.recipientId);
+    check(
+      onTopic.length === 2 && onTopic[0] === AUTHOR && onTopic[1] === READER,
+      `and recipientId survives the registered schema onto the topic (${onTopic.map((r) => (r === undefined ? 'MISSING' : r)).join(', ')})`,
+    );
+
+    console.log('');
     console.log('  the limiter covers posting too');
     // A fresh user, so the budget is whole: everyone above has spent some of theirs.
     const asFlooder = token(TENANT, `u_flood_${RUN}`);

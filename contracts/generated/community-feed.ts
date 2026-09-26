@@ -72,4 +72,15 @@ export interface CommunityActivity {
    * has none.
    */
   body: null | string;
+  /**
+   * For COMMENT_CREATED: whom this comment answers — the parent comment's author
+   * for a reply, the post's author for a top-level comment — decided by
+   * Community in the transaction that wrote the comment. NULL when nobody should
+   * be told: the commenter answered themselves, or the person answered can no
+   * longer read the space (banned, or no longer a member of a private one). A
+   * consumer that notifies must not second-guess it: Community is the only
+   * service that can see who may read what. Added in version 2 with a default,
+   * so readers on version 1 are unaffected.
+   */
+  recipientId: null | string;
 }

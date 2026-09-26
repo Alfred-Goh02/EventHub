@@ -96,6 +96,7 @@ function activity(
     commentId?: string | null;
     parentCommentId?: string | null;
     body?: string | null;
+    recipientId?: string | null;
   },
 ) {
   const id = randomUUID();
@@ -114,6 +115,7 @@ function activity(
     commentId: message.commentId ?? null,
     parentCommentId: message.parentCommentId ?? null,
     body: message.body ?? null,
+    recipientId: message.recipientId ?? null,
   };
   /**
    * occurredAt COMES FROM THE DATABASE, not from this process.
@@ -270,6 +272,31 @@ export function postRoutes(
              SET "commentCount" = "commentCount" + 1,
                  "rankScore" = ${rankScore(Prisma.sql`"reactionCount"`, Prisma.sql`"commentCount" + 1`, Prisma.sql`"createdAt"`)}
            WHERE id = ${postId}`;
+        /**
+         * WHOM THIS COMMENT ANSWERS, decided here and nowhere else.
+         *
+         * The author of the comment replied to, or of the post for a top-level comment
+         * — and only if they can still read the space NOW: an active member, or anyone
+         * not banned from a public one. A reply email carries the reply's words, so
+         * telling someone who was banned, or who left a private space, would hand them
+         * what the space no longer shows them. Community is the only service that can
+         * see who may read what, so a consumer is told the answer rather than left to
+         * guess it. Never the commenter themselves.
+         *
+         * In the same transaction as the comment, so it is judged against the same
+         * snapshot the comment was written in.
+         */
+        const answered = await tx.$queryRaw<Array<{ recipientId: string }>>`
+          SELECT r.author AS "recipientId"
+            FROM (SELECT CASE WHEN ${parentId}::text IS NULL THEN p."authorId" ELSE c."authorId" END AS author
+                    FROM "Post" p
+                    LEFT JOIN "Comment" c ON c.id = ${parentId} AND c."postId" = p.id
+                   WHERE p.id = ${postId}) r
+            JOIN "CommunitySpace" s ON s.id = ${spaceId}
+            LEFT JOIN "Membership" m ON m."spaceId" = s.id AND m."userId" = r.author
+           WHERE r.author IS NOT NULL AND r.author <> ${userId}
+             AND (m.status = 'ACTIVE'::"MemberStatus"
+                  OR (m.id IS NULL AND s.visibility = 'PUBLIC'::"Visibility"))`;
         await activity(tx, {
           tenantId,
           spaceId,
@@ -279,6 +306,7 @@ export function postRoutes(
           commentId,
           parentCommentId: parentId,
           body: parsed.data.body,
+          recipientId: answered[0]?.recipientId ?? null,
         });
       });
     } catch (err) {
