@@ -67,6 +67,8 @@ export const DLQ_HEADERS = {
   sourceOffset: 'dlq-source-offset',
   attempts: 'dlq-attempts',
   firstFailedAt: 'dlq-first-failed-at',
+  /** 'true' when the value was left out on purpose: it was not sealed. See forward(). */
+  valueWithheld: 'dlq-value-withheld',
 } as const;
 
 /** One header's value as a string. */

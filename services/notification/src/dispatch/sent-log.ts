@@ -12,8 +12,9 @@ import { addressHash } from './suppression.js';
  * message both pass the read and both send. scripts/verify-notification-sentlog.mjs
  * races eight claims and requires exactly one to win.
  *
- * The key is built from the message id, the channel and the recipient. The message
- * id is the outbox row's id, which a relay retry reuses; a Kafka offset would change.
+ * The key is built from the message id, the channel, the recipient and — for every
+ * email but a password reset — the template; idempotencyKey says why. The message id
+ * is the outbox row's id, which a relay retry reuses; a Kafka offset would change.
  */
 
 export type DeliveryStatus = 'PENDING' | 'SENT' | 'FAILED' | 'SUPPRESSED';
@@ -33,11 +34,26 @@ export interface DeliveryKey {
   sourceMessageId: string;
   recipientId: string;
   channel: 'email';
+  templateKey: string;
 }
 
-export const idempotencyKey = (k: DeliveryKey): string => `${k.sourceMessageId}:${k.channel}:${k.recipientId}`;
+/**
+ * WHAT KIND OF EMAIL IS PART OF ITS IDENTITY. A message id is only as unique as its
+ * producer makes it, and two topics have two producers: community.feed is not signed,
+ * so a message on it can carry any id, including a pending password reset's, which
+ * travels in plaintext. Keyed on the id alone, such a reply would find the reset's row
+ * PENDING, send, and mark it SENT — and the reset's own retry would then read SENT and
+ * skip. An unsigned producer must never be able to stop a credential email.
+ *
+ * A password reset's key has no template in it because it predates the others: its
+ * format is unchanged, so a reset in flight across the deploy is not sent twice.
+ */
+export const idempotencyKey = (k: DeliveryKey): string =>
+  k.templateKey === 'password-reset'
+    ? `${k.sourceMessageId}:${k.channel}:${k.recipientId}`
+    : `${k.templateKey}:${k.sourceMessageId}:${k.channel}:${k.recipientId}`;
 
-export async function claimDelivery(k: DeliveryKey & { category: string; templateKey: string }): Promise<Claim> {
+export async function claimDelivery(k: DeliveryKey & { category: string }): Promise<Claim> {
   const key = idempotencyKey(k);
   return withTenant(k.tenantId, async (tx) => {
     const inserted = await tx.$executeRaw`
@@ -122,6 +138,20 @@ export async function suppressIfListed(k: DeliveryKey, address: string): Promise
          SELECT 1 FROM "EmailSuppression" s
           WHERE s."tenantId" = ${k.tenantId} AND s."addressHash" = ${hash} AND s."expiresAt" > now())`);
   return moved === 1;
+}
+
+/**
+ * A retry that decided, after an earlier attempt claimed the delivery, to send nothing:
+ * the recipient turned replies off in between, or their card went. Without this the row
+ * would sit PENDING until the sweeper called it abandoned — a correctly declined email
+ * counted, and alarmed on, as a stuck one. FAILED with the reason, and only from PENDING,
+ * so a delivery that did go out is never rewritten.
+ */
+export async function closePending(k: DeliveryKey, reason: string): Promise<void> {
+  const key = idempotencyKey(k);
+  await withTenant(k.tenantId, (tx) => tx.$executeRaw`
+    UPDATE "NotificationDelivery" SET status = 'FAILED', "failedAt" = now(), "lastError" = ${reason.slice(0, 1000)}
+     WHERE "tenantId" = ${k.tenantId} AND "idempotencyKey" = ${key} AND status = 'PENDING'`);
 }
 
 /** A transient failure: the row stays PENDING, so the redelivery tries again. */

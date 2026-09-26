@@ -563,7 +563,7 @@ async function main() {
       await inTenant(authApp, tenant, 'DELETE FROM "User" WHERE "tenantId" = $1', [tenant]).catch(() => {});
       await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [tenant]).catch(() => {});
     }
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, ...scanGroups]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, ...scanGroups]);
     await admin.disconnect().catch(() => {});
     const left = { outbox: 0, deliveries: 0, suppressions: 0 };
     for (const tenant of [TENANT, OTHER_TENANT]) {

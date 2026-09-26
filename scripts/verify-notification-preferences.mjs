@@ -264,7 +264,7 @@ async function main() {
   }
   const left = (await inTenant(owner, TENANT, `SELECT count(*)::int AS n FROM "NotificationPreference" WHERE "tenantId" = $1`, [TENANT])).rows[0].n;
   check(deleted > 0 && left === 0, `cleanup: this run's preference rows are gone (${deleted} deleted, ${left} left)`);
-  const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`]);
+  const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`]);
   if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
   await Promise.allSettled([admin.disconnect(), owner.end()]);
 

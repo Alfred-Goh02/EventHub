@@ -486,7 +486,7 @@ async function main() {
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
     await producer.disconnect().catch(() => {});
     // The group empties once the killed consumer's session times out.
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`]);
     await admin.disconnect().catch(() => {});
     const left = {
       outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,

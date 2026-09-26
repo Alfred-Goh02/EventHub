@@ -457,7 +457,7 @@ async function main() {
       (await authApp.query(`SELECT count(*)::int AS n FROM "Tenant" WHERE id IN ($1, $2)`, [TENANT, OTHER])).rows[0].n +
       (await relayDb.query(`SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" IN ($1, $2)`, [TENANT, OTHER])).rows[0].n;
     check(deleted > 0 && left === 0, `cleanup: this run's rows are gone (${deleted} deleted, ${left} left)`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [`${GROUP}-dispatch`, `${GROUP}-dispatch-retry`, `${GROUP}-contacts`, `${GROUP}-scan`]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [`${GROUP}-dispatch`, `${GROUP}-dispatch-retry`, `${GROUP}-dispatch-replies`, `${GROUP}-contacts`, `${GROUP}-scan`]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), authApp.end(), relayDb.end(), notifyApp.end()]);
   }

@@ -9,29 +9,55 @@
  *     that never saw it would produce.
  *   - The email carries List-Unsubscribe and List-Unsubscribe-Post, and the token in it
  *     is signed for THIS tenant, user and category — checked here with the secret, not
- *     just found.
- *   - The reply's words are someone else's text: markup in them arrives escaped.
+ *     just found. The body links to the post at the WEB APP's origin, which is set to
+ *     one only this run uses, so a link built from any other origin fails.
+ *   - The reply's words are someone else's text: markup in them arrives escaped, in
+ *     both parts, and only an excerpt is quoted in either. The fixture puts an emoji
+ *     across the excerpt's cut, so a cut by UTF-16 unit, which splits it, is visible.
  *   - The unsubscribe link taken from the received email, POSTed, stops the next reply.
  *     The whole loop, not its parts.
  *   - Nothing is sent when Community named nobody, when the reply is to yourself, for a
- *     message that is not a reply, to someone who turned replies off, to someone with
- *     no card, or to a suppressed address. Each has its own counter as the control that
- *     the message was read — "no email" alone is also what a stalled consumer produces.
- *   - A reply retried from a retry tier is handled as a reply. The tiers carry every
- *     route's messages; without routing by the original topic it would be decoded as a
- *     password reset and dead-lettered.
+ *     message that is not a reply, for a reply older than REPLY_MAX_AGE_MS, to someone
+ *     who turned replies off, to someone with no card or a card that does not open, or
+ *     to a suppressed address. Each has its own counter as the control that the message
+ *     was read — "no email" alone is also what a stalled consumer produces.
+ *   - The event-type header is read before the value: a post whose bytes cannot be
+ *     decoded is skipped, not dead-lettered.
+ *   - A message that can never be a reply is dead-lettered WITHOUT its value, and the
+ *     documented replay command says so rather than replaying nothing.
+ *   - A reply carrying a pending password reset's message id does not touch the reset's
+ *     delivery row.
+ *   - A store outage in front of the send is retried, not dropped: the reply goes to the
+ *     first tier stamped with community.feed, and arrives once the store is back. The
+ *     outage is a revoked SELECT, on the card table and the preference table in turn.
+ *   - A retry that declines — the recipient opted out after an attempt claimed the
+ *     delivery — closes the claimed row, rather than leaving it PENDING for the sweeper
+ *     to call abandoned.
+ *   - A reply retried from a tier is handled as a reply. The tiers carry every route's
+ *     messages; without routing by the original topic it would be decoded as a password
+ *     reset and dead-lettered.
+ *   - A reply stuck on its store does not hold up a password reset: the reset arrives
+ *     while the reply is still on its first attempt.
+ *   - A reply already on the topic before the service first started is never sent: the
+ *     replies group starts at `latest` whatever the reset path does, and the reset path
+ *     runs `earliest` here, as compose runs it, so a route that took the reset path's
+ *     setting would read it.
  *
  * Community's messages are produced here, with every field the case needs, rather than
  * written through Community: which recipient Community names is verify-community-
  * posts.mjs's job. Contact cards are sealed here as Auth seals them and stored the way
  * the contact consumer stores them.
  *
- * Notification runs on groups of its own, starting at `latest` on community.feed, so a
- * canary on this run's key proves it is reading the partition every later message
- * lands on before anything real is sent.
+ * Notification runs on groups of its own. Its reset path starts `earliest`, as compose
+ * runs it, with this run's groups committed at the end of their topics first, so it does
+ * not work through every reset ever requested. Its replies group starts where its
+ * default says, and a canary on this run's key proves it is reading the partition every
+ * later message lands on before anything real is sent.
  *
  * Scoped to a tenant created for this run; its rows, inbox messages and consumer groups
- * are removed at the end, and what was deleted is reported.
+ * are removed at the end, and what was deleted is reported. Every SELECT this revokes is
+ * granted back in the same run, and granted again at the start in case a run was killed
+ * holding one.
  *
  * Run (with Postgres, Kafka, the Schema Registry and Mailpit up; Notification built;
  * both keypairs generated): node scripts/verify-reply-emails.mjs
@@ -53,12 +79,19 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
 
 const TOPIC = 'community.feed';
+const RESET_TOPIC = 'auth.email-requested';
+const TIERS = ['notification.retry.1', 'notification.retry.2', 'notification.retry.3'];
+const DLQ = 'notification.dlq';
 const MAILPIT = process.env['MAILPIT_URL'] ?? 'http://127.0.0.1:8025';
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_replies_${RUN}`;
 const SPACE = `space_replies_${RUN}`;
 const GROUP = `verify-reply-emails-${RUN}`;
 const PORT = 3985;
+/** An origin only this run uses, so the post link's origin is checked, not just its path. */
+const APP_URL = `https://app-${RUN}.replies.example`;
+/** Short, so a retried reply comes back within the run. */
+const DELAYS_MS = [3000, 3000, 3000];
 
 /** Everyone in the run, and the address their card holds. */
 const who = (name) => ({ id: `user_${name}_${RUN}`, email: `reply-${name}-${RUN}@mailcheck.example` });
@@ -69,17 +102,31 @@ const O = who('optedout');
 const N = who('nocard');
 const S = who('suppressed');
 const T = who('retried');
+const E = who('early');
+const K = who('resetkey');
+const X = who('unreadable');
+const C = who('cardoutage');
+const V = who('prefoutage');
+const P = who('declined');
+const L = who('stuck');
+const W = who('resetter');
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
   KAFKA_CONSUMER_GROUP: GROUP,
-  DISPATCH_START_FROM: 'latest',
-  COMMUNITY_START_FROM: 'latest',
   CONTACTS_CONSUMER_GROUP: `${GROUP}-contacts`,
+  DISPATCH_RETRY_DELAYS_MS: DELAYS_MS.join(','),
   // The link in the email points at THIS instance, so the loop below can follow it.
   NOTIFICATION_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
+  PUBLIC_APP_URL: APP_URL,
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
 });
+// DISPATCH_START_FROM stays .env.example's `earliest`, and COMMUNITY_START_FROM is left
+// to its default, which is how compose runs both.
+delete notificationEnv.COMMUNITY_START_FROM;
+/** The role the service runs as, from its own URL rather than a copy of its name. */
+const APP_ROLE = decodeURIComponent(new URL(notificationEnv.APP_DATABASE_URL).username);
+const OUTAGE_TABLES = ['ContactCard', 'NotificationPreference', 'EmailSuppression'];
 
 let failures = 0;
 function check(ok, msg) {
@@ -129,6 +176,7 @@ const headersOf = async (id) => {
   const res = await fetch(`${MAILPIT}/api/v1/message/${encodeURIComponent(id)}/headers`);
   return res.ok ? res.json() : {};
 };
+const kafkaHeaders = (m) => Object.fromEntries(Object.entries(m.headers ?? {}).map(([k, v]) => [k, v?.toString()]));
 
 /** The claims in an unsubscribe token, if the service's secret signed it. */
 function verifyToken(token) {
@@ -151,14 +199,15 @@ async function main() {
     return;
   }
 
-  // Nor may the real Notification be consuming: it shares the sent-log, so it would
-  // claim this run's replies and send them itself. The group is the one Notification's
-  // .env.example names, which is the one compose runs.
+  // Nor may the real Notification be consuming: it shares the sent-log and Mailpit, so
+  // it would claim this run's replies and send them itself, and a check here would pass
+  // on its work. The groups are the ones Notification's .env.example names, which are
+  // the ones compose runs.
   const realGroup = serviceEnv(ROOT, 'notification').KAFKA_CONSUMER_GROUP;
   const kafka = new Kafka({ clientId: `verify-replies-${RUN}`, brokers: notificationEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING });
   const admin = kafka.admin();
   await admin.connect();
-  const busy = await busyGroups(admin, [realGroup, `${realGroup}-retry`]);
+  const busy = await busyGroups(admin, [realGroup, `${realGroup}-retry`, `${realGroup}-replies`]);
   if (busy.length > 0) {
     console.error(`FAIL: ${busy.join(' and ')} has active members, so another Notification is sending. Stop it first (in compose: docker compose stop notification).`);
     process.exitCode = 1;
@@ -168,17 +217,25 @@ async function main() {
 
   const owner = new pg.Client({ connectionString: notificationEnv.DATABASE_URL });
   await owner.connect();
+  const grantBack = (table) => owner.query(`GRANT SELECT ON "${table}" TO "${APP_ROLE}"`);
+  const revoke = (table) => owner.query(`REVOKE SELECT ON "${table}" FROM "${APP_ROLE}"`);
+  // A run killed while holding a revoke would leave the service unable to read a table.
+  for (const table of OUTAGE_TABLES) await grantBack(table);
+
   const producer = kafka.producer();
   await producer.connect();
   const registry = new SchemaRegistry({ host: notificationEnv.SCHEMA_REGISTRY_URL });
   const schemaId = await registry.getLatestSchemaId(`${TOPIC}-value`);
+  const resetSchemaId = await registry.getLatestSchemaId(`${RESET_TOPIC}-value`);
 
   const notificationPublic = await importSPKI(key('notification', 'public.pem'), 'RSA-OAEP-256', { extractable: true });
   const kid = await calculateJwkThumbprint(await exportJWK(notificationPublic));
   const authSigning = await importPKCS8(key('auth', 'private.pem'), 'RS256');
+  const seal = async (jws) =>
+    new CompactEncrypt(new TextEncoder().encode(jws)).setProtectedHeader({ alg: 'RSA-OAEP-256', enc: 'A256GCM', cty: 'JWT', kid }).encrypt(notificationPublic);
 
   /** A card as Auth seals one and the contact consumer stores it: the sealed string, its message id and its instant. */
-  async function storeCard(user) {
+  async function storeCard(user, sealedOverride) {
     const messageId = randomUUID();
     const occurredAt = '2026-09-26T00:00:00.000Z';
     const signed = await new SignJWT({ tenantId: TENANT, email: user.email, occurredAt })
@@ -189,9 +246,7 @@ async function main() {
       .setAudience('eventhub-notification')
       .setIssuedAt()
       .sign(authSigning);
-    const sealed = await new CompactEncrypt(new TextEncoder().encode(signed))
-      .setProtectedHeader({ alg: 'RSA-OAEP-256', enc: 'A256GCM', cty: 'JWT', kid })
-      .encrypt(notificationPublic);
+    const sealed = sealedOverride ?? (await seal(signed));
     await inTenant(
       owner,
       TENANT,
@@ -217,27 +272,104 @@ async function main() {
       ...fields,
     };
   }
-  const produce = async (value, { topic = TOPIC, headers = {} } = {}) =>
-    producer.send({ topic, messages: [{ key: SPACE, value: await registry.encode(schemaId, value), headers }] });
+  /**
+   * With the headers the relay stamps: message-id, and event-type from the kind.
+   * `eventType: null` leaves the header off, so the value alone decides.
+   */
+  const produce = async (value, { topic = TOPIC, headers = {}, eventType } = {}) => {
+    const type = eventType === undefined ? `community.${value.kind.toLowerCase()}` : eventType;
+    return producer.send({
+      topic,
+      messages: [
+        {
+          key: SPACE,
+          value: await registry.encode(schemaId, value),
+          headers: { 'message-id': value.messageId, ...(type ? { 'event-type': type } : {}), ...headers },
+        },
+      ],
+    });
+  };
 
-  const metrics = async () => (await (await fetch(`http://127.0.0.1:${PORT}/metrics`)).json());
-  /** Produce, then wait until the counter named moves: the proof the message was read. */
-  async function produceAndWait(value, counter, opts, timeoutMs = 45_000) {
-    const read = (m) => (counter.startsWith('dispatch.') ? m.dispatch[counter.slice(9)] : m.replies[counter]);
-    const before = read(await metrics());
-    await produce(value, opts);
-    return waitFor(async () => read(await metrics()) > before, timeoutMs);
+  /** A password reset as Auth requests one: signed by Auth, sealed to Notification. */
+  async function requestReset(user) {
+    const messageId = randomUUID();
+    const expiresAt = new Date(Date.now() + 10 * 60_000);
+    const jws = await new SignJWT({ tenantId: TENANT, email: user.email, link: `https://app.example/reset-password?token=${RUN}`, kind: 'PASSWORD_RESET' })
+      .setProtectedHeader({ alg: 'RS256', typ: 'auth-email+jwt' })
+      .setSubject(user.id)
+      .setJti(messageId)
+      .setIssuer(notificationEnv.JWT_ISSUER)
+      .setAudience('eventhub-notification')
+      .setIssuedAt()
+      .setExpirationTime(expiresAt)
+      .sign(authSigning);
+    await producer.send({
+      topic: RESET_TOPIC,
+      messages: [
+        {
+          key: user.id,
+          value: await registry.encode(resetSchemaId, {
+            messageId,
+            occurredAt: new Date().toISOString(),
+            tenantId: TENANT,
+            userId: user.id,
+            kind: 'PASSWORD_RESET',
+            expiresAt: expiresAt.toISOString(),
+            sealed: await seal(jws),
+          }),
+          headers: { 'message-id': messageId },
+        },
+      ],
+    });
+    return messageId;
   }
 
-  const service = spawn(process.execPath, ['dist/index.js'], { cwd: join(ROOT, 'services', 'notification'), env: notificationEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  const scanGroups = [];
+  /** Every message on `topic` carrying this message id, read from the beginning. */
+  async function scan(topic, messageId, timeoutMs = 20_000) {
+    const groupId = `${GROUP}-scan-${scanGroups.length}`;
+    scanGroups.push(groupId);
+    const consumer = kafka.consumer({ groupId });
+    await consumer.connect();
+    await consumer.subscribe({ topic, fromBeginning: true });
+    const found = [];
+    await consumer.run({
+      eachMessage: async ({ message: m }) => {
+        if (m.headers?.['message-id']?.toString() === messageId) found.push(m);
+      },
+    });
+    await waitFor(async () => found.length > 0, timeoutMs, 250);
+    await sleep(500);
+    await consumer.disconnect();
+    return found;
+  }
+
+  const metrics = async () => (await (await fetch(`http://127.0.0.1:${PORT}/metrics`)).json());
+  const read = (m, counter) => (counter.startsWith('dispatch.') ? m.dispatch[counter.slice(9)] : m.replies[counter]);
+  /** Produce, then wait until the counter named moves: the proof the message was read. */
+  async function produceAndWait(value, counter, opts, timeoutMs = 45_000) {
+    const before = read(await metrics(), counter);
+    await produce(value, opts);
+    return waitFor(async () => read(await metrics(), counter) > before, timeoutMs);
+  }
+  const deliveries = async (messageId) =>
+    (await inTenant(
+      owner,
+      TENANT,
+      `SELECT d.status::text AS status, d."templateKey", d."idempotencyKey", d."lastError" FROM "NotificationDelivery" d
+        WHERE d."tenantId" = $1 AND d."sourceMessageId" = $2 ORDER BY d."templateKey"`,
+      [TENANT, messageId],
+    )).rows;
+
+  const everyone = [ACTOR, R, U, O, N, S, T, E, K, X, C, V, P, L, W];
+  let service = null;
   let log = '';
-  service.stdout.on('data', (d) => (log += d));
-  service.stderr.on('data', (d) => (log += d));
-  const everyone = [ACTOR, R, U, O, N, S, T];
 
   try {
-    console.log('  the fixture');
-    for (const user of [R, U, O, S, T]) await storeCard(user);
+    console.log('  the fixture, before the service starts');
+    for (const user of [R, U, O, S, T, E, K, C, V, P, L]) await storeCard(user);
+    // Sealed to nobody: a card that was stored and no longer opens.
+    await storeCard(X, 'not-a-jwe');
     await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'COMMUNITY_REPLY', 'EMAIL', false)`, [TENANT, O.id]);
     await inTenant(
       owner,
@@ -245,25 +377,46 @@ async function main() {
       `INSERT INTO "EmailSuppression" (id, "tenantId", "addressHash", reason, "expiresAt") VALUES ($1, $2, $3, 'HARD_BOUNCE', now() + interval '1 day')`,
       [randomUUID(), TENANT, createHash('sha256').update(S.email.trim().toLowerCase()).digest('hex')],
     );
+    // Already on the topic when the service first starts. Never to be sent.
+    const early = activity({ recipientId: E.id, body: 'written before the service started' });
+    await produce(early);
+    // The reset path starts `earliest`, as compose runs it; committing this run's groups
+    // at the end of their topics first keeps it from working through every reset ever
+    // requested, and leaves the replies group the only one without a position.
+    for (const [groupId, topics] of [[GROUP, [RESET_TOPIC]], [`${GROUP}-retry`, TIERS]]) {
+      for (const topic of topics) {
+        const ends = await admin.fetchTopicOffsets(topic);
+        await admin.setOffsets({ groupId, topic, partitions: ends.map((p) => ({ partition: p.partition, offset: p.high })) });
+      }
+    }
+
+    service = spawn(process.execPath, ['dist/index.js'], { cwd: join(ROOT, 'services', 'notification'), env: notificationEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    service.stdout.on('data', (d) => (log += d));
+    service.stderr.on('data', (d) => (log += d));
+
     const ready = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT}/ready`)).ok, 60_000, 500);
     check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${PORT}` : `it never became ready:\n${excerpt(log)}`);
     if (!ready) return;
-    // Both groups: the retry tiers' group also starts at latest, and the tier check at
-    // the end would otherwise pass or fail on whether it had joined in time.
+    // Every group: the retry tiers' group and the replies group both matter below, and
+    // a check would otherwise pass or fail on whether one had joined in time.
+    const groups = [GROUP, `${GROUP}-retry`, `${GROUP}-replies`];
     const joined = await waitFor(async () => {
-      const { groups } = await admin.describeGroups([GROUP, `${GROUP}-retry`]);
-      return groups.length === 2 && groups.every((g) => g.state === 'Stable' && g.members.length > 0);
+      const { groups: described } = await admin.describeGroups(groups);
+      return described.length === groups.length && described.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
-    check(Boolean(joined), 'CONTROL: its dispatch group and its retry group have both joined');
-    // A canary on this run's key until one is counted: the group started at latest, so
-    // anything produced before it held the partition was never going to be read.
+    check(Boolean(joined), 'CONTROL: its reset group, its retry group and its replies group have all joined');
+    // A canary on this run's key until one is counted: the replies group started at
+    // latest, so anything produced before it held the partition was never going to be read.
     const reading = await waitFor(async () => produceAndWait(activity({ kind: 'POST_CREATED', recipientId: null }), 'notAReplyTotal', undefined, 5_000), 60_000, 500);
     check(Boolean(reading), 'CONTROL: it read a canary on the partition every message below lands on');
     if (failures > 0) return;
 
     console.log('');
     console.log('  a reply reaches the person it answers, once');
-    const hostile = `<script>alert(1)</script> & "quoted" ${'x'.repeat(400)}`;
+    // Markup to escape, and an emoji whose code point is the 280th: the excerpt keeps it
+    // whole, and a cut by UTF-16 unit would leave half of it.
+    const prefix = '<script>alert(1)</script> & "quoted" ';
+    const hostile = `${prefix}${'x'.repeat(279 - [...prefix].length)}😀${'y'.repeat(60)}`;
     const reply = activity({ body: hostile });
     await produce(reply);
     const received = await waitFor(async () => {
@@ -278,8 +431,15 @@ async function main() {
       Boolean(mail) && !mail.HTML.includes('<script>') && mail.HTML.includes('&lt;script&gt;') && mail.HTML.includes('&amp;'),
       'the reply\'s markup arrives escaped, not as markup',
     );
-    const quoted = mail?.Text?.split('\n').find((l) => l.startsWith('  ')) ?? '';
-    check([...quoted.trim()].length <= 281 && quoted.trim().endsWith('…'), `only an excerpt is quoted (${[...quoted.trim()].length} characters)`);
+    const quoted = (mail?.Text?.split('\n').find((l) => l.startsWith('  ')) ?? '').trim();
+    check(
+      [...quoted].length === 281 && quoted.endsWith('😀…') && !quoted.includes('�') && !quoted.includes('yyyy'),
+      `only an excerpt is quoted, cut whole at 280 code points (${[...quoted].length} characters, ends ${JSON.stringify(quoted.slice(-3))})`,
+    );
+    check(
+      Boolean(mail) && mail.HTML.includes('😀…') && !mail.HTML.includes('yyyy') && !mail.HTML.includes('�'),
+      'and only the same excerpt in the HTML part, which is what most clients show',
+    );
     const listUnsubscribe = headers['List-Unsubscribe']?.[0] ?? '';
     const unsubscribeUrl = listUnsubscribe.match(/^<(.+)>$/)?.[1] ?? '';
     const claims = unsubscribeUrl ? verifyToken(new URL(unsubscribeUrl).searchParams.get('token') ?? '') : null;
@@ -291,7 +451,15 @@ async function main() {
       claims?.t === TENANT && claims?.u === R.id && claims?.c === 'COMMUNITY_REPLY',
       "and the token in it is signed with the service's secret, for this tenant, this user and replies only",
     );
-    check(Boolean(mail) && mail.Text.includes(unsubscribeUrl) && mail.Text.includes(`/posts/${encodeURIComponent(reply.postId)}`), 'the body carries the same link, and a link to the post');
+    const postUrl = `${APP_URL}/posts/${encodeURIComponent(reply.postId)}`;
+    check(
+      Boolean(mail) && mail.Text.includes(unsubscribeUrl) && mail.HTML.includes(`href="${unsubscribeUrl}"`),
+      'both parts carry the same unsubscribe link, where the reader can see it',
+    );
+    check(
+      Boolean(mail) && mail.Text.includes(postUrl) && mail.HTML.includes(`href="${postUrl}"`),
+      `and link to the post on the web app's origin (${APP_URL})`,
+    );
 
     const again = await produceAndWait(reply, 'dispatch.duplicatesSkippedTotal');
     await sleep(1_000);
@@ -305,23 +473,98 @@ async function main() {
 
     console.log('');
     console.log('  and nobody it should not');
+    const hoursAgo = (h) => new Date(Date.now() - h * 3_600_000).toISOString();
     const cases = [
       ['Community named nobody', activity({ recipientId: null }), 'nobodyToTellTotal', null],
       ['a reply to yourself', activity({ actorId: R.id }), 'toSelfTotal', R],
-      ['a reaction, which is not a reply', activity({ kind: 'REACTION_ADDED' }), 'notAReplyTotal', R],
+      // No event-type header, so the value's own kind is what is judged.
+      ['a reaction, which is not a reply', activity({ kind: 'REACTION_ADDED' }), 'notAReplyTotal', R, { eventType: null }],
+      ['a reply two hours old, past REPLY_MAX_AGE_MS', activity({ occurredAt: hoursAgo(2) }), 'tooOldTotal', R],
       ['someone who turned replies off', activity({ recipientId: O.id }), 'optedOutTotal', O],
       ['someone with no contact card', activity({ recipientId: N.id }), 'noAddressTotal', N],
     ];
-    for (const [what, value, counter, target] of cases) {
-      const read = await produceAndWait(value, counter);
+    for (const [what, value, counter, target, opts] of cases) {
+      const moved = await produceAndWait(value, counter, opts);
       await sleep(500);
       const mails = target ? (await inbox(target.email)).length : 0;
       const expected = target === R ? 2 : 0;
-      check(Boolean(read) && mails === expected, `${what}: read, and nothing sent (${counter} moved: ${Boolean(read)}; inbox ${mails})`);
+      check(Boolean(moved) && mails === expected, `${what}: read, and nothing sent (${counter} moved: ${Boolean(moved)}; inbox ${mails})`);
     }
+
+    // A card that does not open is the keys' fault, not the reply's: nothing sent, and
+    // nothing dead-lettered, since replaying the reply would not fix the card.
+    const beforeUnreadable = await metrics();
+    const unreadable = await produceAndWait(activity({ recipientId: X.id }), 'noAddressTotal');
+    await sleep(1_500);
+    const afterUnreadable = await metrics();
+    check(
+      Boolean(unreadable) && afterUnreadable.dispatch.deadLetteredTotal === beforeUnreadable.dispatch.deadLetteredTotal && (await inbox(X.email)).length === 0,
+      `a card that no longer opens: read, nothing sent, nothing dead-lettered (dead-lettered ${beforeUnreadable.dispatch.deadLetteredTotal} -> ${afterUnreadable.dispatch.deadLetteredTotal})`,
+    );
+
+    // The header is read before the value: a post whose bytes are not even Avro is
+    // skipped as not a reply. Decoded first, it would be poison and dead-lettered.
+    const beforeGarbage = await metrics();
+    await producer.send({
+      topic: TOPIC,
+      messages: [{ key: SPACE, value: Buffer.from(`not avro ${RUN}`), headers: { 'message-id': randomUUID(), 'event-type': 'community.post_created' } }],
+    });
+    const skippedByHeader = await waitFor(async () => (await metrics()).replies.notAReplyTotal > beforeGarbage.replies.notAReplyTotal, 30_000);
+    await sleep(1_000);
+    const afterGarbage = await metrics();
+    check(
+      Boolean(skippedByHeader) && afterGarbage.replies.poisonTotal === beforeGarbage.replies.poisonTotal,
+      `a post that cannot be decoded is skipped by its header, not decoded (poison ${beforeGarbage.replies.poisonTotal} -> ${afterGarbage.replies.poisonTotal})`,
+    );
+
     const suppressedRead = await produceAndWait(activity({ recipientId: S.id }), 'dispatch.suppressedTotal');
     const sStatus = (await inTenant(owner, TENANT, `SELECT status::text AS s FROM "NotificationDelivery" WHERE "tenantId" = $1 AND "recipientId" = $2`, [TENANT, S.id])).rows[0]?.s;
     check(Boolean(suppressedRead) && sStatus === 'SUPPRESSED' && (await inbox(S.email)).length === 0, `a suppressed address: recorded ${sStatus}, and nothing sent`);
+
+    console.log('');
+    console.log("  a reply that can never be sent is dead-lettered without its words");
+    const poison = activity({ commentId: null, body: `words that must not be kept ${RUN}` });
+    const poisoned = await produceAndWait(poison, 'dispatch.deadLetteredTotal');
+    const [dead] = poisoned ? await scan(DLQ, poison.messageId) : [];
+    const deadHeaders = dead ? kafkaHeaders(dead) : {};
+    check(Boolean(dead), `CONTROL: its dead-letter copy is on ${DLQ} (${dead ? deadHeaders['dlq-reason'] : 'not found'})`);
+    check(
+      Boolean(dead) && dead.value === null && deadHeaders['dlq-value-withheld'] === 'true' && deadHeaders['dlq-original-topic'] === TOPIC,
+      `with no value, marked withheld, and still saying where it came from (value ${dead?.value === null ? 'null' : `${dead?.value?.length} bytes`})`,
+    );
+    const replay = await new Promise((done) => {
+      const child = spawn(process.execPath, ['dist/scripts/dlq-replay.js', poison.messageId], { cwd: join(ROOT, 'services', 'notification'), env: notificationEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      child.stdout.on('data', (d) => (out += d));
+      child.stderr.on('data', (d) => (out += d));
+      child.on('exit', (code) => done({ code, out }));
+    });
+    check(
+      replay.code !== 0 && replay.out.includes('without its value'),
+      `dlq:replay refuses it and says why, rather than replaying nothing (exit ${replay.code}: ${replay.out.trim().split(/\r?\n/).pop()?.slice(0, 120)})`,
+    );
+
+    console.log('');
+    console.log("  a reply cannot take over a password reset's delivery");
+    // A reset whose send failed and is waiting in a tier: its row is PENDING. A reply on
+    // the unsigned topic carrying the same message id, for the same user, must be its
+    // own delivery.
+    const resetId = randomUUID();
+    const resetKey = `${resetId}:email:${K.id}`;
+    await inTenant(
+      owner,
+      TENANT,
+      `INSERT INTO "NotificationDelivery" (id, "tenantId", "recipientId", channel, category, "templateKey", "idempotencyKey", "sourceMessageId")
+       VALUES ($1, $2, $3, 'email', 'account', 'password-reset', $4, $5)`,
+      [randomUUID(), TENANT, K.id, resetKey, resetId],
+    );
+    await produce(activity({ messageId: resetId, recipientId: K.id, body: 'same id as a reset' }));
+    const kMail = await waitFor(async () => ((await inbox(K.email)).length === 1 ? true : null), 45_000);
+    const kRows = await deliveries(resetId);
+    const resetRow = kRows.find((r) => r.idempotencyKey === resetKey);
+    const replyRow = kRows.find((r) => r.templateKey === 'community-reply');
+    check(Boolean(kMail) && replyRow?.status === 'SENT', `CONTROL: the reply was sent, as a delivery of its own (${replyRow?.status ?? 'no row'})`);
+    check(resetRow?.status === 'PENDING', `and the reset's row is untouched, still PENDING for its own retry (${resetRow?.status})`);
 
     console.log('');
     console.log('  the unsubscribe link in the email stops the next one');
@@ -338,18 +581,121 @@ async function main() {
     check(Boolean(stopped) && (await inbox(U.email)).length === 1, `and the next reply to them is read and not sent (inbox ${(await inbox(U.email)).length})`);
 
     console.log('');
+    console.log('  a store outage is retried, not dropped');
+    /**
+     * The outage is the app role losing SELECT on one table: a store failure in front of
+     * the send that nothing about the message caused. Granted back as soon as the reply
+     * has been moved to a tier, so its retry finds the store working.
+     */
+    for (const [table, user] of [['ContactCard', C], ['NotificationPreference', V]]) {
+      const value = activity({ recipientId: user.id, body: `through an outage of ${table}` });
+      const before = (await metrics()).dispatch.retriedTotal;
+      await revoke(table);
+      let moved;
+      try {
+        await produce(value);
+        moved = await waitFor(async () => (await metrics()).dispatch.retriedTotal > before, 30_000, 100);
+      } finally {
+        await grantBack(table);
+      }
+      const arrived = await waitFor(async () => ((await inbox(user.email)).length === 1 ? true : null), 45_000);
+      const [tierCopy] = moved ? await scan(TIERS[0], value.messageId) : [];
+      const tierHeaders = tierCopy ? kafkaHeaders(tierCopy) : {};
+      check(
+        Boolean(moved) && tierHeaders['retry-original-topic'] === TOPIC && tierHeaders['retry-attempt'] === '1',
+        `with ${table} unreadable, the reply went to the first tier stamped with where it came from (${tierHeaders['retry-original-topic'] ?? 'no tier copy'})`,
+      );
+      check(Boolean(arrived) && (await inbox(user.email)).length === 1, `and once ${table} could be read again, it arrived, once`);
+    }
+
+    console.log('');
+    console.log('  a retry that declines closes the delivery an earlier attempt claimed');
+    {
+      const value = activity({ recipientId: P.id, body: 'claimed, then declined' });
+      const before = await metrics();
+      await revoke('EmailSuppression');
+      let moved;
+      let claimed;
+      try {
+        await produce(value);
+        moved = await waitFor(async () => (await metrics()).dispatch.retriedTotal > before.dispatch.retriedTotal, 30_000, 100);
+        claimed = (await deliveries(value.messageId))[0]?.status;
+        // Opted out between the attempt and its retry, as a click on an earlier email would.
+        await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'COMMUNITY_REPLY', 'EMAIL', false)`, [TENANT, P.id]);
+      } finally {
+        await grantBack('EmailSuppression');
+      }
+      check(Boolean(moved) && claimed === 'PENDING', `CONTROL: the first attempt claimed the delivery and failed after the claim (${claimed})`);
+      const closed = await waitFor(async () => {
+        const [row] = await deliveries(value.messageId);
+        return row?.status !== 'PENDING' ? row : null;
+      }, 30_000);
+      check(
+        closed?.status === 'FAILED' && closed?.lastError === 'not sent: opted out' && (await inbox(P.email)).length === 0,
+        `the retry found them opted out, sent nothing, and closed the row (${closed?.status ?? 'still PENDING'}: ${closed?.lastError ?? '-'})`,
+      );
+    }
+
+    console.log('');
     console.log('  a reply retried from a tier is handled as a reply');
     await produce(activity({ recipientId: T.id, body: 'retried' }), {
-      topic: 'notification.retry.1',
+      topic: TIERS[0],
       headers: { 'retry-original-topic': TOPIC, 'retry-attempt': '1', 'retry-not-before': String(Date.now()), 'retry-first-failed-at': new Date().toISOString() },
     });
     const retried = await waitFor(async () => ((await inbox(T.email)).length === 1 ? true : null), 60_000);
     check(Boolean(retried), 'it reaches the person it answers, rather than being decoded as a password reset and dead-lettered');
+
+    console.log('');
+    console.log('  a reply stuck on its store does not hold up a password reset');
+    /**
+     * The card table is locked, so the reply waits on it inside its first attempt; the
+     * reset reads no card. On one consumer for both, the reset could only be read once
+     * the reply's attempt ended — by the lock going, or by its transaction timing out,
+     * which sends it to a tier. So the reset must arrive while the reply is still on its
+     * first attempt: nothing moved to a tier yet.
+     */
+    {
+      const locker = new pg.Client({ connectionString: notificationEnv.DATABASE_URL });
+      await locker.connect();
+      const { pid } = (await locker.query('SELECT pg_backend_pid() AS pid')).rows[0];
+      const blockedByLock = async () =>
+        (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))', [pid])).rows[0].n > 0;
+      let blocked = false;
+      let arrivedWhileStuck = false;
+      let retriedMeanwhile = null;
+      await locker.query('BEGIN');
+      try {
+        await locker.query('LOCK TABLE "ContactCard" IN ACCESS EXCLUSIVE MODE');
+        const before = (await metrics()).dispatch.retriedTotal;
+        await produce(activity({ recipientId: L.id, body: 'held up' }));
+        blocked = Boolean(await waitFor(blockedByLock, 20_000, 50));
+        await requestReset(W);
+        arrivedWhileStuck = Boolean(await waitFor(async () => (await inbox(W.email)).length === 1, 20_000, 100));
+        retriedMeanwhile = (await metrics()).dispatch.retriedTotal - before;
+      } finally {
+        await locker.query('ROLLBACK').catch(() => {});
+        await locker.end().catch(() => {});
+      }
+      check(blocked, 'CONTROL: the reply was waiting on the locked card table');
+      check(
+        arrivedWhileStuck && retriedMeanwhile === 0,
+        `the reset arrived while the reply was still on its first attempt (arrived: ${arrivedWhileStuck}; moved to a tier meanwhile: ${retriedMeanwhile})`,
+      );
+      const released = await waitFor(async () => ((await inbox(L.email)).length === 1 ? true : null), 45_000);
+      check(Boolean(released), 'and once the table was free, the reply arrived too');
+    }
+
+    console.log('');
+    console.log('  a reply already on the topic when the service first started is never sent');
+    // Everything above was read after it, on the same partition, by a group that has
+    // been reading since before the canary: had it started earlier, this would be there.
+    check((await inbox(E.email)).length === 0, `it was never read, so never sent (inbox ${(await inbox(E.email)).length})`);
   } catch (err) {
     check(false, `the run stopped early: ${err instanceof Error ? err.message : String(err)}`);
     console.error(`  Notification's output:\n${excerpt(log)}`);
   } finally {
-    service.kill();
+    service?.kill();
+    for (const table of OUTAGE_TABLES) await grantBack(table).catch((err) => check(false, `could not grant SELECT on ${table} back: ${err.message}`));
     let removed = 0;
     for (const table of ['NotificationDelivery', 'ContactCard', 'NotificationPreference', 'EmailSuppression']) {
       removed += (await inTenant(owner, TENANT, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [TENANT]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
@@ -362,7 +708,7 @@ async function main() {
       await fetch(`${MAILPIT}/api/v1/messages`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ IDs: ids }) }).catch(() => {});
     }
     check(removed > 0 && Number(left) === 0, `cleanup: this run's rows are gone (${removed} deleted, ${left} left), and ${ids.length} email(s) removed from Mailpit`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-contacts`]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-contacts`, ...scanGroups]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), owner.end()]);
   }
