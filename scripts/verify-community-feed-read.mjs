@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { Kafka, logLevel } from 'kafkajs';
 import { serviceEnv } from './lib/service-env.mjs';
-import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { busyGroups, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -162,6 +162,26 @@ async function main() {
   );
   if (taken) {
     console.error(`FAIL: something already answers on :${PORT}. Stop it before running this.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  /**
+   * NOR MAY THE REAL COMMUNITY BE CONSUMING community.feed. Its feed consumer fans out
+   * with its own threshold — 5000 members — so the posts this fixture puts in spaces
+   * meant to be read at query time get FeedEntry rows too, and the control that every
+   * post is in the half the fixture intends fails on code that is right. Same guard as
+   * verify-community-feed-fanout.mjs; see there.
+   */
+  const realGroup = serviceEnv(ROOT, 'community').FEED_CONSUMER_GROUP;
+  const probe = new Kafka({ clientId: `verify-feed-read-probe-${RUN}`, brokers: relayEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING }).admin();
+  await probe.connect();
+  const busy = await busyGroups(probe, [realGroup]).finally(() => probe.disconnect().catch(() => {}));
+  if (busy.length > 0) {
+    console.error(
+      `FAIL: ${busy.join(', ')} has active members, so another Community is fanning out community.feed with its own ` +
+        'threshold. Stop it first (in compose: docker compose stop community).',
+    );
     process.exitCode = 1;
     return;
   }

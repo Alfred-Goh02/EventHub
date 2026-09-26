@@ -978,6 +978,28 @@ jobs:
       - name: Assert an address that does not exist is suppressed, and only such an address
         run: node scripts/verify-email-suppression.mjs
 
+      # Preferences and the unsubscribe link. A user changes only their own choices, in
+      # their own tenant; a password reset cannot be turned off, and a row planted to
+      # say it is off is ignored; the categories are a closed set. Following an
+      # unsubscribe link changes nothing — read after a pause, because the first
+      # version read at once and missed an unsubscribe fired from GET and not awaited —
+      # and POSTing it unsubscribes. Four kinds of tampered token are refused and change
+      # nothing, and a production process refuses the public development secret.
+      - name: Assert a user turns off only what may be turned off, and an unsubscribe link does one thing
+        run: node scripts/verify-notification-preferences.mjs
+
+      # Contact cards. Registering queues each user's address sealed to Notification,
+      # keyed tenantId:userId on the compacted topic (read off the topic itself), with
+      # no address in the outbox row and an occurredAt stamped by Postgres under the
+      # user's row lock — asserted with Auth's clock an hour fast, because on a machine
+      # whose clocks agree a stamp from `new Date()` passed. Notification stores the
+      # card still sealed; the verifier opens the stored ciphertext itself. The latest
+      # signed occurredAt wins; five kinds of forgery are dead-lettered while a genuine
+      # card behind them lands; a tombstone withdraws; the publish command queues only
+      # users who never had a card, run in its documented form.
+      - name: Assert every address reaches Notification sealed, newest first, and nothing forged gets in
+        run: node scripts/verify-contact-cards.mjs
+
       # A delivery is claimed PENDING before anything is sent, and the ones whose
       # message was dead-lettered stay that way for ever. The sweep ends them, on a
       # credential that crosses tenants and may do nothing else: it cannot create a

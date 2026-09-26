@@ -18,8 +18,28 @@ const notificationEnvSchema = z.object({
   SCHEMA_REGISTRY_URL: z.string().url(),
   /** Every sealed request's iss must be this. Only Auth's requests are acted on. */
   JWT_ISSUER: z.string().min(1),
+  /**
+   * The audience of the access tokens /preferences accepts, as every other API checks.
+   * A sealed email request is for aud eventhub-notification, so it is not accepted
+   * here, and an access token is not accepted as a sealed request.
+   */
+  JWT_AUDIENCE: z.string().min(1),
+
+  /**
+   * Signs the token in every unsubscribe link, so the link needs no login and cannot be
+   * edited to unsubscribe someone else. At least 32 characters. Changing it breaks
+   * every unsubscribe link already sent, which the law requires to keep working.
+   */
+  UNSUBSCRIBE_SECRET: z.string().min(32),
   /** One group per deployment. Verifiers run their own, so they never take its partitions. */
   KAFKA_CONSUMER_GROUP: z.string().min(1).default('notification-dispatch'),
+  /**
+   * The group that keeps the contact-card copy, from auth.user-contact. Its own, so a
+   * backlog of cards never waits behind email requests or the reverse. It always
+   * starts from the earliest offset: the topic is compacted precisely so a new group
+   * can read every user's card, and there is deliberately no setting for that.
+   */
+  CONTACTS_CONSUMER_GROUP: z.string().min(1).default('notification-contacts'),
   /**
    * Where a group with no committed offset starts. earliest, so a request queued
    * before the service first ran is still delivered if its link has not expired.
@@ -73,6 +93,15 @@ const parsed = notificationEnvSchema.safeParse(process.env);
 if (!parsed.success) {
   const issues = parsed.error.issues.map((i) => `  ${i.path.join('.')}: ${i.message}`).join('\n');
   throw new Error(`Invalid notification-service environment:\n${issues}`);
+}
+
+/**
+ * The secret in .env.example is public — it is in the repository. A production process
+ * using it would sign unsubscribe links anyone could forge, so it refuses to start. A
+ * comment saying "change this in production" is not a control; refusing to boot is.
+ */
+if (base.NODE_ENV === 'production' && parsed.data.UNSUBSCRIBE_SECRET.startsWith('dev-only-')) {
+  throw new Error('refusing to start: UNSUBSCRIBE_SECRET is the development value from .env.example');
 }
 
 export const env = Object.freeze({ ...base, ...parsed.data });

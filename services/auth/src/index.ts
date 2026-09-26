@@ -14,6 +14,7 @@ import { issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
 import { issueResetToken, lookupResetToken } from './password-reset.js';
 import { emitDevToken } from './dev-sink.js';
 import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
+import { queueContactCard } from './contact-card.js';
 import { emit } from './outbox.js';
 import { createRateLimiter } from './rate-limit.js';
 
@@ -249,6 +250,10 @@ app.post('/register', ah(async (req, res) => {
       if (claimed.count !== 1) {
         throw new Error('invite already claimed');
       }
+
+      // The new user's address, sealed for Notification, in this same transaction:
+      // a user who exists always has a card on its way. See contact-card.ts.
+      await queueContactCard(tx, { tenantId: invite.tenantId, userId: created.id, email: created.email });
 
       return created;
     });

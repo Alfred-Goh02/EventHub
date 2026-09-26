@@ -393,6 +393,9 @@ importers:
       '@eventhub/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@eventhub/http':
+        specifier: workspace:*
+        version: link:../../packages/http
       '@eventhub/kafka':
         specifier: workspace:*
         version: link:../../packages/kafka

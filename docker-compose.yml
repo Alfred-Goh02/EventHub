@@ -410,6 +410,9 @@ services:
       # names and assigned per command below, rather than hoping three migrations
       # can share one variable.
       AUTH_DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
+      # Auth's app role, for queueing contact cards: that command writes the way the
+      # service does, one tenant at a time under row security, not as the owner.
+      AUTH_APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@postgres:5432/eventhub_auth
       EVENT_DATABASE_URL: postgresql://eventhub_event_owner:eventhub_event_owner@postgres:5432/eventhub_event
       TICKETING_DATABASE_URL: postgresql://eventhub_ticketing_owner:eventhub_ticketing_owner@postgres:5432/eventhub_ticketing
       LIVE_DATABASE_URL: postgresql://eventhub_live_owner:eventhub_live_owner@postgres:5432/eventhub_live
@@ -468,6 +471,16 @@ services:
         # dies on a missing module.
         echo "setup: seeding auth"
         DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma db seed
+
+        # Seeded users get no card from /register, so they are queued here. Only
+        # users who never had one: a second `up` queues nothing.
+        #
+        # PORT is given although the command listens on nothing: Auth's db.ts validates
+        # the whole base environment, and PORT has no default there. Without it the
+        # command died with "PORT: Expected number, received nan" — in this job only,
+        # because the verifier runs it with Auth's full environment.
+        echo "setup: queueing contact cards"
+        PORT=3001 DATABASE_URL="$$AUTH_DATABASE_URL" APP_DATABASE_URL="$$AUTH_APP_DATABASE_URL" pnpm --filter @eventhub/auth run contact-cards:publish
 
         # Not optional: the broker runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
         # on purpose, so nothing will create these on first publish.
@@ -975,6 +988,9 @@ services:
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
       EMAIL_FROM: no-reply@eventhub.local
+      # The development value from .env.example. NODE_ENV is development here; a
+      # production process refuses to start with this.
+      UNSUBSCRIBE_SECRET: dev-only-unsubscribe-secret-change-me-0123456789
     volumes:
       - jwt-public:/run/eventhub/keys:ro
       # keys/ resolves beside dist/, so the layout fixes this mount point.
