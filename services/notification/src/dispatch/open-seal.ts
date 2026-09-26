@@ -68,21 +68,26 @@ export async function loadNotificationPrivateKey(): Promise<CryptoKey> {
 
 const reason = (err: unknown): string => (err as { code?: string })?.code ?? (err instanceof Error ? err.name : 'unknown');
 
+/** The one decryption, with the algorithms pinned, for every kind of seal. */
+async function unseal(sealed: string, privateKey: CryptoKey): Promise<string> {
+  try {
+    const { plaintext } = await compactDecrypt(sealed, privateKey, {
+      keyManagementAlgorithms: ['RSA-OAEP-256'],
+      contentEncryptionAlgorithms: ['A256GCM'],
+    });
+    return new TextDecoder().decode(plaintext);
+  } catch (err) {
+    throw new PoisonMessage(`the seal did not open (${reason(err)})`);
+  }
+}
+
 export function createSealOpener(opts: { privateKey: CryptoKey; authPublicKey: CryptoKey; issuer: string }) {
   return async function open(envelope: EmailRequestEnvelope): Promise<OpenedEmailRequest> {
-    let plaintext: Uint8Array;
-    try {
-      ({ plaintext } = await compactDecrypt(envelope.sealed, opts.privateKey, {
-        keyManagementAlgorithms: ['RSA-OAEP-256'],
-        contentEncryptionAlgorithms: ['A256GCM'],
-      }));
-    } catch (err) {
-      throw new PoisonMessage(`the seal did not open (${reason(err)})`);
-    }
+    const plaintext = await unseal(envelope.sealed, opts.privateKey);
 
     let claims;
     try {
-      ({ payload: claims } = await jwtVerify(new TextDecoder().decode(plaintext), opts.authPublicKey, {
+      ({ payload: claims } = await jwtVerify(plaintext, opts.authPublicKey, {
         algorithms: ['RS256'],
         issuer: opts.issuer,
         audience: EMAIL_REQUEST_AUDIENCE,
@@ -122,5 +127,67 @@ export function createSealOpener(opts: { privateKey: CryptoKey; authPublicKey: C
       link: claims.link,
       expiresAt: new Date((claims.exp as number) * 1000),
     };
+  };
+}
+
+/**
+ * A contact card's type, pinned here as the email request's is above. The two are
+ * sealed to the same key and signed by the same key, so the type is all that tells
+ * them apart: a card must never be accepted as a request to send, nor the reverse.
+ */
+export const CONTACT_CARD_TYPE = 'auth-contact+jwt';
+
+export interface ContactCardEnvelope {
+  messageId: string;
+  occurredAt: string;
+  tenantId: string;
+  userId: string;
+  sealed: string;
+}
+
+export interface OpenedContactCard {
+  tenantId: string;
+  userId: string;
+  email: string;
+}
+
+/**
+ * Opens a contact card from auth.user-contact and believes it only if Auth signed it
+ * for THIS envelope. Same two layers, and the same reasons, as an email request.
+ *
+ * No exp is required: a card stands until a newer one replaces it.
+ */
+export function createCardOpener(opts: { privateKey: CryptoKey; authPublicKey: CryptoKey; issuer: string }) {
+  return async function openCard(envelope: ContactCardEnvelope): Promise<OpenedContactCard> {
+    const plaintext = await unseal(envelope.sealed, opts.privateKey);
+
+    let claims;
+    try {
+      ({ payload: claims } = await jwtVerify(plaintext, opts.authPublicKey, {
+        algorithms: ['RS256'],
+        issuer: opts.issuer,
+        audience: EMAIL_REQUEST_AUDIENCE,
+        typ: CONTACT_CARD_TYPE,
+        requiredClaims: ['sub', 'jti', 'iat'],
+      }));
+    } catch (err) {
+      throw new PoisonMessage(`Auth's signature did not verify (${reason(err)})`);
+    }
+
+    // The envelope is plaintext anyone can edit; these are what Auth signed.
+    if (claims.jti !== envelope.messageId) {
+      throw new PoisonMessage('the card was sealed for a different message (jti does not match)');
+    }
+    if (claims.sub !== envelope.userId || claims.tenantId !== envelope.tenantId) {
+      throw new PoisonMessage('the card names a different user or tenant than its envelope');
+    }
+    // The ordering key. Unsigned, a replayed old card could claim to be the newest.
+    if (claims.occurredAt !== envelope.occurredAt) {
+      throw new PoisonMessage('the card was sealed at a different time than its envelope says');
+    }
+    if (typeof claims.email !== 'string' || claims.email.length === 0) {
+      throw new PoisonMessage('the card carries no address');
+    }
+    return { tenantId: claims.tenantId as string, userId: claims.sub as string, email: claims.email };
   };
 }

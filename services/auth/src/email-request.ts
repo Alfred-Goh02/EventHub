@@ -74,6 +74,15 @@ export async function sealEmailRequest(params: {
     claims: { tenantId: params.tenantId, email: params.email, link: params.link, kind: params.kind },
   });
 
+  return sealToNotification(signed);
+}
+
+/**
+ * Encrypts a JWS Auth has signed to Notification's key, with the algorithms pinned
+ * above. The one place that seals anything for Notification, so a contact card and
+ * an email request cannot drift onto different algorithms.
+ */
+export function sealToNotification(signed: string): Promise<string> {
   return new CompactEncrypt(new TextEncoder().encode(signed))
     .setProtectedHeader({ alg: KEY_ALG, enc: CONTENT_ALG, cty: 'JWT', kid: notificationKeyId })
     .encrypt(notificationKey);
