@@ -10,6 +10,7 @@ import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/co
 import { contactsMetrics, createContactsConsumer } from './contacts/consumer.js';
 import { COMMUNITY_TOPIC, createReplyHandler, replyMetrics } from './dispatch/replies.js';
 import { createSweeper } from './sweeper/index.js';
+import { createDigestFlusher } from './digest/index.js';
 import { preferenceRoutes } from './preferences/routes.js';
 
 /**
@@ -33,6 +34,7 @@ const channel = createSmtpChannel({ host: env.SMTP_HOST, port: env.SMTP_PORT, fr
 let dispatcher: ReturnType<typeof createDispatcher> | null = null;
 let contacts: ReturnType<typeof createContactsConsumer> | null = null;
 let sweeper: ReturnType<typeof createSweeper> | null = null;
+let digest: ReturnType<typeof createDigestFlusher> | null = null;
 
 const app = express();
 app.use(express.json());
@@ -75,6 +77,7 @@ app.get('/metrics', async (_req, res) => {
     // Straight from memory: the sweep keeps its own counts and asks the database on
     // its own clock, so a /metrics request never waits on it.
     sweep: sweeper?.metrics() ?? null,
+    digest: digest?.metrics() ?? null,
   });
 });
 
@@ -162,6 +165,7 @@ async function shutdown(signal: string): Promise<void> {
   await Promise.all([dispatcher?.stop(), contacts?.stop()]);
   logger.info({ ms: Date.now() - started }, 'dispatch and contact consumers stopped');
   await sweeper?.stop();
+  await digest?.stop();
   await prisma.$disconnect().catch(() => {});
   logger.info({ ms: Date.now() - started }, 'shut down');
   process.exit(0);
@@ -214,6 +218,7 @@ async function main(): Promise<void> {
             publicUrl: env.NOTIFICATION_PUBLIC_URL,
             appUrl: env.PUBLIC_APP_URL,
             maxAgeMs: env.REPLY_MAX_AGE_MS,
+            perHour: env.REPLY_HOURLY_LIMIT,
           }),
       },
     ],
@@ -239,6 +244,18 @@ async function main(): Promise<void> {
     logger,
   });
 
+  digest = createDigestFlusher({
+    databaseUrl: env.DIGEST_DATABASE_URL,
+    intervalMs: env.DIGEST_INTERVAL_MS,
+    batchSize: env.DIGEST_BATCH_SIZE,
+    openCard: createCardOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
+    channel,
+    logger,
+    unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
+    publicUrl: env.NOTIFICATION_PUBLIC_URL,
+    appUrl: env.PUBLIC_APP_URL,
+  });
+
   app.listen(env.PORT, () => {
     logger.info(`notification-service listening on port ${env.PORT}`);
   });
@@ -248,6 +265,9 @@ async function main(): Promise<void> {
   // here rather than being discovered by someone reading grants later.
   await sweeper.start();
   logger.info({ everyMs: env.SWEEP_INTERVAL_MS, stuckAfterMs: env.SWEEP_STUCK_AFTER_MS }, 'stuck-delivery sweep running');
+  // The same for the digest's credential.
+  await digest.start();
+  logger.info({ everyMs: env.DIGEST_INTERVAL_MS, perHour: env.REPLY_HOURLY_LIMIT }, 'reply digest running');
 }
 
 main().catch((err) => {

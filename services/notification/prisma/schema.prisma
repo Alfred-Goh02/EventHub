@@ -123,3 +123,21 @@ model ContactCard {
 
   @@id([tenantId, userId])
 }
+
+/// A reply held back by the per-person hourly limit, waiting for the hourly digest.
+/// COUNTS AND LINKS ONLY: the post it was on and whether it answered a comment, never
+/// the reply's words or its author. See migration 20260927090000.
+model DigestItem {
+  tenantId        String
+  userId          String
+  category        String
+  sourceMessageId String
+  postId          String
+  toComment       Boolean
+  /// Set when a flush takes the item into a digest; that digest's sent-log identity.
+  digestId        String?
+  createdAt       DateTime @default(now())
+
+  @@id([tenantId, userId, category, sourceMessageId])
+  @@index([createdAt])
+}

@@ -7,6 +7,10 @@ import { signUnsubscribe } from '../preferences/unsubscribe-token.js';
 import { deliver, describe, isTransient, type HandlerContext, type MessageHandler, type MessageHandlerOptions, type Outcome } from './consumer.js';
 import { PoisonMessage, type ContactCardEnvelope, type OpenedContactCard } from './open-seal.js';
 import { closePending, type DeliveryKey } from './sent-log.js';
+import { sendOrHold } from '../digest/hold.js';
+
+/** The preference a reply is sent under, and the category its held items carry. */
+const DIGEST_CATEGORY = 'COMMUNITY_REPLY';
 import { renderCommunityReply } from './templates.js';
 
 export const COMMUNITY_TOPIC = 'community.feed';
@@ -37,6 +41,11 @@ const COMMENT_CREATED_EVENT = 'community.comment_created';
  *     has fallen behind, which its lag in /metrics shows.
  * None writes to the sent-log on a first attempt: nothing was attempted. On a retry an
  * earlier attempt may have claimed the delivery, so its row is closed with the reason.
+ *
+ * THEN THE HOURLY LIMIT, last, once everything else says the email would go: past five
+ * reply emails in the hour, a reply is held and goes out in the hourly digest instead
+ * (digest/). A reply that passes is claimed in the same step, under a lock per
+ * recipient, so two read at once cannot both take the fifth place.
  *
  * Then the shared half — claim, suppression list, send, record — exactly as a
  * password reset takes it, so a redelivered reply is not sent twice.
@@ -70,7 +79,7 @@ const envelopeSchema = z.object({
   recipientId: z.string().nullable().optional(),
 });
 
-const counters = { received: 0, notAReply: 0, nobodyToTell: 0, toSelf: 0, tooOld: 0, optedOut: 0, noAddress: 0, poison: 0, handedOn: 0 };
+const counters = { received: 0, notAReply: 0, nobodyToTell: 0, toSelf: 0, tooOld: 0, optedOut: 0, noAddress: 0, held: 0, poison: 0, handedOn: 0 };
 
 export function replyMetrics(): Record<string, number> {
   return {
@@ -86,6 +95,8 @@ export function replyMetrics(): Record<string, number> {
     optedOutTotal: counters.optedOut,
     /** No contact card for the recipient, or one that no longer opens. */
     noAddressTotal: counters.noAddress,
+    /** Past the recipient's hourly limit: held for the digest, not emailed on its own. */
+    heldTotal: counters.held,
     poisonTotal: counters.poison,
     /** Went on to claim, suppression and send; see dispatch's counters for what became of them. */
     handedOnTotal: counters.handedOn,
@@ -93,7 +104,7 @@ export function replyMetrics(): Record<string, number> {
 }
 
 /** The stored card, as the envelope openCard checks it against. Rendered by Postgres, never through a JS Date. */
-async function loadCard(tenantId: string, userId: string): Promise<ContactCardEnvelope | null> {
+export async function loadCard(tenantId: string, userId: string): Promise<ContactCardEnvelope | null> {
   const rows = await withTenant(tenantId, (tx) =>
     tx.$queryRaw<Array<{ sealed: string; messageId: string; occurredAt: string }>>`
       SELECT c.sealed, c."messageId", to_char(c."occurredAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "occurredAt"
@@ -123,6 +134,8 @@ export function createReplyHandler(opts: {
   appUrl: string;
   /** Past this age a reply is not sent. See the note at the top of this file. */
   maxAgeMs: number;
+  /** Reply emails per recipient per hour; the rest are held for the digest. See digest/hold.ts. */
+  perHour: number;
 }): MessageHandler {
   const skipped = (why: string): Outcome => ({ kind: 'skipped', why });
   const transient = (err: unknown): Outcome => ({ kind: 'transient', error: describe(err) });
@@ -240,6 +253,27 @@ export function createReplyHandler(opts: {
         return decline('address unreadable');
       }
       return transient(err);
+    }
+
+    // Last, once everything else says this person would be emailed: a reply to someone
+    // opted out or unreachable must not use up their hour, or be held for a digest
+    // nobody will receive.
+    let admission;
+    try {
+      admission = await sendOrHold(key, {
+        category: 'community',
+        digestCategory: DIGEST_CATEGORY,
+        postId: e.postId,
+        toComment: Boolean(e.parentCommentId),
+        perHour: opts.perHour,
+      });
+    } catch (err) {
+      return transient(err);
+    }
+    if (admission === 'held') {
+      counters.held += 1;
+      opts.logger.info(ids, 'past this recipient\'s hourly limit; held for the digest');
+      return skipped('held for the digest');
     }
 
     const unsubscribeUrl = `${opts.publicUrl}/unsubscribe?token=${encodeURIComponent(

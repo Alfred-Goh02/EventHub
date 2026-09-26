@@ -536,9 +536,18 @@ works, that the old password stops working and that the session issued before th
 reset is revoked — then removes what it made. Locally the mail arrives about a second
 after the request.
 
-Preferences and rate limits are still to come, and arrive with the first email
-anyone could opt out of. Chapter 9, community, is designed and documented but not
-implemented.
+Replies are the second email, and the first anyone can turn off. When someone
+answers your comment or post in Community, Notification emails you — never about
+your own reply, never once you can no longer read the space, never an hour late — with
+a one-click unsubscribe that works without logging in. A password reset can never be
+turned off. Past five reply emails in an hour, the rest are held and go out as one
+digest an hour, which carries counts and links and none of the replies' words. The
+digest finds who is waiting on a credential of its own that can read three columns
+and nothing else; one pass by hand is:
+
+```bash
+pnpm --filter @eventhub/notification run digest:once
+```
 
 Known gaps, named rather than hidden:
 
