@@ -1012,6 +1012,16 @@ jobs:
       - name: Assert a reply reaches the person it answers, once, with a way out
         run: node scripts/verify-reply-emails.mjs
 
+      # Five reply emails per person per hour; the rest are held and go out as one
+      # digest an hour, with counts and links and none of the replies' words. Exactly
+      # five even with replies arriving on two consumers at once. At send time the
+      # preference, the card and the suppression list are asked again, a digest taken
+      # and never settled is settled without being sent twice, and nothing goes before
+      # a pass. The digest's credential reads three columns across tenants and nothing
+      # else, and the service refuses to start on a wider one.
+      - name: Assert past five an hour, replies wait for one digest of counts and links
+        run: node scripts/verify-reply-digest.mjs
+
       # A delivery is claimed PENDING before anything is sent, and the ones whose
       # message was dead-lettered stay that way for ever. The sweep ends them, on a
       # credential that crosses tenants and may do nothing else: it cannot create a
