@@ -334,7 +334,10 @@ async function main() {
     console.log('  held means held, until a pass');
     // G and H: one over the limit each. G then turns replies off, and H's card goes.
     for (const user of [G, H]) for (let i = 0; i <= LIMIT; i++) await produce(reply(user));
-    await waitFor(async () => (await heldItems(G)).length === 1 && (await heldItems(H)).length === 1, 45_000);
+    const bothHeld = await waitFor(async () => (await heldItems(G)).length === 1 && (await heldItems(H)).length === 1, 45_000);
+    // Without it, "no digest and nothing held" below would hold of two people who were
+    // never held anything at all.
+    check(Boolean(bothHeld), `CONTROL: one held reply each for the two people whose circumstances change (${(await heldItems(G)).length}, ${(await heldItems(H)).length})`);
     await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'COMMUNITY_REPLY', 'EMAIL', false)`, [TENANT, G.id]);
     await inTenant(owner, TENANT, `DELETE FROM "ContactCard" WHERE "tenantId" = $1 AND "userId" = $2`, [TENANT, H.id]);
     // S: held replies to a suppressed address, planted, since a suppressed delivery does
