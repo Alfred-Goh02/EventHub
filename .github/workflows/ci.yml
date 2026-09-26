@@ -1096,15 +1096,23 @@ jobs:
       # A comment saying "never enable this in production" is not a control.
       # Refusing to boot is. Same shape as the relay and ticketing refuse-to-start
       # checks.
+      #
+      # PUBLIC_APP_URL is https so that the sink is the only reason left to refuse:
+      # production also refuses a plain-http origin, and without one this step went
+      # green on THAT refusal with the sink's check deleted. The grep names the sink
+      # for the same reason. timeout, so a service that starts fails the step rather
+      # than hanging it.
       - name: Assert the dev token sink cannot run in production
         working-directory: services/auth
         run: |
           set +e
-          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PORT=3098 node dist/index.js > /tmp/sink.log 2>&1
+          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PUBLIC_APP_URL=https://app.eventhub.example PORT=3098 \
+            timeout 60 node dist/index.js > /tmp/sink.log 2>&1
           CODE=$?
           set -e
-          test "$CODE" != "0" || { echo "the service started with the dev sink enabled in production"; exit 1; }
-          grep -q "refusing to start" /tmp/sink.log \
+          test "$CODE" != "0" && test "$CODE" != "124" \
+            || { echo "the service started with the dev sink enabled in production:"; cat /tmp/sink.log; exit 1; }
+          grep -q "Error: refusing to start: AUTH_DEV_TOKEN_SINK" /tmp/sink.log \
             || { echo "exited non-zero but not for the right reason:"; cat /tmp/sink.log; exit 1; }
           echo "correctly refused to start"
 
