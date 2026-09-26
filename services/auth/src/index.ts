@@ -1,10 +1,10 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import express from 'express';
-import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
 import { ah } from '@eventhub/http';
+import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
@@ -18,15 +18,14 @@ import { queueContactCard } from './contact-card.js';
 import { emit } from './outbox.js';
 import { createRateLimiter } from './rate-limit.js';
 
-const env = loadBaseEnv();
 const logger = createLogger('auth-service');
 
 /**
- * Where a reset link points. Only ever used to build the dev sink's URL, so the
- * localhost default is honest rather than lazy — there is no front end in this
- * repository yet, and a token is delivered to a developer reading logs.
+ * Where invite and reset links point. Validated in env.ts, which refuses to start a
+ * production process on anything but https: the default is localhost, and a reset
+ * link is now emailed rather than printed for a developer.
  */
-const RESET_URL_BASE = process.env['PUBLIC_APP_URL'] ?? 'http://localhost:3000';
+const RESET_URL_BASE = env.PUBLIC_APP_URL;
 
 const app = express();
 
