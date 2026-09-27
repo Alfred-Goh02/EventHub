@@ -29,7 +29,18 @@ export function createDigestFlusher(
     'notification-digest',
   );
 
-  const counters = { passes: 0, failures: 0, recipientFailures: 0, digestsSent: 0, itemsSettled: 0, droppedOptedOut: 0, droppedNoAddress: 0, deferred: 0 };
+  const counters = {
+    passes: 0,
+    failures: 0,
+    recipientFailures: 0,
+    busyElsewhere: 0,
+    digestsSent: 0,
+    itemsSettled: 0,
+    droppedOptedOut: 0,
+    droppedNoAddress: 0,
+    droppedStale: 0,
+    deferred: 0,
+  };
   let last: { at: number; waiting: number } | null = null;
   let timer: NodeJS.Timeout | null = null;
   let stopping = false;
@@ -41,8 +52,10 @@ export function createDigestFlusher(
       counters.itemsSettled += r.itemsSettled;
       counters.droppedOptedOut += r.droppedOptedOut;
       counters.droppedNoAddress += r.droppedNoAddress;
+      counters.droppedStale += r.droppedStale;
       counters.deferred += r.deferred;
       counters.recipientFailures += r.recipientFailures;
+      counters.busyElsewhere += r.busyElsewhere;
       counters.passes += 1;
       last = { at: Date.now(), waiting: r.waiting };
     } catch (err) {
@@ -74,7 +87,11 @@ export function createDigestFlusher(
         itemsSettledTotal: counters.itemsSettled,
         droppedOptedOutTotal: counters.droppedOptedOut,
         droppedNoAddressTotal: counters.droppedNoAddress,
+        /** Held replies more than a day old, dropped rather than counted. */
+        droppedStaleTotal: counters.droppedStale,
         deferredTotal: counters.deferred,
+        /** People another pass was already flushing, stepped over. */
+        busyElsewhereTotal: counters.busyElsewhere,
         /** People with replies waiting at the last pass, up to the batch size. */
         waitingAtLastPass: last?.waiting ?? null,
         lastPassAgeMs: last ? Date.now() - last.at : null,

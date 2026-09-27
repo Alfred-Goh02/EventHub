@@ -23,6 +23,14 @@ import { idempotencyKey, insertClaim, type DeliveryKey } from '../dispatch/sent-
  * A MESSAGE ALREADY DECIDED STAYS DECIDED. One that already has a delivery row is
  * deliver()'s to judge (a duplicate, or a retry of a claim), and one already held
  * stays held; neither is counted again.
+ *
+ * UNTIL ITS DIGEST GOES. A held item is deleted once its digest is settled, and nothing
+ * remembers that the message was held. So a copy redelivered after that — the offset
+ * commit that followed the hold failed, and Kafka sends the message again — is judged
+ * afresh, and emailed on its own if the person's hour has room. It takes a failed
+ * commit, a digest pass, and a redelivery inside REPLY_MAX_AGE_MS, and costs one email
+ * for a reply the digest already counted. Accepted: remembering every held message
+ * past its digest would keep, for every reply, the record this table exists to drop.
  */
 
 /** The advisory-lock namespace for this, so no other lock in the database can collide with it. */

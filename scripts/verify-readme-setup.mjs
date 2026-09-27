@@ -248,6 +248,41 @@ function main() {
 
   // -------------------------------------------------------------------------
   console.log('');
+  console.log('  and the databases and roles it says db/init creates are the ones it creates');
+  // -------------------------------------------------------------------------
+  /**
+   * The same kind of number, with the same fate: the README said "eighteen roles" after
+   * a nineteenth was bootstrapped, and a review noticed, not a check. Counted from the
+   * one file that creates them, statements only: an anchored `CREATE ROLE` never
+   * matches a comment that mentions one.
+   */
+  const bootstrap = readFileSync(join(ROOT, 'db', 'init', '01-bootstrap.sql'), 'utf8');
+  const created = {
+    databases: (bootstrap.match(/^CREATE DATABASE /gm) ?? []).length,
+    roles: (bootstrap.match(/^CREATE ROLE /gm) ?? []).length,
+  };
+  const NUMBER_WORDS = [
+    'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+    'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty',
+    'twenty-one', 'twenty-two', 'twenty-three', 'twenty-four', 'twenty-five', 'twenty-six', 'twenty-seven', 'twenty-eight', 'twenty-nine', 'thirty',
+  ];
+  const asNumber = (word) => (/^\d+$/.test(word) ? Number(word) : NUMBER_WORDS.indexOf(word.toLowerCase()));
+  const said = readme.match(/([\w-]+) databases and ([\w-]+) roles/);
+  check(
+    said !== null && created.databases > 0 && created.roles > 0,
+    said
+      ? `the README says "${said[0]}", and db/init creates ${created.databases} database(s) and ${created.roles} role(s)`
+      : 'the README no longer says how many databases and roles db/init creates, so this cannot check it',
+  );
+  if (said) {
+    check(
+      asNumber(said[1]) === created.databases && asNumber(said[2]) === created.roles,
+      `the README's numbers are db/init's (${said[1]} = ${created.databases}? ${said[2]} = ${created.roles}?)`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  console.log('');
   console.log('  and every setup script CI runs is a script the README tells you to run');
   // -------------------------------------------------------------------------
   const scripts = new Set();

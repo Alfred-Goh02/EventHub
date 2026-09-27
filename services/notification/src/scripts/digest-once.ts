@@ -44,9 +44,9 @@ async function main(): Promise<void> {
       { batchSize: env.DIGEST_BATCH_SIZE },
     );
     console.log(
-      `sent ${r.digestsSent} digest(s) to ${r.waiting} waiting (up to ${env.DIGEST_BATCH_SIZE}); settled ${r.itemsSettled} held ` +
-        `repl${r.itemsSettled === 1 ? 'y' : 'ies'}; dropped ${r.droppedOptedOut} opted out and ${r.droppedNoAddress} without an address; ` +
-        `deferred ${r.deferred}; failed ${r.recipientFailures}`,
+      `sent ${r.digestsSent} digest(s) to ${r.waiting} waiting; settled ${r.itemsSettled} held ` +
+        `repl${r.itemsSettled === 1 ? 'y' : 'ies'}; dropped ${r.droppedOptedOut} opted out, ${r.droppedNoAddress} without an address ` +
+        `and ${r.droppedStale} stale; deferred ${r.deferred}; stepped over ${r.busyElsewhere} another pass had; failed ${r.recipientFailures}`,
     );
     if (r.recipientFailures > 0) process.exitCode = 1;
   } finally {
