@@ -29,8 +29,9 @@
  *
  * THE OTHER WAY ROUND IS TRUE TOO: this run sweeps with a five-second threshold, and
  * the sweep crosses tenants by design, so any delivery anywhere in this database that
- * has sat PENDING for longer than that is ended as well. In CI nothing else is
- * mid-flight; on a developer's stack it is the sweep doing exactly what it is for.
+ * has sat PENDING for longer than that is ended as well. That is the sweep doing exactly
+ * what it is for, so the count it reports is checked against every tenant at the sweep's
+ * own instant, never against the number of rows this run planted.
  *
  * Run (with Postgres, Kafka and the Schema Registry up, Notification built and
  * migrated): node scripts/verify-notification-sweeper.mjs
@@ -42,6 +43,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+// The reason the sweep writes, from the service itself rather than copied here, so the
+// rows a pass ended are found by exactly what it wrote.
+import { ABANDONED } from '../services/notification/dist/sweeper/sweep.js';
 import { serviceEnv } from './lib/service-env.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -167,7 +171,46 @@ async function main() {
       child.stderr.on('data', (d) => (log += d));
       child.on('exit', (code) => done({ code, log }));
     });
-    check(once.code === 0 && /abandoned 2 deliveries/.test(once.log), `sweep:once ended exactly the two stuck deliveries (exit ${once.code}: ${once.log.trim().split(/\r?\n/).pop()})`);
+    /**
+     * EXACTLY THE STUCK DELIVERIES, IN EVERY TENANT, JUDGED AT THE SWEEP'S OWN INSTANT.
+     *
+     * This used to require "abandoned 2 deliveries", the two this run planted. The sweep
+     * crosses tenants by design, so any delivery in this database left PENDING past the
+     * threshold is its business, and that count was true only of a database this run had
+     * to itself: it failed on a third tenant's stuck delivery, which the sweep was right
+     * to end. Nor can the stuck rows be counted just before the sweep: pnpm and a new
+     * process start in between, and another verifier's delivery that crosses the threshold
+     * in that gap is swept correctly and then counted as a surprise.
+     *
+     * So the pass is found by its own mark. One UPDATE ends every row it ends, under one
+     * now(), so the failedAt it gave this run's stuck delivery names the pass. The sweeper
+     * role reads every tenant, and says, against that same instant: how many rows the
+     * pass ended, whether any was younger than the threshold, and whether any delivery
+     * that was already stuck then is still PENDING. The instant stays in SQL throughout.
+     */
+    const reported = Number(once.log.match(/abandoned (\d+) deliver/)?.[1] ?? NaN);
+    const at = (await sweeperRole.query('SELECT d."failedAt"::text AS at FROM "NotificationDelivery" d WHERE d.id = $1', [stuck])).rows[0]?.at ?? null;
+    const pass = at === null ? null : (await sweeperRole.query(
+      `SELECT count(*)::int AS ended,
+              count(*) FILTER (WHERE d."createdAt" >= $1::timestamp - ($2::double precision * interval '1 millisecond'))::int AS young,
+              count(*) FILTER (WHERE d.id = ANY($4::text[]))::int AS ours
+         FROM "NotificationDelivery" d
+        WHERE d."failedAt" = $1::timestamp AND d."lastError" = $3`,
+      [at, STUCK_AFTER_MS, ABANDONED, [stuck, otherStuck]],
+    )).rows[0];
+    const leftStuck = at === null ? null : (await sweeperRole.query(
+      `SELECT count(*)::int AS n FROM "NotificationDelivery" d
+        WHERE d.status = 'PENDING' AND d."createdAt" < $1::timestamp - ($2::double precision * interval '1 millisecond')`,
+      [at, STUCK_AFTER_MS],
+    )).rows[0].n;
+    check(
+      once.code === 0 && pass !== null && reported === pass.ended && pass.ours === 2,
+      `sweep:once reported exactly the deliveries its pass ended, in every tenant (exit ${once.code}: "${once.log.trim().split(/\r?\n/).pop()}"; ` +
+        `the pass at ${at ?? 'NO PASS FOUND'} ended ${pass?.ended ?? 'none'}, this run's two stuck ones among them: ${pass?.ours ?? 0} of 2)`,
+    );
+    check(pass !== null && pass.young === 0, `and not one of them was younger than the threshold at that instant (${pass?.young ?? 'no pass'})`);
+    check(leftStuck === 0, `and no delivery in any tenant that was already stuck at that instant is still PENDING (${leftStuck ?? 'no pass'})`);
+
     const sweptRow = await rowById(TENANT, stuck);
     check(sweptRow?.status === 'FAILED' && /abandoned/.test(sweptRow.lastError ?? '') && Boolean(sweptRow.failedAt), `the stuck delivery is FAILED, with a reason and a time (${sweptRow?.status}: ${sweptRow?.lastError})`);
     check((await rowById(OTHER_TENANT, otherStuck))?.status === 'FAILED', "the other tenant's stuck delivery went in the same pass, which a tenant-scoped role could not do");
@@ -231,11 +274,15 @@ async function main() {
     console.error(`  Notification's output:\n${excerpt(service.log())}`);
   } finally {
     service.child.kill();
+    // In each row's own tenant, the context it was written in, and reported by what was
+    // DELETED: "0 left" is also what a delete that matched nothing prints.
+    let deleted = 0;
+    let left = 0;
     for (const tenant of [TENANT, OTHER_TENANT]) {
-      await inTenant(owner, tenant, 'DELETE FROM "NotificationDelivery" WHERE "tenantId" = $1', [tenant]).catch(() => {});
+      deleted += (await inTenant(owner, tenant, 'DELETE FROM "NotificationDelivery" d WHERE d."tenantId" = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+      left += (await rowsOf(tenant).catch(() => [])).length;
     }
-    const left = (await rowsOf(TENANT).catch(() => [])).length + (await rowsOf(OTHER_TENANT).catch(() => [])).length;
-    check(left === 0, `cleanup: this run's deliveries are gone (${left} left)`);
+    check(deleted > 0 && left === 0, `cleanup: this run's deliveries are gone (${deleted} deleted, ${left} left)`);
     await Promise.all([owner.end().catch(() => {}), sweeperRole.end().catch(() => {})]);
   }
 
