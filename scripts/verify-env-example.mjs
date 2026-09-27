@@ -72,14 +72,25 @@ import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
 const RUN = randomBytes(4).toString('hex');
 /**
  * Every consumer group this run's services join starts with this. A prefix rather than
- * a suffix, so the groups a service DERIVES from its configured name (Notification's
- * `${group}-retry`) carry it too, and the cleanup finds them without being told.
+ * a suffix, so the groups a service DERIVES from its configured name carry it too:
+ * Notification runs four more from KAFKA_CONSUMER_GROUP (`-retry`, `-replies`,
+ * `-replies-retry`), and each is this run's without being named here.
  */
 const RUN_PREFIX = `verify-env-${RUN}-`;
 
 /** The example keys that name a consumer group, and the ones that say where a new group starts. */
 const isGroupKey = (key) => /(^|_)GROUP(_|$)/.test(key);
 const isStartKey = (key) => /(^|_)START_FROM$/.test(key);
+
+/**
+ * A deployed group, or one a service derives from a deployed group's name:
+ * notification-dispatch, and notification-dispatch-retry, -replies and -replies-retry
+ * with it, whatever suffixes a service adds next. A name carrying a run's hex tag is
+ * another verifier's (community-feed-verify-1a2b3c4d), not a deployed one.
+ */
+const isRealFamily = (groupId, realGroups) =>
+  !groupId.startsWith(RUN_PREFIX) &&
+  realGroups.some((r) => groupId === r || (groupId.startsWith(`${r}-`) && !/[0-9a-f]{8}/.test(groupId.slice(r.length))));
 
 /** Scratch ports, well away from anything a developer is likely to be running. */
 const SERVICES = [
@@ -149,9 +160,16 @@ async function waitForHttp(port, path, timeoutMs) {
   return false;
 }
 
-/** Each group's current members, id to "clientId@host". A group the cluster does not know has none. */
-async function membersOf(admin, groupIds) {
-  const { groups } = await admin.describeGroups([...new Set(groupIds)]);
+/**
+ * Every group the cluster lists, with its current members, id to "clientId@host".
+ *
+ * All of them, not a list: the groups a service derives from its configured name are
+ * not in any example, so the only way to see one being joined is to look at everything.
+ */
+async function allMembers(admin) {
+  const ids = (await admin.listGroups()).groups.map((g) => g.groupId);
+  if (ids.length === 0) return new Map();
+  const { groups } = await admin.describeGroups(ids);
   return new Map(groups.map((g) => [g.groupId, new Map(g.members.map((m) => [m.memberId, `${m.clientId}@${m.clientHost}`]))]));
 }
 
@@ -204,7 +222,7 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
 
   const mine = Object.keys(parsed).filter(isGroupKey).map((k) => env[k]);
   for (const g of mine) kafka.configured.add(g);
-  const before = await membersOf(kafka.admin, [...kafka.realGroups, ...mine]);
+  const before = await allMembers(kafka.admin);
 
   const child = spawn(process.execPath, [svc.entry ?? 'dist/index.js'], {
     cwd: dir,
@@ -245,29 +263,37 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
   /**
    * NOT A MEMBER OF ANY REAL GROUP, checked while the process is still alive.
    *
-   * First it is given until each group it is configured with has gained a member, so
-   * by the time the real groups are read its consumers have joined SOMEWHERE: a check
-   * made before the join would pass on a service that was about to join the real group.
+   * First it is given until each group it is configured with has gained a member, and
+   * then until the set of groups gaining members stops growing, so by the time the real
+   * ones are read its consumers have joined SOMEWHERE, derived groups included: a check
+   * made before the join would pass on a service that was about to join a real group.
    * A process with no consumer (Analytics' HTTP side shares the ingest's example) just
    * waits the time out.
+   *
+   * Real means the whole family: a deployed group, or any group named from one, since a
+   * derived group that escaped this run's prefix is as live as the one it came from.
    */
   if (up && mine.length > 0) {
     const deadline = Date.now() + 15_000;
     let now = before;
+    let settled = '';
     while (Date.now() < deadline) {
-      now = await membersOf(kafka.admin, [...kafka.realGroups, ...mine]);
-      if (gainedMember(before, now, mine).length === mine.length) break;
-      await sleep(500);
+      now = await allMembers(kafka.admin);
+      const moving = gainedMember(before, now, [...now.keys()]).sort().join(',');
+      if (gainedMember(before, now, mine).length === mine.length && moving === settled) break;
+      settled = moving;
+      await sleep(1_000);
     }
-    const joined = gainedMember(before, now, mine);
+    const joined = gainedMember(before, now, [...now.keys()].filter((g) => g.startsWith(RUN_PREFIX))).sort();
     for (const g of joined) kafka.joined.add(g);
-    const real = gainedMember(before, now, kafka.realGroups);
+    const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups))).sort();
     const starts = Object.keys(consumer).filter(isStartKey).map((k) => `${k}=${consumer[k]}`);
     check(
       real.length === 0,
       real.length === 0
         ? `${svc.label ?? svc.name} joined no real consumer group ` +
-            `(${joined.length ? `it consumed as ${joined.join(', ')}` : 'it joined no group at all'}${starts.length ? `, ${starts.join(', ')}` : ''})`
+            `(${joined.length ? `it consumed as this run's ${joined.map((g) => g.slice(RUN_PREFIX.length)).join(', ')}` : 'it joined no group at all'}` +
+            `${starts.length ? `; ${starts.join(', ')}` : ''})`
         : `${svc.label ?? svc.name} JOINED ${real.map((g) => `${g} (as ${newcomers(before, now, g).join(', ')})`).join(', ')}: ` +
             "for as long as it runs it takes partitions, and messages, from that group's real consumers, and it is killed mid-flight",
     );
@@ -458,10 +484,12 @@ async function main() {
      */
     const configured = [...kafka.configured];
     const unseen = configured.filter((g) => !kafka.joined.has(g));
+    const derived = [...kafka.joined].filter((g) => !kafka.configured.has(g));
     check(
       configured.length > 0 && unseen.length === 0,
-      `CONTROL: every group the services consumed as gained a member while they ran (${configured.length - unseen.length} of ${configured.length}` +
-        `${unseen.length ? `; never joined: ${unseen.join(', ')}` : ''}), so a join to a real group would have been seen`,
+      `CONTROL: every group the services were configured with gained a member while they ran (${configured.length - unseen.length} of ${configured.length}` +
+        `${unseen.length ? `; never joined: ${unseen.join(', ')}` : ''}), and ${derived.length} more they derived from those names, ` +
+        'so a join to a real group would have been seen',
     );
 
     console.log('');
