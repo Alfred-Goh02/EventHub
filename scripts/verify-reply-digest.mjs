@@ -628,7 +628,16 @@ async function main() {
     await service.exited;
     service = start({ ...notificationEnv, DIGEST_INTERVAL_MS: '12000' });
     const again = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT}/ready`)).ok, 60_000, 500);
-    check(Boolean(again) && (await heldItems(Z)).length === 1, `it does not pass as it starts: ready, and Z's reply still held (${(await heldItems(Z)).length})`);
+    // Once the flusher has started, not merely once the service answers: /ready can
+    // answer before the flusher is started at all, and a check made then would pass for
+    // a flusher that passes the moment it starts.
+    const flusherUp = again ? await waitFor(async () => service.log().includes('reply digest running'), 30_000, 100) : null;
+    await sleep(2_000);
+    const passesAtStart = flusherUp ? (await metrics()).digest?.passesTotal : null;
+    check(
+      Boolean(flusherUp) && passesAtStart === 0 && (await heldItems(Z)).length === 1,
+      `it does not pass as it starts: two seconds after its flusher started, no pass yet and Z's reply still held (${passesAtStart ?? 'no metrics'} pass(es), ${(await heldItems(Z)).length} held)`,
+    );
     const first = again ? await waitFor(async () => ((await digests(Z)).length === 1 ? true : null), 40_000) : null;
     const passesAfterFirst = first ? (await metrics()).digest?.passesTotal ?? 0 : 0;
     await plantHeld(Z2, { postId: 'post_z2' });
