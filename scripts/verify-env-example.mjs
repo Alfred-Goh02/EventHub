@@ -44,6 +44,9 @@
  * group is rewritten to one of this run's, and every key that says where a new group
  * starts is set to `latest`, because a new group at `earliest` replays everything.
  * Both are derived from the examples' own keys, and the groups are deleted at the end.
+ * The groups a service names from one of those (Notification's -retry, -replies and
+ * -replies-retry) inherit the rewrite, and the check that nothing joined a real group
+ * reads every group the cluster lists, so a derived one that escaped it is seen too.
  * Each service is killed as soon as its groups have a member, so it consumes as little
  * as possible: Notification's contact-card consumer starts every new group at the
  * beginning of auth.user-contact by design, and has no setting to say otherwise.
