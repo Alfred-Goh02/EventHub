@@ -584,3 +584,78 @@ A consumer on a new group, on a topic nothing has been written to, has no positi
 any partition, and its lag is unknown rather than zero — so "caught up" never becomes
 true and a control waiting for it fails on a healthy consumer. Prove a consumer is
 reading with a canary it must process, then wait for the lag.
+
+## Make the race happen; do not wait for it
+
+"Two consumers cannot both take the fifth place" went red, the first time, only because
+the mutation that removed the lock also added a `pg_sleep` to widen the window. Without
+the sleep the lock could be deleted and the check stayed green on most runs: each
+consumer's cycle is long, and the two rarely met inside the few milliseconds that
+matter. A red run that needed help from the mutation proves nothing about the fixture.
+
+The fixture now forces the interleaving: `LOCK TABLE ... IN SHARE MODE` lets both
+consumers count and blocks both inserts, a control asserts that two backends are
+waiting, and the lock is let go. Without the per-recipient lock it is sent 2, held 0,
+every run; with it, 1 and 1. A race test that depends on timing is not a test of the
+race.
+
+## "Resume what is PENDING" makes any second runner a second sender
+
+deliver() treats a PENDING claim as its own to resume, which is how a retry continues a
+delivery an earlier attempt claimed. It also means anything else that reaches the same
+claim sends too. Kafka gives the reply path one consumer per partition; the digest
+flusher had no such exclusion, and two passes at once — two replicas, or `digest:once`
+during the hourly pass — both sent the same digest. Measured by holding the claim open:
+the second pass waited on the same claim and never finished. Anything that re-drives a
+claim outside Kafka needs its own exclusion; the digest takes an advisory lock per
+person and steps over anyone another pass holds.
+
+## An ended claim is not a sent one
+
+The sweeper marks a claim left PENDING for an hour FAILED. The digest's next pass
+arrives about an hour later, found the claim FAILED, took it as "already handled", and
+deleted the held replies unsent — measured: 0 digests for a claim the sweeper had
+ended. Read what the sent-log actually says — sent, suppressed or refused, against
+deferred or abandoned — before treating a claim as settled. And close a failed attempt
+yourself rather than leaving it PENDING for the sweeper to find: a correctly deferred
+send is otherwise reported, and alarmed on, as a stuck one.
+
+## Ready is not started
+
+The check that the digest does not run a pass as the service starts read `/ready` and
+then looked for the held reply. It stayed green with a pass at startup added: `/ready`
+answers before the flusher is started at all, so the check ran before the pass it was
+meant to catch. It now waits for the flusher's own log line, then asserts no pass and
+the reply still held — measured red, `1 pass(es), 0 held`. A readiness answer says the
+process can serve; it says nothing about what it has started in the background.
+
+## kafkajs's run() resolving is not joining
+
+`consumer.run()` resolves even when joining the group fails: the runner catches the
+failure and reports it as a crash instead (runner.js, `start()`). A route marked
+running once `run()` returned would answer running for a consumer that never joined.
+Running is set by `GROUP_JOIN` and cleared by `CRASH`. The same source says a
+`TypeError` thrown from a handler is unrecoverable, so it crashes with `restart: false`,
+and a header present with a null value — which kafkajs decodes from a length of -1 and
+will not produce — made `toString()` throw on every redelivery of that message. Read
+the library at the version you run before relying on what a method's name promises.
+
+## A verifier that boots the example joins the real consumer groups
+
+`verify-env-example.mjs` booted every service from its `.env.example`, which names the
+real consumer groups, so for the seconds each was up it was a live member of them.
+Measured (#142): Notification joined `notification-dispatch`, moved its committed
+offset 177 → 194, and sent 14 emails from the real group's backlog into earlier runs'
+tenants; one it was killed partway through left a PENDING row that another verifier's
+global count then tripped on. A verifier that runs a service runs it under this run's
+groups — every GROUP variable the example sets, and every group the service derives
+from them — and a check that the real groups gained no member.
+
+## A dead-letter topic kept forever must not keep what people can delete
+
+`notification.dlq` is kept forever, for the reason every DLQ here is. Once replies
+shared it, it held the words of a reply past its author's delete and a moderator's
+hide, which change only Community's database — and `dlq:replay` put them back on
+community.feed for every consumer of it, measured. A dead-letter copy keeps its value
+only where the value is sealed; anything else keeps the headers that say what failed
+and where, and the words go when their own topic's retention takes them.
