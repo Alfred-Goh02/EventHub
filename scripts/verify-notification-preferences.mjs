@@ -15,7 +15,11 @@
  *   - A tampered token is refused and changes nothing — another user's id under the
  *     original signature, a changed signature, a correctly signed token for a password
  *     reset, and garbage. The control is the untampered token working.
- *   - A production process refuses to start with the public development secret.
+ *   - A production process refuses to start with the public development secret, and
+ *     with either public origin not https: one left unset, so the localhost default, and
+ *     one on plain http at a real host name. Each time its message names that one only,
+ *     and the control is the same process starting once both are https and the secret is
+ *     its own.
  *
  * Tokens are signed here with the working tree's keys and the example secret, the
  * same way Auth and Notification make them.
@@ -252,11 +256,53 @@ async function main() {
     exitCode !== 'still running' && exitCode !== 0 && production.log().includes('UNSUBSCRIBE_SECRET is the development value'),
     `it refuses to start, and says why (exit ${exitCode})`,
   );
-  const control = start({ ...notificationEnv, NODE_ENV: 'production', PORT: String(PORT + 1), UNSUBSCRIBE_SECRET: randomBytes(32).toString('hex') });
+  const ownSecret = randomBytes(32).toString('hex');
+
+  /**
+   * A plain-http origin in production: every unsubscribe link would point where a reader
+   * cannot follow it, in mail that is on by default. Each case has ONE origin wrong, so
+   * a guard that refused only when both were wrong would start. One is left unset, which
+   * is the deployment that forgot it and got the localhost default; the other is plain
+   * http on a real host name, so a guard that looked for "localhost" instead of https
+   * would start.
+   */
+  console.log('  nor with a public origin a reader cannot reach');
+  async function refusalFor(overrides, unset = []) {
+    const env = { ...notificationEnv, NODE_ENV: 'production', PORT: String(PORT + 1), UNSUBSCRIBE_SECRET: ownSecret, ...overrides };
+    for (const name of unset) delete env[name];
+    const child = start(env);
+    const exit = await Promise.race([child.exited, sleep(30_000).then(() => 'still running')]);
+    if (exit === 'still running') {
+      child.child.kill();
+      await child.exited;
+    }
+    // Anchored on "Error:": the stack trace also prints the throwing line of source, whose
+    // template text would match a looser pattern and name nothing.
+    return { exit, named: child.log().match(/Error: refusing to start: (.+?) must be https/)?.[1] ?? '' };
+  }
+  const unset = await refusalFor({ PUBLIC_APP_URL: 'https://app.example' }, ['NOTIFICATION_PUBLIC_URL']);
+  check(
+    unset.exit !== 'still running' && unset.exit !== 0 && unset.named === 'NOTIFICATION_PUBLIC_URL',
+    `NOTIFICATION_PUBLIC_URL left unset, so localhost: it refuses, naming only that one (exit ${unset.exit}: ${unset.named || 'no such message'})`,
+  );
+  const plainApp = await refusalFor({ NOTIFICATION_PUBLIC_URL: 'https://notify.example', PUBLIC_APP_URL: 'http://app.example' });
+  check(
+    plainApp.exit !== 'still running' && plainApp.exit !== 0 && plainApp.named === 'PUBLIC_APP_URL',
+    `PUBLIC_APP_URL on plain http at a real host: it refuses, naming only that one (exit ${plainApp.exit}: ${plainApp.named || 'no such message'})`,
+  );
+
+  const control = start({
+    ...notificationEnv,
+    NODE_ENV: 'production',
+    PORT: String(PORT + 1),
+    UNSUBSCRIBE_SECRET: ownSecret,
+    NOTIFICATION_PUBLIC_URL: 'https://notify.example',
+    PUBLIC_APP_URL: 'https://app.example',
+  });
   const controlUp = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT + 1}/health`)).ok, 60_000, 500);
   control.child.kill();
   await control.exited;
-  check(Boolean(controlUp), 'CONTROL: with a secret of its own, the same production process starts');
+  check(Boolean(controlUp), 'CONTROL: with a secret of its own and https origins, the same production process starts');
 
   let deleted = 0;
   for (const tenant of [TENANT, OTHER]) {
@@ -264,7 +310,7 @@ async function main() {
   }
   const left = (await inTenant(owner, TENANT, `SELECT count(*)::int AS n FROM "NotificationPreference" WHERE "tenantId" = $1`, [TENANT])).rows[0].n;
   check(deleted > 0 && left === 0, `cleanup: this run's preference rows are gone (${deleted} deleted, ${left} left)`);
-  const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`]);
+  const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`]);
   if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
   await Promise.allSettled([admin.disconnect(), owner.end()]);
 

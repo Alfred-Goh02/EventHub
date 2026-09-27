@@ -8,6 +8,7 @@ import { createSmtpChannel } from './channels/smtp.js';
 import { createCardOpener, createSealOpener, loadNotificationPrivateKey } from './dispatch/open-seal.js';
 import { createDispatcher, dispatchHealth, dispatchMetrics } from './dispatch/consumer.js';
 import { contactsMetrics, createContactsConsumer } from './contacts/consumer.js';
+import { COMMUNITY_TOPIC, createReplyHandler, replyMetrics } from './dispatch/replies.js';
 import { createSweeper } from './sweeper/index.js';
 import { preferenceRoutes } from './preferences/routes.js';
 
@@ -24,6 +25,9 @@ import { preferenceRoutes } from './preferences/routes.js';
  * are not credentials and so carry no address of their own.
  */
 const logger = createLogger('notification-service');
+
+/** Names the replies consumer groups: `${KAFKA_CONSUMER_GROUP}-replies`, and `-replies-retry` on the tiers. */
+const REPLIES_ROUTE = 'replies';
 
 const channel = createSmtpChannel({ host: env.SMTP_HOST, port: env.SMTP_PORT, from: env.EMAIL_FROM });
 let dispatcher: ReturnType<typeof createDispatcher> | null = null;
@@ -49,19 +53,25 @@ const bounded = <T>(work: Promise<T>): Promise<T | { error: string }> =>
  * brokers, so it is cached for five seconds and bounded at two, as Analytics'
  * ingest does: a /metrics request must never be the thing that hangs when Kafka does.
  */
-let slow: { at: number; lag: unknown; retryLag: unknown; contactsLag: unknown } | null = null;
+let slow: { at: number; lag: unknown; retryLag: unknown; contactsLag: unknown; repliesLag: unknown; repliesRetryLag: unknown } | null = null;
 app.get('/metrics', async (_req, res) => {
   if (dispatcher && (slow === null || Date.now() - slow.at > 5_000)) {
-    const [lag, retryLag, contactsLag] = await Promise.all([
+    const [lag, retryLag, contactsLag, repliesLag, repliesRetryLag] = await Promise.all([
       bounded(dispatcher.lag()),
       bounded(dispatcher.retryLag()),
       contacts ? bounded(contacts.lag()) : Promise.resolve(null),
+      bounded(dispatcher.routeLag(REPLIES_ROUTE)),
+      bounded(dispatcher.routeLag(`${REPLIES_ROUTE}-retry`)),
     ]);
-    slow = { at: Date.now(), lag, retryLag, contactsLag };
+    slow = { at: Date.now(), lag, retryLag, contactsLag, repliesLag, repliesRetryLag };
   }
   res.json({
     dispatch: { ...dispatchMetrics(), lag: slow?.lag ?? null, retryLag: slow?.retryLag ?? null },
     contacts: { ...contactsMetrics(), lag: slow?.contactsLag ?? null },
+    // Why each community message ended as it did. What was sent is in dispatch's
+    // counters, which replies share with password resets; the lag is the replies
+    // group's own, on community.feed.
+    replies: { ...replyMetrics(), lag: slow?.repliesLag ?? null, retryLag: slow?.repliesRetryLag ?? null },
     // Straight from memory: the sweep keeps its own counts and asks the database on
     // its own clock, so a /metrics request never waits on it.
     sweep: sweeper?.metrics() ?? null,
@@ -101,6 +111,8 @@ app.get('/ready', async (_req, res) => {
      * an outage of the one email that must always go.
      */
     contacts: contactsMetrics().running,
+    // Reported, not required, for the same reason: replies are not credentials.
+    routes: dispatcher?.routeHealth() ?? [],
     smtp: smtp.ok,
     smtpError: smtp.error,
     failing,
@@ -187,6 +199,24 @@ async function main(): Promise<void> {
     logger,
     open: createSealOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
     channel,
+    routes: [
+      {
+        name: REPLIES_ROUTE,
+        topic: COMMUNITY_TOPIC,
+        startFrom: env.COMMUNITY_START_FROM,
+        make: (decode) =>
+          createReplyHandler({
+            decode,
+            openCard: createCardOpener({ privateKey, authPublicKey, issuer: env.JWT_ISSUER }),
+            channel,
+            logger,
+            unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
+            publicUrl: env.NOTIFICATION_PUBLIC_URL,
+            appUrl: env.PUBLIC_APP_URL,
+            maxAgeMs: env.REPLY_MAX_AGE_MS,
+          }),
+      },
+    ],
     onFatal: (err) => {
       logger.fatal({ err }, 'the dispatch consumer stopped for good; exiting so the process is restarted');
       void prisma.$disconnect().finally(() => process.exit(1));

@@ -16,6 +16,9 @@ import { DLQ_HEADERS, DLQ_TOPIC, header, originalHeaders } from '../dispatch/ret
  * the sent-log claim sees a delivery already recorded SENT and sends nothing. An
  * expired reset is skipped as expired.
  *
+ * PASSWORD RESETS ONLY. Only a sealed value is kept in the dead-letter topic; a reply's
+ * copy has none, and this says so rather than replaying an empty message.
+ *
  * Reads KAFKA_BROKERS and nothing else. It does not import the service's
  * configuration, which requires a database and an SMTP server this has no use for.
  */
@@ -76,6 +79,20 @@ async function main(): Promise<void> {
   const topic = header(latest.headers, DLQ_HEADERS.originalTopic);
   if (!topic) {
     console.error(`${messageId} was dead-lettered without ${DLQ_HEADERS.originalTopic}, so there is nowhere to replay it`);
+    process.exitCode = 1;
+    await admin.disconnect();
+    return;
+  }
+
+  // A reply's dead-letter copy keeps its headers and not its value (see forward() in
+  // dispatch/consumer.ts). Replaying nothing would print "replayed" and send nothing, so
+  // say what there is instead.
+  if (latest.value === null || header(latest.headers, DLQ_HEADERS.valueWithheld) === 'true') {
+    console.error(
+      `${messageId} was dead-lettered without its value, which was not sealed: nothing here to replay. ` +
+        `The original is on ${topic} under the same message id for as long as that topic keeps it ` +
+        `(dead-lettered for: ${header(latest.headers, DLQ_HEADERS.reason) ?? 'no reason recorded'})`,
+    );
     process.exitCode = 1;
     await admin.disconnect();
     return;

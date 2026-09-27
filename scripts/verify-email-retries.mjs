@@ -467,7 +467,7 @@ async function main() {
     await inTenant(notifyOwner, 'DELETE FROM "EmailSuppression" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await inTenant(authApp, 'DELETE FROM "User" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, ...scanGroups]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, ...scanGroups]);
     await admin.disconnect().catch(() => {});
     const left = {
       outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
