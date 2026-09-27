@@ -49,7 +49,10 @@
  * reads every group the cluster lists, so a derived one that escaped it is seen too.
  * Each service is killed as soon as its groups have a member, so it consumes as little
  * as possible: Notification's contact-card consumer starts every new group at the
- * beginning of auth.user-contact by design, and has no setting to say otherwise.
+ * beginning of auth.user-contact by design, and has no setting to say otherwise. Its
+ * replay upserts cards the table already holds, and parks the topic's forged cards on
+ * auth.user-contact.dlq again, as every verifier with a new contacts group does:
+ * measured, 37 of them in the second or so before the kill.
  *
  * Ticketing's projection is the one consumer this cannot move: its group is a constant
  * in services/ticketing/src/consumer.ts, not configuration, and it is not in its
