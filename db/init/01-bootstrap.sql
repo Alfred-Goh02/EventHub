@@ -48,6 +48,17 @@ CREATE ROLE eventhub_notification_sweeper LOGIN PASSWORD 'eventhub_notification_
 ALTER ROLE eventhub_notification_sweeper SET idle_in_transaction_session_timeout = '30s';
 ALTER ROLE eventhub_notification_sweeper SET statement_timeout = '15s';
 
+-- Finds who has replies held for the hourly digest.
+--
+-- Past five reply emails an hour, a person's replies are held and sent as one digest
+-- an hour. "Who has anything waiting" is, like the sweeper's question, one with no
+-- tenant in it, so it is asked on a credential of its own: three columns of the held
+-- items, read only, in every tenant. Everything after that — reading the items,
+-- sending, deleting — is done as the app role, inside the tenant.
+CREATE ROLE eventhub_notification_digest LOGIN PASSWORD 'eventhub_notification_digest';
+ALTER ROLE eventhub_notification_digest SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE eventhub_notification_digest SET statement_timeout = '15s';
+
 CREATE ROLE eventhub_community_owner LOGIN CREATEDB PASSWORD 'eventhub_community_owner';
 CREATE ROLE eventhub_community_app   LOGIN          PASSWORD 'eventhub_community_app';
 
@@ -140,7 +151,7 @@ GRANT  CONNECT ON DATABASE eventhub_live TO eventhub_live_owner, eventhub_live_a
 
 REVOKE CONNECT ON DATABASE eventhub_notification FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_notification TO eventhub_notification_owner, eventhub_notification_app,
-                                                    eventhub_notification_sweeper;
+                                                    eventhub_notification_sweeper, eventhub_notification_digest;
 
 REVOKE CONNECT ON DATABASE eventhub_community FROM PUBLIC;
 GRANT  CONNECT ON DATABASE eventhub_community TO eventhub_community_owner, eventhub_community_app,
@@ -170,7 +181,7 @@ GRANT USAGE ON SCHEMA public TO eventhub_ticketing_app, eventhub_ticketing_relay
 GRANT USAGE ON SCHEMA public TO eventhub_live_app;
 
 \connect eventhub_notification
-GRANT USAGE ON SCHEMA public TO eventhub_notification_app, eventhub_notification_sweeper;
+GRANT USAGE ON SCHEMA public TO eventhub_notification_app, eventhub_notification_sweeper, eventhub_notification_digest;
 
 \connect eventhub_community
 GRANT USAGE ON SCHEMA public TO eventhub_community_app, eventhub_community_relay;

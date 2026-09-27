@@ -52,6 +52,21 @@ const notificationEnvSchema = z.object({
    */
   REPLY_MAX_AGE_MS: z.coerce.number().int().positive().default(3_600_000),
   /**
+   * Reply emails one person may get in an hour; past it, replies are held and sent as
+   * one digest. Decided 2026-09-27: five. See digest/hold.ts.
+   */
+  REPLY_HOURLY_LIMIT: z.coerce.number().int().positive().default(5),
+  /**
+   * The digest's own credential: three columns of the held replies, read only, across
+   * every tenant — who has anything waiting. Separate from APP_DATABASE_URL for the
+   * reason the sweeper's is. It refuses to start if this role can do more.
+   */
+  DIGEST_DATABASE_URL: z.string().url(),
+  /** How often held replies go out as a digest. Decided 2026-09-27: hourly. A verifier shortens it. */
+  DIGEST_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
+  /** People sent a digest per pass, longest-waiting first; the rest wait for the next pass. */
+  DIGEST_BATCH_SIZE: z.coerce.number().int().positive().max(10_000).default(500),
+  /**
    * One group per deployment. Verifiers run their own, so they never take its partitions.
    * The retry tiers are read by `<this>-retry`, and replies from community.feed by
    * `<this>-replies`, so a verifier's own group brings its own of each.
