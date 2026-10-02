@@ -85,8 +85,8 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
-| `db/init/` | Six databases and eighteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 85 executable proofs of the invariants above |
+| `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
+| `scripts/verify-*.mjs` | 86 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -536,9 +536,18 @@ works, that the old password stops working and that the session issued before th
 reset is revoked — then removes what it made. Locally the mail arrives about a second
 after the request.
 
-Preferences and rate limits are still to come, and arrive with the first email
-anyone could opt out of. Chapter 9, community, is designed and documented but not
-implemented.
+Replies are the second email, and the first anyone can turn off. When someone
+answers your comment or post in Community, Notification emails you — never about
+your own reply, never once you can no longer read the space, never an hour late — with
+a one-click unsubscribe that works without logging in. A password reset can never be
+turned off. Past five reply emails in an hour, the rest are held and go out as one
+digest an hour, which carries counts and links and none of the replies' words. The
+digest finds who is waiting on a credential of its own that can read three columns
+and nothing else; one pass by hand is:
+
+```bash
+pnpm --filter @eventhub/notification run digest:once
+```
 
 Known gaps, named rather than hidden:
 

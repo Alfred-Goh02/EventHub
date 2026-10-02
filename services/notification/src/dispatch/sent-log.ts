@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { withTenant } from '../db.js';
+import type { Prisma } from '../generated/prisma/client.js';
 import { env } from '../env.js';
 import { addressHash } from './suppression.js';
 
@@ -53,15 +54,25 @@ export const idempotencyKey = (k: DeliveryKey): string =>
     ? `${k.sourceMessageId}:${k.channel}:${k.recipientId}`
     : `${k.templateKey}:${k.sourceMessageId}:${k.channel}:${k.recipientId}`;
 
+/**
+ * The claim's one statement, inside a transaction the caller already holds in the
+ * tenant. Resolves whether THIS statement made the row. claimDelivery is the usual way
+ * in; the reply limit uses this directly, so a reply it lets through is claimed under
+ * the same lock that counted it.
+ */
+export async function insertClaim(tx: Prisma.TransactionClient, k: DeliveryKey & { category: string }): Promise<boolean> {
+  const inserted = await tx.$executeRaw`
+    INSERT INTO "NotificationDelivery"
+      (id, "tenantId", "recipientId", channel, category, "templateKey", "idempotencyKey", "sourceMessageId")
+    VALUES (${randomUUID()}, ${k.tenantId}, ${k.recipientId}, ${k.channel}, ${k.category}, ${k.templateKey}, ${idempotencyKey(k)}, ${k.sourceMessageId})
+    ON CONFLICT DO NOTHING`;
+  return inserted === 1;
+}
+
 export async function claimDelivery(k: DeliveryKey & { category: string }): Promise<Claim> {
   const key = idempotencyKey(k);
   return withTenant(k.tenantId, async (tx) => {
-    const inserted = await tx.$executeRaw`
-      INSERT INTO "NotificationDelivery"
-        (id, "tenantId", "recipientId", channel, category, "templateKey", "idempotencyKey", "sourceMessageId")
-      VALUES (${randomUUID()}, ${k.tenantId}, ${k.recipientId}, ${k.channel}, ${k.category}, ${k.templateKey}, ${key}, ${k.sourceMessageId})
-      ON CONFLICT DO NOTHING`;
-    if (inserted === 1) return { claimed: true };
+    if (await insertClaim(tx, k)) return { claimed: true };
 
     const rows = await tx.$queryRaw<Array<{ status: DeliveryStatus }>>`
       SELECT d.status::text AS status FROM "NotificationDelivery" d

@@ -982,6 +982,9 @@ services:
       # it crosses tenants, so it is not the API's credential. SELECT and a
       # three-column UPDATE, and the service refuses to sweep on anything wider.
       SWEEPER_DATABASE_URL: postgresql://eventhub_notification_sweeper:eventhub_notification_sweeper@postgres:5432/eventhub_notification
+      # A fourth, for the hourly reply digest: who has replies waiting, across
+      # tenants, and nothing else. It refuses to start on anything wider.
+      DIGEST_DATABASE_URL: postgresql://eventhub_notification_digest:eventhub_notification_digest@postgres:5432/eventhub_notification
       KAFKA_CONSUMER_GROUP: notification-dispatch
       # Verifies Auth's signature inside each seal. The public half only.
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem

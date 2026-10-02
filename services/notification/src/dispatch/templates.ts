@@ -100,3 +100,42 @@ export function renderCommunityReply(params: {
 
   return { subject: params.toComment ? 'Someone replied to your comment' : 'Someone commented on your post', text, html };
 }
+
+/**
+ * The replies held back by the hourly limit, as one email.
+ *
+ * COUNTS AND LINKS ONLY, decided 2026-09-27: no reply's words are stored while it
+ * waits, so there are none to quote — which also means a reply deleted or hidden in
+ * the meantime is never shown here. Each line is one post: how many replies there were,
+ * to a comment of yours or to the post itself, and a link to read them.
+ */
+export function renderReplyDigest(params: {
+  groups: Array<{ postUrl: string; toComment: boolean; count: number }>;
+  unsubscribeUrl: string;
+}): RenderedEmail {
+  const total = params.groups.reduce((sum, g) => sum + g.count, 0);
+  const line = (g: { toComment: boolean; count: number }) =>
+    g.toComment
+      ? `${g.count} ${g.count === 1 ? 'reply' : 'replies'} to your comment`
+      : `${g.count} ${g.count === 1 ? 'comment' : 'comments'} on your post`;
+  const subject = `${total} more ${total === 1 ? 'reply' : 'replies'} to you`;
+
+  const text = [
+    `While you were away, people kept talking. ${subject}:`,
+    '',
+    ...params.groups.flatMap((g) => [`  ${line(g)}:`, `  ${g.postUrl}`, '']),
+    'You get these because replies to you are on. To stop them:',
+    params.unsubscribeUrl,
+  ].join('\n');
+
+  const html = [
+    `<p>While you were away, people kept talking. ${escapeHtml(subject)}:</p>`,
+    '<ul>',
+    ...params.groups.map((g) => `<li><a href="${escapeHtml(g.postUrl)}">${escapeHtml(line(g))}</a></li>`),
+    '</ul>',
+    `<p style="color:#666;font-size:12px">You get these because replies to you are on. ` +
+      `<a href="${escapeHtml(params.unsubscribeUrl)}">Stop emails about replies</a>.</p>`,
+  ].join('\n');
+
+  return { subject: `${subject[0]!.toUpperCase()}${subject.slice(1)}`, text, html };
+}

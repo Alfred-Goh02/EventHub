@@ -10,7 +10,8 @@
     "generate": "prisma generate",
     "dlq:replay": "node --env-file-if-exists=.env dist/scripts/dlq-replay.js",
     "suppression:remove": "node --env-file-if-exists=.env dist/scripts/suppression-remove.js",
-    "sweep:once": "node --env-file-if-exists=.env dist/scripts/sweep-once.js"
+    "sweep:once": "node --env-file-if-exists=.env dist/scripts/sweep-once.js",
+    "digest:once": "node --env-file-if-exists=.env dist/scripts/digest-once.js"
   },
   "dependencies": {
     "@eventhub/auth-middleware": "workspace:*",
