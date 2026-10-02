@@ -1009,6 +1009,53 @@ services:
       retries: 6
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # The gateway. Every external request enters here: Kong OSS, DB-less, reading
+  # infra/kong/kong.yml at boot and holding no state, so a config that does not
+  # parse stops it starting rather than leaving it half-configured. That file says
+  # what it routes and why.
+  #
+  # The proxy, 8000, is the one port meant for the outside. The Admin API and the
+  # status endpoint are published on loopback only: in DB-less mode the Admin API
+  # cannot change an entity, but it lists every route and upstream, and POST
+  # /config replaces the whole configuration.
+  #
+  # A tenant is a subdomain, so locally: http://acme.eventhub.localhost:8000/...
+  # Browsers and curl resolve any *.localhost name to loopback by themselves.
+  # ---------------------------------------------------------------------------
+  kong:
+    image: kong:3.9
+    container_name: eventhub-kong
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      # Inside the container, so the port mapping below can reach them; published
+      # to 127.0.0.1 only.
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_LOG_LEVEL: info
+      # The default, written down: the tenant snippet runs in Kong's Lua sandbox.
+      KONG_UNTRUSTED_LUA: sandbox
+    volumes:
+      - ./infra/kong:/kong/declarative:ro
+    ports:
+      - "8000:8000"
+      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:8100:8100"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
 volumes:
   postgres-data:
   kafka-data:

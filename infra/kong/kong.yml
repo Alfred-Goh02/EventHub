@@ -1,0 +1,192 @@
+# The gateway: every external request enters here, and nowhere else.
+#
+# Kong OSS, DB-less (decided 2026-09-28, following the Field Guide's "Kong gateway +
+# multi-tenancy" section): this file is the whole configuration. Kong reads it at boot
+# and holds no state; if it does not parse, Kong refuses to start rather than run
+# half-configured. `kong config parse` checks it in CI.
+#
+# WHAT IT DOES, AND NOTHING MORE: routes a host and a path to a service, and makes the
+# tenant headers trustworthy. Anything that needs to know what an event or a ticket is
+# stays in the services.
+#
+# HOSTS. A tenant is its subdomain: acme.eventhub.com in production, and
+# acme.eventhub.localhost here — browsers and curl resolve any *.localhost name to the
+# loopback address themselves, so nothing has to be added to a hosts file. The api
+# subdomain is the one host with no tenant in it, for the two callers that cannot know
+# one: a payment provider's webhook, and an unsubscribe link in an email.
+#
+# PATHS. Each service already owns distinct top-level paths, so they are routed as they
+# are, with no prefix to strip — /events reaches Event as /events. Auth is the
+# exception: its paths (/login, /me, ...) name nothing, so they live under /auth, which
+# is stripped. Nothing routes /health, /ready or /metrics: those are for the platform,
+# not the internet.
+#
+# RETRIES ARE OFF on every service. Kong retries a failed upstream five times by
+# default, and a request that reached the service and timed out on the way back would
+# run again — a registration, a reservation, a post. Retrying is the client's decision.
+
+_format_version: "3.0"
+
+# Every service states its retries and timeouts rather than inheriting them: Kong
+# refuses unknown top-level keys, so there is nowhere to hang a shared block, and a
+# setting written out per service is one an audit can read without resolving anything.
+# The host lists are YAML anchors, set on their first use.
+services:
+  - name: auth
+    url: http://auth:3001
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: auth
+        hosts: &tenant-hosts ["*.eventhub.localhost", "*.eventhub.com"]
+        paths: ["/auth/"]
+        strip_path: true # /auth/login reaches Auth as /login
+
+  - name: event
+    url: http://event:3002
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: event
+        hosts: *tenant-hosts
+        paths: ["/events"]
+        strip_path: false
+
+  - name: ticketing
+    url: http://ticketing:3003
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: ticketing
+        hosts: *tenant-hosts
+        paths: ["/reservations"]
+        strip_path: false
+      # A payment provider's webhook carries no tenant: Ticketing resolves it from the
+      # payment itself, on a credential that reads one column across tenants.
+      - name: ticketing-webhooks
+        hosts: &api-hosts ["api.eventhub.localhost", "api.eventhub.com"]
+        paths: ["/webhooks"]
+        strip_path: false
+        tags: [tenantless]
+
+  - name: live
+    url: http://live:3004
+    retries: 0
+    connect_timeout: 5000
+    # A WebSocket stays open; these bound silence between frames, not the connection,
+    # and Live's own heartbeat is well inside an hour.
+    read_timeout: 3600000
+    write_timeout: 3600000
+    routes:
+      - name: live
+        hosts: *tenant-hosts
+        paths: ["/live"]
+        strip_path: false
+
+  - name: search
+    url: http://search:3005
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: search
+        hosts: *tenant-hosts
+        paths: ["/search"]
+        strip_path: false
+
+  - name: analytics
+    url: http://analytics:3006
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: analytics
+        hosts: *tenant-hosts
+        paths: ["/analytics"]
+        strip_path: false
+
+  - name: notification
+    url: http://notification:3007
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: notification
+        hosts: *tenant-hosts
+        paths: ["/preferences"]
+        strip_path: false
+      # The link in an email: the tenant, the user and the category are inside its
+      # signed token, and the reader may not be signed in anywhere.
+      - name: notification-unsubscribe
+        hosts: *api-hosts
+        paths: ["/unsubscribe"]
+        strip_path: false
+        tags: [tenantless]
+
+  - name: community
+    url: http://community:3008
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: community
+        hosts: *tenant-hosts
+        paths: ["/spaces", "/posts", "/comments", "/feed", "/reports"]
+        strip_path: false
+
+plugins:
+  # THE TENANT HEADERS. Security critical: shared-schema tenancy holds only if no
+  # client can say which tenant it is. Global, so that a route added later cannot
+  # forget it; a route with no tenant opts out of the SUBDOMAIN rule — never out of the
+  # clearing — with the tag `tenantless`.
+  #
+  # 1. Everything a client could forge is cleared, unconditionally, first. Cleared and
+  #    then set, never appended: an appended duplicate reaches Node as "forged, real".
+  # 2. The tenant is the Host's one subdomain label. get_host() is already lower-case
+  #    and has no port; the raw Host header would have both, and the pattern would
+  #    silently never match. These are Lua patterns, not regular expressions.
+  # 3. A reserved name, a second label, or no label at all is refused here rather than
+  #    passed on as a tenant that does not exist.
+  # 4. What the services receive is X-Tenant-Slug. Turning it into a tenant id is
+  #    Auth's job (decided 2026-09-28), so a new tenant is one INSERT, not a reload.
+  # Runs at pre-function's priority, before every other plugin.
+  - name: pre-function
+    config:
+      access:
+        - |
+          local UNTRUSTED = {
+            "X-Tenant-ID", "X-Tenant-Slug",
+            "X-Consumer-ID", "X-Consumer-Username", "X-Consumer-Custom-ID",
+            "X-Credential-Identifier", "X-Anonymous-Consumer",
+            "X-Authenticated-Scope", "X-Authenticated-Userid",
+          }
+          for _, name in ipairs(UNTRUSTED) do
+            kong.service.request.clear_header(name)
+          end
+
+          local route = kong.router.get_route()
+          for _, tag in ipairs(route and route.tags or {}) do
+            if tag == "tenantless" then return end
+          end
+
+          local RESERVED = {
+            www = true, api = true, admin = true, app = true, auth = true,
+            static = true, assets = true, mail = true, status = true,
+          }
+          local host = kong.request.get_host() or ""
+          local slug = host:match("^([a-z0-9][a-z0-9%-]*)%.eventhub%.localhost$")
+            or host:match("^([a-z0-9][a-z0-9%-]*)%.eventhub%.com$")
+          if not slug or #slug > 63 or RESERVED[slug] then
+            return kong.response.exit(400, { error = "tenant subdomain required" })
+          end
+          kong.service.request.set_header("X-Tenant-Slug", slug)
