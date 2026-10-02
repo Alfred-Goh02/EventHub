@@ -95,19 +95,17 @@ const isStartKey = (key) => /(^|_)START_FROM$/.test(key);
  * notification-dispatch, and notification-dispatch-retry, -replies and -replies-retry
  * with it, whatever suffixes a service adds next. A name carrying a run's hex tag is
  * another verifier's (community-feed-verify-1a2b3c4d), not a deployed one.
+ *
+ * AND ANY OTHER GROUP WITH NO RUN'S TAG IN ITS NAME, which no example has to name. A
+ * group id written into a service's code, rather than read from its configuration, is in
+ * no example, so a check that knew only the examples' groups could never see a booted
+ * service join one. Ticketing's projection group was exactly that until it became
+ * KAFKA_CONSUMER_GROUP.
  */
 const isRealFamily = (groupId, realGroups) =>
   !groupId.startsWith(RUN_PREFIX) &&
-  realGroups.some((r) => groupId === r || (groupId.startsWith(`${r}-`) && !/[0-9a-f]{8}/.test(groupId.slice(r.length))));
-
-/**
- * A group that is neither this run's nor another verifier's: a name with no run's hex
- * tag in it. No example has to name it. A group id written into a service's code, and
- * not read from its configuration, is in no example, so a check that knew only the
- * examples' groups could never see a booted service join one. Ticketing's projection
- * group was exactly that until it became KAFKA_CONSUMER_GROUP.
- */
-const isUntagged = (groupId) => !groupId.startsWith(RUN_PREFIX) && !/[0-9a-f]{8}/.test(groupId);
+  (!/[0-9a-f]{8}/.test(groupId) ||
+    realGroups.some((r) => groupId === r || (groupId.startsWith(`${r}-`) && !/[0-9a-f]{8}/.test(groupId.slice(r.length)))));
 
 /** Scratch ports, well away from anything a developer is likely to be running. */
 const SERVICES = [
@@ -311,7 +309,7 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
     }
     const joined = gainedMember(before, now, [...now.keys()].filter((g) => g.startsWith(RUN_PREFIX))).sort();
     for (const g of joined) kafka.joined.add(g);
-    const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups) || isUntagged(g))).sort();
+    const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups))).sort();
     const starts = Object.keys(consumer).filter(isStartKey).map((k) => `${k}=${consumer[k]}`);
     check(
       real.length === 0,
