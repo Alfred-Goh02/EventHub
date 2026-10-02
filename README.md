@@ -85,8 +85,9 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
+| `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 86 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 87 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -229,6 +230,8 @@ That builds one image, shared by every application service, and then:
    migrates ClickHouse, and generates a signing keypair into a volume
 3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relays for Event, Ticketing and Auth
 
+Beside them it starts the gateway, Kong, on port 8000.
+
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
 
@@ -247,6 +250,7 @@ An empty result for a draft is the policy working, not the indexer failing.
 
 | Service   | URL                     |
 | --------- | ----------------------- |
+| The gateway, as tenant `acme` | `http://acme.eventhub.localhost:8000` |
 | Auth      | `http://localhost:3001` |
 | Event     | `http://localhost:3002` |
 | Ticketing | `http://localhost:3003` |
@@ -261,6 +265,19 @@ An empty result for a draft is the policy working, not the indexer failing.
 | Ticketing relay | `http://localhost:3011/metrics` |
 | Auth relay | `http://localhost:3012/metrics` |
 | Community relay | `http://localhost:3013/metrics` |
+
+**Through the gateway, the tenant is the subdomain.** `acme.eventhub.localhost`
+is tenant `acme`; any `*.localhost` name resolves to your own machine without a
+hosts-file entry. Kong clears any `X-Tenant-ID` or `X-Tenant-Slug` a client sends
+and passes the subdomain on as `X-Tenant-Slug`, so a request cannot name its own
+tenant. Paths are each service's own (`/events`, `/reservations`, `/spaces`...),
+except Auth's, which sit under `/auth`. The payment webhook and the unsubscribe
+link carry no tenant and live on `api.eventhub.localhost`.
+
+Two things are still open. Auth does not yet turn a slug into a tenant, so
+signing in works only on Auth's own port, as below. And every service's own port
+is still published, so the gateway's guarantee covers only what comes through
+it.
 
 Proof that it is working end to end, rather than just listening — sign in as the
 seeded admin, create an event through one service, and read it back out of
