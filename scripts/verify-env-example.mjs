@@ -54,11 +54,13 @@
  * auth.user-contact.dlq again, as every verifier with a new contacts group does:
  * measured, 37 of them in the second or so before the kill.
  *
- * Ticketing's projection is the one consumer this cannot move: its group is a constant
- * in services/ticketing/src/consumer.ts, not configuration, and it is not in its
- * example. It still joins ticketing-event-projection while it is booted here. Its
- * handler is a deduplicated, version-guarded upsert that commits after the transaction,
- * so killing it mid-flight leaves nothing half-done; it does still take the partitions.
+ * Ticketing's projection was the one consumer this could not move: its group was a
+ * constant in services/ticketing/src/consumer.ts, in no example, so there was no key to
+ * rewrite and it joined ticketing-event-projection every time it was booted here. And
+ * the check below never saw it, because it looked only at services whose example named
+ * a group. Now the group is KAFKA_CONSUMER_GROUP with PROJECTION_START_FROM beside it,
+ * and the check watches every service for a join to any group that is neither this
+ * run's nor another verifier's, which is what a group written into the code looks like.
  *
  * AND THE OTHER DIRECTION, FOR AUTH: the example is a laptop's configuration, and
  * Auth run from it as production must refuse. Its PUBLIC_APP_URL is localhost,
@@ -97,6 +99,15 @@ const isStartKey = (key) => /(^|_)START_FROM$/.test(key);
 const isRealFamily = (groupId, realGroups) =>
   !groupId.startsWith(RUN_PREFIX) &&
   realGroups.some((r) => groupId === r || (groupId.startsWith(`${r}-`) && !/[0-9a-f]{8}/.test(groupId.slice(r.length))));
+
+/**
+ * A group that is neither this run's nor another verifier's: a name with no run's hex
+ * tag in it. No example has to name it. A group id written into a service's code, and
+ * not read from its configuration, is in no example, so a check that knew only the
+ * examples' groups could never see a booted service join one. Ticketing's projection
+ * group was exactly that until it became KAFKA_CONSUMER_GROUP.
+ */
+const isUntagged = (groupId) => !groupId.startsWith(RUN_PREFIX) && !/[0-9a-f]{8}/.test(groupId);
 
 /** Scratch ports, well away from anything a developer is likely to be running. */
 const SERVICES = [
@@ -276,23 +287,31 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
    * A process with no consumer (Analytics' HTTP side shares the ingest's example) just
    * waits the time out.
    *
+   * EVERY SERVICE, not only those whose example names a group: a service that joins a
+   * group its configuration does not name has no example key to rewrite, and this check
+   * skipping it is how Ticketing's projection consumer went on joining the real group.
+   * Those are watched for three seconds at least, past the moment they answer.
+   *
    * Real means the whole family: a deployed group, or any group named from one, since a
-   * derived group that escaped this run's prefix is as live as the one it came from.
+   * derived group that escaped this run's prefix is as live as the one it came from. And
+   * any other group with no run's tag in its name, which is what a group written into
+   * the code looks like.
    */
-  if (up && mine.length > 0) {
-    const deadline = Date.now() + 15_000;
+  if (up) {
+    const started = Date.now();
+    const deadline = started + 15_000;
     let now = before;
     let settled = '';
     while (Date.now() < deadline) {
       now = await allMembers(kafka.admin);
       const moving = gainedMember(before, now, [...now.keys()]).sort().join(',');
-      if (gainedMember(before, now, mine).length === mine.length && moving === settled) break;
+      if (gainedMember(before, now, mine).length === mine.length && moving === settled && Date.now() - started >= 3_000) break;
       settled = moving;
       await sleep(1_000);
     }
     const joined = gainedMember(before, now, [...now.keys()].filter((g) => g.startsWith(RUN_PREFIX))).sort();
     for (const g of joined) kafka.joined.add(g);
-    const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups))).sort();
+    const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups) || isUntagged(g))).sort();
     const starts = Object.keys(consumer).filter(isStartKey).map((k) => `${k}=${consumer[k]}`);
     check(
       real.length === 0,

@@ -6,10 +6,28 @@ import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
 import { pay } from './routes/pay.js';
 import { webhooks } from './routes/webhooks.js';
-import { createProjectionConsumer } from './consumer.js';
+import { createProjectionConsumer, DEFAULT_GROUP } from './consumer.js';
 
 const env = loadBaseEnv();
 const logger = createLogger('ticketing-service');
+
+/**
+ * The projection consumer's group, and where a new one starts. Unset, they are what
+ * compose runs: ticketing-event-projection, from the earliest offset. Set but empty, or
+ * set to anything else, the process refuses to start, as Notification's schema does,
+ * rather than quietly falling back to the deployed group.
+ */
+function projectionSettings(): { groupId: string; startFrom: 'earliest' | 'latest' } {
+  const group = process.env['KAFKA_CONSUMER_GROUP'];
+  const start = process.env['PROJECTION_START_FROM'];
+  if (group !== undefined && group.trim() === '') {
+    throw new Error('KAFKA_CONSUMER_GROUP is set but empty: unset it for the default, or name the group');
+  }
+  if (start !== undefined && start !== 'earliest' && start !== 'latest') {
+    throw new Error(`PROJECTION_START_FROM must be earliest or latest, not "${start}"`);
+  }
+  return { groupId: group ?? DEFAULT_GROUP, startFrom: start ?? 'earliest' };
+}
 
 const app = express();
 app.use(
@@ -53,6 +71,7 @@ const consumer = createProjectionConsumer({
   brokers: (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',').map((b) => b.trim()),
   registryUrl: process.env['SCHEMA_REGISTRY_URL'] ?? 'http://localhost:8081',
   logger,
+  ...projectionSettings(),
 });
 
 async function shutdown(signal: string): Promise<void> {
