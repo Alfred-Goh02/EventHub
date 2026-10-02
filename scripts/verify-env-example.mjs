@@ -48,11 +48,12 @@
  * -replies-retry) inherit the rewrite, and the check that nothing joined a real group
  * reads every group the cluster lists, so a derived one that escaped it is seen too.
  * Each service is killed as soon as its groups have a member, so it consumes as little
- * as possible: Notification's contact-card consumer starts every new group at the
- * beginning of auth.user-contact by design, and has no setting to say otherwise. Its
- * replay upserts cards the table already holds, and parks the topic's forged cards on
- * auth.user-contact.dlq again, as every verifier with a new contacts group does:
- * measured, 37 of them in the second or so before the kill.
+ * as possible. A group key with no start setting is committed at the end of its topics
+ * before the service boots instead (START_AT_END below): Notification's contact-card
+ * consumer starts every new group at the beginning of auth.user-contact by design, and
+ * has no setting to say otherwise. From there its replay upserted cards the table already
+ * held, and parked the topic's forged cards on auth.user-contact.dlq again: measured, 37
+ * of them in the second or so before the kill.
  *
  * Ticketing's projection is the one consumer this cannot move: its group is a constant
  * in services/ticketing/src/consumer.ts, not configuration, and it is not in its
@@ -73,7 +74,8 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Kafka, logLevel } from 'kafkajs';
-import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { commitAtEnd, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { CONTACTS_TOPIC } from './lib/notification-groups.mjs';
 
 const RUN = randomBytes(4).toString('hex');
 /**
@@ -87,6 +89,14 @@ const RUN_PREFIX = `verify-env-${RUN}-`;
 /** The example keys that name a consumer group, and the ones that say where a new group starts. */
 const isGroupKey = (key) => /(^|_)GROUP(_|$)/.test(key);
 const isStartKey = (key) => /(^|_)START_FROM$/.test(key);
+
+/**
+ * The group keys whose consumer has no start setting and begins every new group at the
+ * start of its topics, and those topics. Each such group of this run's is committed at
+ * the end of them before its service boots. Hand-written, so checked in main() against
+ * the examples: a key here that no example sets any more is reported.
+ */
+const START_AT_END = { CONTACTS_CONSUMER_GROUP: [CONTACTS_TOPIC] };
 
 /**
  * A deployed group, or one a service derives from a deployed group's name:
@@ -228,6 +238,12 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
 
   const mine = Object.keys(parsed).filter(isGroupKey).map((k) => env[k]);
   for (const g of mine) kafka.configured.add(g);
+  const atEnd = [];
+  for (const [key, topics] of Object.entries(START_AT_END)) {
+    if (!(key in consumer)) continue;
+    await commitAtEnd(kafka.admin, consumer[key], topics);
+    atEnd.push(`${key} committed at the end of ${topics.join(', ')}`);
+  }
   const before = await allMembers(kafka.admin);
 
   const child = spawn(process.execPath, [svc.entry ?? 'dist/index.js'], {
@@ -293,7 +309,7 @@ async function bootFromExample(svc, publicKeyB64, kafka) {
     const joined = gainedMember(before, now, [...now.keys()].filter((g) => g.startsWith(RUN_PREFIX))).sort();
     for (const g of joined) kafka.joined.add(g);
     const real = gainedMember(before, now, [...now.keys()].filter((g) => isRealFamily(g, kafka.realGroups))).sort();
-    const starts = Object.keys(consumer).filter(isStartKey).map((k) => `${k}=${consumer[k]}`);
+    const starts = [...Object.keys(consumer).filter(isStartKey).map((k) => `${k}=${consumer[k]}`), ...atEnd];
     check(
       real.length === 0,
       real.length === 0
@@ -472,6 +488,14 @@ async function main() {
   const realGroups = [...new Set(examples.flatMap((e) => Object.keys(e).filter(isGroupKey).map((k) => e[k])))].sort();
   const brokers = examples.find((e) => Object.keys(e).some(isGroupKey))?.['KAFKA_BROKERS'];
   check(realGroups.length > 0 && Boolean(brokers), `the examples name ${realGroups.length} consumer group(s) (${realGroups.join(', ')}) on ${brokers}`);
+  const stale = Object.keys(START_AT_END).filter((k) => !examples.some((e) => k in e));
+  check(
+    stale.length === 0,
+    stale.length === 0
+      ? `and the group key(s) committed at the end of their topics before boot are all set by an example (${Object.keys(START_AT_END).join(', ')})`
+      : `${stale.join(', ')} ${stale.length === 1 ? 'is' : 'are'} in START_AT_END but in no example: renamed, the group is no longer ` +
+        'committed at the end, and starts at the beginning of its topics',
+  );
   console.log('');
 
   const admin = new Kafka({ clientId: `verify-env-example-${RUN}`, brokers: (brokers ?? '').split(','), logLevel: logLevel.NOTHING }).admin();

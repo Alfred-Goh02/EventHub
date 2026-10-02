@@ -58,7 +58,9 @@
  *
  * Notification runs on groups of its own. Its reset path starts `earliest`, as compose
  * runs it, with this run's groups committed at the end of their topics first, so it does
- * not work through every reset ever requested. Its replies group starts where its
+ * not work through every reset ever requested; its contact-card group is committed at the
+ * end of auth.user-contact the same way (scripts/lib/notification-groups.mjs), since the
+ * cards this run needs are written straight to the table. Its replies group starts where its
  * default says, and a canary on this run's key proves it is reading the partition every
  * later message lands on before anything real is sent.
  *
@@ -81,7 +83,8 @@ import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { CompactEncrypt, SignJWT, calculateJwkThumbprint, exportJWK, importPKCS8, importSPKI } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
-import { busyGroups, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { busyGroups, commitAtEnd, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -95,6 +98,7 @@ const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_replies_${RUN}`;
 const SPACE = `space_replies_${RUN}`;
 const GROUP = `verify-reply-emails-${RUN}`;
+const GROUPS = notificationGroups(GROUP);
 const PORT = 3985;
 /** An origin only this run uses, so the post link's origin is checked, not just its path. */
 const APP_URL = `https://app-${RUN}.replies.example`;
@@ -127,8 +131,8 @@ const Y = who('recent');
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
-  CONTACTS_CONSUMER_GROUP: `${GROUP}-contacts`,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs.
+  ...GROUPS.env,
   DISPATCH_RETRY_DELAYS_MS: DELAYS_MS.join(','),
   REPLY_MAX_AGE_MS: String(MAX_AGE_MS),
   // An hour fast, so a comparison made on this process's clock is visible.
@@ -410,13 +414,12 @@ async function main() {
     await produce(early);
     // The reset path starts `earliest`, as compose runs it; committing this run's groups
     // at the end of their topics first keeps it from working through every reset ever
-    // requested, and leaves the replies group the only one without a position.
-    for (const [groupId, topics] of [[GROUP, [RESET_TOPIC]], [`${GROUP}-retry`, TIERS]]) {
-      for (const topic of topics) {
-        const ends = await admin.fetchTopicOffsets(topic);
-        await admin.setOffsets({ groupId, topic, partitions: ends.map((p) => ({ partition: p.partition, offset: p.high })) });
-      }
-    }
+    // requested, and leaves the replies group the only one without a position. The
+    // contacts group too: this run's cards are written straight to the table, and a
+    // contacts group from the start would replay every card on auth.user-contact.
+    await commitAtEnd(admin, GROUP, [RESET_TOPIC]);
+    await commitAtEnd(admin, `${GROUP}-retry`, TIERS);
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
 
     service = spawn(process.execPath, ['dist/index.js'], { cwd: join(ROOT, 'services', 'notification'), env: notificationEnv, stdio: ['ignore', 'pipe', 'pipe'] });
     service.stdout.on('data', (d) => (log += d));
@@ -434,6 +437,8 @@ async function main() {
       return described.length === groups.length && described.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
     check(Boolean(joined), 'CONTROL: its reset group, its replies group and each one\'s retry group have all joined');
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     // A canary on this run's key until one is counted: the replies group started at
     // latest, so anything produced before it held the partition was never going to be read.
     const reading = await waitFor(async () => produceAndWait(activity({ kind: 'POST_CREATED', recipientId: null }), 'notAReplyTotal', undefined, 5_000), 60_000, 500);
@@ -783,7 +788,7 @@ async function main() {
       await fetch(`${MAILPIT}/api/v1/messages`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ IDs: ids }) }).catch(() => {});
     }
     check(removed > 0 && Number(left) === 0, `cleanup: this run's rows are gone (${removed} deleted, ${left} left), and ${ids.length} email(s) removed from Mailpit`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, `${GROUP}-contacts`, ...scanGroups]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, ...scanGroups]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), owner.end()]);
   }
