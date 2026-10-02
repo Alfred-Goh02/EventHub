@@ -1015,10 +1015,16 @@ services:
   # parse stops it starting rather than leaving it half-configured. That file says
   # what it routes and why.
   #
-  # The proxy, 8000, is the one port meant for the outside. The Admin API and the
-  # status endpoint are published on loopback only: in DB-less mode the Admin API
-  # cannot change an entity, but it lists every route and upstream, and POST
-  # /config replaces the whole configuration.
+  # The proxy, 8000, is the one port meant for the outside. The Admin API listens
+  # on the container's OWN loopback and is published nowhere: in DB-less mode it
+  # cannot change one entity, but POST /config replaces the whole configuration,
+  # tenant snippet included, and it has no authentication. On 0.0.0.0 inside the
+  # container, any service on this network could have rewritten the gateway. To
+  # read it, join Kong's network namespace:
+  #   docker run --rm --network container:eventhub-kong --entrypoint curl \
+  #     eventhub/app:local -s http://127.0.0.1:8001/routes
+  # Kong Manager, the GUI on 8002 and 8445 by default, is off for the same reason.
+  # The status endpoint is read-only and published on loopback.
   #
   # A tenant is a subdomain, so locally: http://acme.eventhub.localhost:8000/...
   # Browsers and curl resolve any *.localhost name to loopback by themselves.
@@ -1032,9 +1038,10 @@ services:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
       KONG_PROXY_LISTEN: 0.0.0.0:8000
-      # Inside the container, so the port mapping below can reach them; published
-      # to 127.0.0.1 only.
-      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001
+      KONG_ADMIN_GUI_LISTEN: "off"
+      # Inside the container, so the port mapping below can reach it; published to
+      # 127.0.0.1 only.
       KONG_STATUS_LISTEN: 0.0.0.0:8100
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
@@ -1047,7 +1054,6 @@ services:
       - ./infra/kong:/kong/declarative:ro
     ports:
       - "8000:8000"
-      - "127.0.0.1:8001:8001"
       - "127.0.0.1:8100:8100"
     healthcheck:
       test: ["CMD", "kong", "health"]

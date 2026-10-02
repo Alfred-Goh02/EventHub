@@ -32,8 +32,11 @@
  *   - The snippet that does this is global, so a route added later cannot miss it.
  *   - Retries are off on every service.
  *   - In the real stack: a path reaches the real service (its own error shape, not
- *     Kong's), Auth never sees a forged X-Tenant-ID, nothing routes /health or
- *     /metrics, and the Admin API and status endpoint are published on loopback only.
+ *     Kong's), Auth never sees a forged X-Tenant-ID, and nothing routes /health or
+ *     /metrics.
+ *   - The Admin API is unreachable from the host AND from every other container: it
+ *     has no authentication, and POST /config replaces the whole configuration. It is
+ *     read here from inside Kong's own network namespace.
  *
  * Run with the compose stack up (docker compose up -d --wait):
  *   node scripts/verify-compose-gateway.mjs
@@ -44,9 +47,10 @@ import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 
 const PROXY = process.env['KONG_PROXY_URL'] ?? 'http://127.0.0.1:8000';
-const ADMIN = process.env['KONG_ADMIN_URL'] ?? 'http://127.0.0.1:8001';
 const STATUS = process.env['KONG_STATUS_URL'] ?? 'http://127.0.0.1:8100';
 const KONG_CONTAINER = 'eventhub-kong';
+/** Another container on the compose network, with curl, to ask what Kong exposes there. */
+const NEIGHBOUR = 'eventhub-auth';
 const RUN = randomBytes(4).toString('hex');
 const SCRATCH = `eventhub-kong-echo-${RUN}`;
 
@@ -144,16 +148,33 @@ async function send(base, path, { host, headers = {}, method = 'GET', body } = {
   });
 }
 
+/**
+ * The Admin API listens on Kong's own loopback and is published nowhere, so it is read
+ * from a container that joins Kong's network namespace: the application image, for its
+ * curl. Kong's image has none.
+ */
+async function admin(appImage, path) {
+  const out = await docker(['run', '--rm', '--network', `container:${KONG_CONTAINER}`, '--entrypoint', 'curl', appImage, '-sf', `http://127.0.0.1:8001${path}`]);
+  return JSON.parse(out);
+}
+
 /** Every page of an Admin API listing. */
-async function listAll(base, path) {
+async function listAll(appImage, path) {
   const out = [];
-  let next = `${base}${path}?size=1000`;
+  let next = `${path}?size=1000`;
   while (next) {
-    const page = await getJson(next);
+    const page = await admin(appImage, next);
     out.push(...page.data);
-    next = page.next ? new URL(page.next, base).href : null;
+    next = page.next ? new URL(page.next, 'http://admin').pathname + new URL(page.next, 'http://admin').search : null;
   }
   return out;
+}
+
+/** What a neighbour on the compose network gets from one of Kong's ports: an HTTP status, or 000 and curl's exit code. */
+async function fromNeighbour(port) {
+  const out = await docker(['exec', NEIGHBOUR, 'sh', '-c', `curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://kong:${port}/; echo " $?"`]);
+  const [code, exit] = out.split(' ');
+  return { code, exit: Number(exit) };
 }
 
 async function main() {
@@ -162,16 +183,37 @@ async function main() {
   check(Boolean(status?.server), `CONTROL: Kong is up and answers its status endpoint (${status ? 'yes' : 'no answer'})`);
   if (!status) return;
 
+  // Every port the container publishes, and to which address. Only the proxy is for
+  // the outside; the status endpoint is read-only and stays on loopback.
   const bindings = JSON.parse(await docker(['inspect', '-f', '{{json .NetworkSettings.Ports}}', KONG_CONTAINER]));
-  const hostIps = (port) => (bindings[`${port}/tcp`] ?? []).map((b) => b.HostIp);
+  const published = Object.entries(bindings)
+    .filter(([, b]) => Array.isArray(b) && b.length > 0)
+    .map(([port, b]) => `${port.replace('/tcp', '')}@${[...new Set(b.map((x) => x.HostIp))].join('+')}`)
+    .sort();
   check(
-    hostIps(8001).length > 0 && hostIps(8001).every((ip) => ip === '127.0.0.1') && hostIps(8100).length > 0 && hostIps(8100).every((ip) => ip === '127.0.0.1'),
-    `the Admin API and the status endpoint are published on loopback only (8001: ${hostIps(8001).join(', ') || 'none'}; 8100: ${hostIps(8100).join(', ') || 'none'})`,
+    published.some((p) => p.startsWith('8000@')),
+    `CONTROL: the proxy is published (${published.join(', ') || 'nothing'})`,
+  );
+  check(
+    published.every((p) => p.startsWith('8000@') || p === '8100@127.0.0.1'),
+    `nothing but the proxy leaves the host's loopback, and the Admin API is published nowhere (${published.join(', ')})`,
   );
 
-  const services = await listAll(ADMIN, '/services');
-  const routes = await listAll(ADMIN, '/routes');
-  const plugins = await listAll(ADMIN, '/plugins');
+  // And on the compose network, where every service is a neighbour: the Admin API has
+  // no authentication, and POST /config would replace the tenant snippet. Asked from a
+  // real service's container; the proxy answering the same neighbour is the control
+  // that the name and the network work at all.
+  const viaProxy = await fromNeighbour(8000);
+  check(viaProxy.code === '404', `CONTROL: ${NEIGHBOUR} reaches Kong's proxy over the compose network (${viaProxy.code}, curl exit ${viaProxy.exit})`);
+  for (const [port, what] of [[8001, 'the Admin API'], [8444, 'the Admin API over TLS'], [8002, 'Kong Manager'], [8445, 'Kong Manager over TLS']]) {
+    const res = await fromNeighbour(port);
+    check(res.code === '000' && res.exit === 7, `${what} (:${port}) refuses a connection from ${NEIGHBOUR} (${res.code}, curl exit ${res.exit})`);
+  }
+
+  const appImage = await docker(['inspect', '-f', '{{.Config.Image}}', NEIGHBOUR]);
+  const services = await listAll(appImage, '/services');
+  const routes = await listAll(appImage, '/routes');
+  const plugins = await listAll(appImage, '/plugins');
   const serviceName = new Map(services.map((s) => [s.id, s.name]));
   check(services.length > 0 && routes.length > 0, `CONTROL: read the running config: ${services.length} services, ${routes.length} routes, ${plugins.length} plugin(s)`);
 
