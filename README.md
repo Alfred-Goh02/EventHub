@@ -87,7 +87,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
 | `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 88 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 89 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -271,7 +271,9 @@ is tenant `acme`; any `*.localhost` name resolves to your own machine without a
 hosts-file entry. Kong clears any `X-Tenant-ID` or `X-Tenant-Slug` a client sends
 and passes the subdomain on as `X-Tenant-Slug`, so a request cannot name its own
 tenant; Auth turns the slug into a tenant when you sign in, and every other
-service takes the tenant from the token. Paths are each service's own (`/events`,
+service takes the tenant from the token. The token names its subdomain too, so
+an acme token on `globex.eventhub.localhost` is refused with 403 rather than
+quietly acting on acme. Paths are each service's own (`/events`,
 `/reservations`, `/spaces`...), except Auth's, which sit under `/auth`. The
 payment webhook and the unsubscribe link carry no tenant and live on
 `api.eventhub.localhost`.

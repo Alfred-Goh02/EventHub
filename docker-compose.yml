@@ -661,10 +661,11 @@ services:
       # redis, not 127.0.0.1: inside the network the host mapping does not exist.
       REDIS_URL: redis://redis:6379
       AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
-      # A suffix rather than a list, and permissive locally because there is no
-      # front end yet. WebSocket handshakes are not subject to CORS, so this is
-      # the only thing standing between a page on another origin and a socket.
-      ALLOWED_ORIGIN_SUFFIX: localhost
+      # A suffix rather than a list: every tenant's subdomain, as the gateway serves
+      # them. WebSocket handshakes are not subject to CORS, so this is the only thing
+      # standing between a page on another origin and a socket. The leading dot is
+      # required -- without it `localhost` admitted `evillocalhost`.
+      ALLOWED_ORIGIN_SUFFIX: .eventhub.localhost
       # Nothing to drain from in compose, and waiting 15 s on every `down` is
       # only irritating. Production wants the real delay.
       LIVE_DRAIN_DELAY_MS: 0
@@ -1058,6 +1059,11 @@ services:
       KONG_LOG_LEVEL: info
       # The default, written down: the tenant snippet runs in Kong's Lua sandbox.
       KONG_UNTRUSTED_LUA: sandbox
+      # Re-resolve service names every 5 s, whatever TTL Docker's DNS gives them.
+      # Recreate two services and they can swap addresses; Kong kept sending /events
+      # to Event's old one, which was now Live's, and answered 502 for as long as it
+      # was measured (over 100 s) until Kong itself was restarted.
+      KONG_DNS_VALID_TTL: "5"
     volumes:
       - ./infra/kong:/kong/declarative:ro
     ports:

@@ -125,6 +125,14 @@ export function attachUpgrade(server: HttpServer): void {
 
     verifyAccessToken(token).then(
       (claims) => {
+        // One tenant's token on another tenant's subdomain, refused exactly as the
+        // HTTP middleware refuses it (@eventhub/auth-middleware), and only when the
+        // gateway has named a subdomain.
+        const subdomain = req.headers['x-tenant-slug'];
+        if (subdomain !== undefined && claims.tenantSlug !== subdomain) {
+          reject(socket, 403, 'Forbidden');
+          return;
+        }
         // handleUpgrade adds the socket to wss.clients, which is what the
         // heartbeat sweep iterates.
         wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws as WsSocket, claims));

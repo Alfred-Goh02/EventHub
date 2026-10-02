@@ -156,6 +156,23 @@ export function createRequireAuth(opts: RequireAuthOptions): RequestHandler {
         return res.status(401).json({ error: 'malformed token' });
       }
 
+      // ONE TENANT'S TOKEN ON ANOTHER TENANT'S SUBDOMAIN. The gateway names the
+      // subdomain a request came in on in X-Tenant-Slug, and the token names its
+      // tenant's. When they disagree, refuse: preferring the token silently would
+      // make an acme session work on globex's pages, which corrupts every cache,
+      // CORS rule and audit trail that assumes a subdomain is one tenant. 403, not
+      // 401: the token is genuine, and signing in again would not change the answer.
+      //
+      // Only when the header is there. It is set by the gateway, not by a client --
+      // a caller that reaches this service directly can send or omit anything, and
+      // the tenant it acts on is still the token's. A token with no slug at all
+      // fails this comparison too, so one minted before the claim existed is refused
+      // through the gateway rather than waved through.
+      const subdomain = req.header('X-Tenant-Slug');
+      if (subdomain !== undefined && payload['tenantSlug'] !== subdomain) {
+        return res.status(403).json({ error: "this token is for another tenant's subdomain" });
+      }
+
       req.auth = {
         userId: payload.sub,
         tenantId: payload.tenantId,

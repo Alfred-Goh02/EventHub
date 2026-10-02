@@ -17,7 +17,7 @@ import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
 import { queueContactCard } from './contact-card.js';
 import { emit } from './outbox.js';
 import { createRateLimiter } from './rate-limit.js';
-import { resolveTenantSlug } from './tenant-slug.js';
+import { resolveTenantSlug, slugOfTenant } from './tenant-slug.js';
 
 const logger = createLogger('auth-service');
 
@@ -490,7 +490,7 @@ app.post('/login', ah(async (req, res) => {
   loginFailuresPerAccountIp.reset(accountIpKey);
   loginFailuresPerAccount.reset(accountKey);
 
-  const accessToken = await signAccessToken(user.id, tenantId, user.role);
+  const accessToken = await signAccessToken(user.id, tenantId, slug, user.role);
   const refreshToken = await issueRefreshToken(user.id, tenantId);
   return res.json({ accessToken, refreshToken });
 }));
@@ -549,11 +549,16 @@ app.post('/refresh', ah(async (req, res) => {
     tx.user.findUnique({ where: { id: result.userId }, select: { role: true } }),
   );
 
-  if (!user) {
+  // The slug as it is NOW, so a renamed tenant's next token carries the new name. Not
+  // compared with the gateway's X-Tenant-Slug here: the token minted is for the
+  // refresh token's own tenant, and every service refuses it on another tenant's
+  // subdomain.
+  const tenantSlug = await slugOfTenant(result.tenantId);
+  if (!user || !tenantSlug) {
     return res.status(401).json({ error: 'invalid refresh token' });
   }
 
-  const accessToken = await signAccessToken(result.userId, result.tenantId, user.role);
+  const accessToken = await signAccessToken(result.userId, result.tenantId, tenantSlug, user.role);
   return res.json({ accessToken, refreshToken: result.token });
 }));
 

@@ -33,12 +33,18 @@ const keyPath = (name: string) => new URL(`../keys/${name}`, import.meta.url);
 const privateKey = await importPKCS8(readFileSync(keyPath('private.pem'), 'utf8'), ALG);
 export const publicKey = await importSPKI(readFileSync(keyPath('public.pem'), 'utf8'), ALG);
 
+/**
+ * `tenantSlug` is the subdomain the tenant is served on. Services never scope data by
+ * it -- `tenantId` does that -- but they compare it with the gateway's X-Tenant-Slug
+ * and refuse a token presented on another tenant's subdomain, without a lookup.
+ */
 export async function signAccessToken(
   userId: string,
   tenantId: string,
+  tenantSlug: string,
   role: Role,
 ): Promise<string> {
-  return new SignJWT({ tenantId, role })
+  return new SignJWT({ tenantId, tenantSlug, role })
     .setProtectedHeader({ alg: ALG })
     .setSubject(userId)
     .setIssuer(ISSUER!)

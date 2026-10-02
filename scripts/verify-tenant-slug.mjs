@@ -7,7 +7,8 @@
  * half: what Auth does with it.
  *
  *   - A slug signs in to its own tenant. The seed holds alice@acme.com with one password
- *     in BOTH acme and globex, so the two answers can only differ by the slug.
+ *     in BOTH acme and globex, so the two answers can only differ by the slug. The
+ *     token names the slug as well, and so does the one a refresh mints.
  *   - X-Tenant-ID, the header this replaced, is not read: on its own it is a 400, and
  *     beside a slug it changes nothing.
  *   - A slug with no tenant behind it, or one that is not a subdomain at all, is the
@@ -49,7 +50,15 @@ async function login(headers, account = ACCOUNT) {
   });
   const body = await res.json().catch(() => null);
   const claims = body?.accessToken ? JSON.parse(Buffer.from(body.accessToken.split('.')[1], 'base64url').toString('utf8')) : null;
-  return { status: res.status, error: body?.error ?? null, tenant: claims?.tenantId ?? null };
+  return { status: res.status, error: body?.error ?? null, tenant: claims?.tenantId ?? null, slug: claims?.tenantSlug ?? null, refreshToken: body?.refreshToken ?? null };
+}
+
+/** POST /refresh; the new access token's tenant and slug. */
+async function refresh(refreshToken) {
+  const res = await fetch(`${AUTH}/refresh`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refreshToken }) });
+  const body = await res.json().catch(() => null);
+  const claims = body?.accessToken ? JSON.parse(Buffer.from(body.accessToken.split('.')[1], 'base64url').toString('utf8')) : null;
+  return { status: res.status, tenant: claims?.tenantId ?? null, slug: claims?.tenantSlug ?? null };
 }
 
 /** One statement inside a tenant's context, as the runtime role; the rows it returned. */
@@ -76,6 +85,15 @@ async function main() {
     console.error('\nIs Auth up and seeded? Start it, or set AUTH_URL.');
     return;
   }
+
+  // The token names its tenant's subdomain too, so that every service can refuse it
+  // on another tenant's (verify-token-tenant.mjs). From a sign-in and from a refresh.
+  check(acme.slug === 'acme' && globex.slug === 'globex', `each token carries its own tenant's slug (${acme.slug}, ${globex.slug})`);
+  const refreshed = await refresh(acme.refreshToken);
+  check(
+    refreshed.status === 200 && refreshed.tenant === 'tenant_acme' && refreshed.slug === 'acme',
+    `so does the access token a refresh mints (${refreshed.status}, ${refreshed.tenant}, ${refreshed.slug})`,
+  );
 
   console.log('');
   console.log('  the header it replaced is not read');
