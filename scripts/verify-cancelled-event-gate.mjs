@@ -44,6 +44,8 @@ const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
 const TICKETING = process.env['TICKETING_URL'] ?? 'http://localhost:3003';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 
 // The fake provider picks its outcome from the last two digits of the amount.
 // 00 succeeds, which is what the positive control needs. See payments/provider.ts.
@@ -160,7 +162,7 @@ async function main() {
 
   const loginRes = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
   });
   const { accessToken } = await loginRes.json();

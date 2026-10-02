@@ -26,6 +26,9 @@ const AUTH_APP_URL =
 
 const TENANT = 'tenant_acme';
 const OTHER_TENANT = 'tenant_globex';
+/** Their subdomains: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
+const OTHER_TENANT_SLUG = 'globex';
 const ADMIN = { email: 'alice@acme.com', password: 'hunter2222' };
 
 let failures = 0;
@@ -77,7 +80,7 @@ const post = (path, body, headers = {}) =>
 async function main() {
   await db.connect();
 
-  const login = await post('/login', ADMIN, { 'X-Tenant-ID': TENANT });
+  const login = await post('/login', ADMIN, { 'X-Tenant-Slug': TENANT_SLUG });
   if (login.status !== 200) fail(`could not log in as admin (${login.status})`);
   const auth = { Authorization: `Bearer ${login.body.accessToken}` };
 
@@ -140,7 +143,7 @@ async function main() {
   console.log('\n5. revoking requires ADMIN');
   // -------------------------------------------------------------------------
   // The user registered in step 3 is an ATTENDEE in the other tenant.
-  const attendee = await post('/login', { email, password: 'hunter2222' }, { 'X-Tenant-ID': OTHER_TENANT });
+  const attendee = await post('/login', { email, password: 'hunter2222' }, { 'X-Tenant-Slug': OTHER_TENANT_SLUG });
   if (attendee.status !== 200) fail(`could not log in as the new attendee (${attendee.status})`);
 
   const forbidden = await post(

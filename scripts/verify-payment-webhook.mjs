@@ -23,6 +23,8 @@ const TICKETING = process.env['TICKETING_URL'] ?? 'http://localhost:3003';
 const SECRET = process.env['PAYMENT_WEBHOOK_SECRET'] ?? 'dev_webhook_secret';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const PRICE_UNKNOWN = 1002; // charge() answers "no answer"; see payments/provider.ts
 
 const run = `wh_${Date.now()}`;
@@ -107,7 +109,7 @@ async function main() {
 
   const loginRes = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
   });
   const { accessToken } = await loginRes.json();

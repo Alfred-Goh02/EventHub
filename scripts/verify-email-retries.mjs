@@ -53,6 +53,8 @@ const DELAYS_MS = [1500, 3000, 4500];
 
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_mailretry_${RUN}`;
+/** Its subdomain, which is how Auth is told the tenant. */
+const TENANT_SLUG = `mailretry-${RUN}`;
 const GROUP = `verify-email-retries-${RUN}`;
 const SMTP_PORT = 3190;
 const NOTIFICATION_PORT = 3191;
@@ -251,7 +253,7 @@ async function main() {
 
   try {
     console.log('  the fixture');
-    await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail retries ${RUN}`, `mailretry-${RUN}`]);
+    await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail retries ${RUN}`, TENANT_SLUG]);
     for (const user of Object.values(users)) {
       await inTenant(authApp, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [user, TENANT, email(user)]);
     }
@@ -298,7 +300,7 @@ async function main() {
     if (failures > 0) return;
 
     async function requestReset(user) {
-      const status = await post('/forgot-password', { email: email(user) }, { 'X-Tenant-ID': TENANT });
+      const status = await post('/forgot-password', { email: email(user) }, { 'X-Tenant-Slug': TENANT_SLUG });
       const link = await waitFor(async () => sinkLink(auth.log(), email(user)), 5_000, 100);
       await relayOnce();
       const messageId = await outboxIdFor(user);

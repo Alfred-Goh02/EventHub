@@ -51,6 +51,8 @@ const SUBJECT = 'Reset your EventHub password';
 
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_maildelivery_${RUN}`;
+/** Its subdomain, which is how Auth is told the tenant. */
+const TENANT_SLUG = `maildelivery-${RUN}`;
 const USER_ID = `user_maildelivery_${RUN}`;
 const EMAIL = `deliver-${RUN}@mailcheck.example`;
 const VICTIM = `victim-${RUN}@mailcheck.example`;
@@ -293,7 +295,7 @@ async function main() {
 
   try {
     console.log('  the fixture');
-    await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail delivery ${RUN}`, `maildelivery-${RUN}`]);
+    await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail delivery ${RUN}`, TENANT_SLUG]);
     await inTenant(authApp, TENANT, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [USER_ID, TENANT, EMAIL]);
 
     // Waited for side by side, each with a full minute: one run saw Auth miss a
@@ -319,7 +321,7 @@ async function main() {
 
     console.log('');
     console.log('  a reset is delivered once, with the link Auth issued');
-    const first = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-ID': TENANT });
+    const first = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(first.status === 202, `/forgot-password answered 202 (${first.status})`);
     const link1 = await waitFor(async () => sinkLinks(auth.log())[0], 5_000, 100);
     const token1 = link1 ? new URL(link1).searchParams.get('token') : '';
@@ -413,7 +415,7 @@ async function main() {
     check(refused?.expiredSkippedTotal === beforeRefusals.expiredSkippedTotal + 2, 'an expired envelope, and a current envelope around an expired seal, were both skipped as expired');
 
     const inboxBefore = (await inbox(EMAIL)).length;
-    const second = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-ID': TENANT });
+    const second = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(second.status === 202, `a second reset request answered 202 (${second.status})`);
     const link2 = await waitFor(async () => sinkLinks(auth.log())[1], 5_000, 100);
     const token2 = link2 ? new URL(link2).searchParams.get('token') : '';
@@ -448,7 +450,7 @@ async function main() {
     const emailedToken = emailedLink ? new URL(emailedLink).searchParams.get('token') ?? '' : '';
     const reset = await post('/reset-password', { token: emailedToken, password: NEW_PASSWORD });
     check(reset.status === 200, `the link read out of the email resets the password (${reset.status})`);
-    const login = await post('/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-ID': TENANT });
+    const login = await post('/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(login.status === 200, `and the new password signs in (${login.status})`);
 
     console.log('');

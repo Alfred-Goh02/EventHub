@@ -34,6 +34,8 @@ const AUTH_APP_URL =
   'postgresql://eventhub_auth_app:eventhub_auth_app@localhost:5432/eventhub_auth';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const EMAIL = 'alice@acme.com';
 const PASSWORD = 'hunter2222';
 
@@ -56,7 +58,7 @@ function fail(msg) {
 const login = async () => {
   const r = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
   });
   const body = await r.json();

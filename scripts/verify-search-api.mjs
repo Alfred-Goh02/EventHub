@@ -367,14 +367,15 @@ async function main() {
     }
 
     const mine = await ids('/search?q=jazz');
-    const withHeader = await ids('/search?q=jazz', t1, { 'X-Tenant-ID': T2 });
+    // X-Tenant-Slug too: the gateway sends it on every request, and only Auth reads it.
+    const withHeader = await ids('/search?q=jazz', t1, { 'X-Tenant-ID': T2, 'X-Tenant-Slug': T2 });
     check(
       mine.includes(id('fest')) && !mine.includes(id('other')),
       `tenant A's search finds its own events and not B's: [${mine.join(', ')}]`,
     );
     check(
       JSON.stringify(withHeader) === JSON.stringify(mine),
-      'X-Tenant-ID naming tenant B changes nothing',
+      'X-Tenant-ID and X-Tenant-Slug naming tenant B change nothing',
     );
     const theirs = await ids('/search?q=jazz', token(T2));
     check(theirs.length === 1 && theirs[0] === id('other'), `tenant B's token finds [${theirs.join(', ')}]`);
