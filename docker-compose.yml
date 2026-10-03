@@ -513,6 +513,14 @@ services:
       PORT: 3001
       DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
       APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@postgres:5432/eventhub_auth
+      # One proxy hop: the gateway. Without it Auth sees every sign-in as coming from
+      # Kong, and the login budget keyed on the caller's address becomes one budget
+      # for everybody -- measured: an account locked out from this host was locked
+      # out from another container too. With it, req.ip is the address Kong saw;
+      # anything a client put in X-Forwarded-For sits to its left and is ignored.
+      # The cost, while this port is still published: a client calling Auth
+      # directly can name its own address. scripts/verify-compose-gateway.mjs.
+      TRUST_PROXY: "1"
     volumes:
       # The only container that gets the PRIVATE key, because it is the only one
       # that signs. jwt.ts resolves keys/ relative to its own file, so the mount

@@ -17,7 +17,7 @@
  * that a schema has a required field.
  *
  * The property it was reaching for is real and was tested nowhere: /register
- * takes no X-Tenant-ID at all, deliberately, because the tenant comes from an
+ * takes no tenant header at all, deliberately, because the tenant comes from an
  * invite created by someone already inside that tenant — so the registering
  * user never gets to say which tenant they are joining. Nothing checked that
  * the header is actually ignored rather than merely undocumented.
@@ -116,9 +116,11 @@ async function main() {
   const email = `${run}_steered@acme.com`;
   const token = await mintInvite(INVITE_TENANT, email);
 
+  // Both tenant headers there have been: the id Auth once read, and the gateway's slug
+  // it reads now on /login. /register reads neither.
   const steered = await register(
     { token, password: 'hunter2222' },
-    { 'X-Tenant-ID': CLAIMED_TENANT },
+    { 'X-Tenant-ID': CLAIMED_TENANT, 'X-Tenant-Slug': 'globex' },
   );
   check(
     steered.status === 201,

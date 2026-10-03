@@ -280,10 +280,11 @@ async function main() {
       const r = await funnel(SHARED, '', { auth });
       check(r.status === want, `${label}: ${r.status} (want ${want})`);
     }
-    const spoofed = await funnel(SHARED, '', { headers: { 'X-Tenant-ID': TB } });
+    // X-Tenant-Slug too: the gateway sends it on every request, and only Auth reads it.
+    const spoofed = await funnel(SHARED, '', { headers: { 'X-Tenant-ID': TB, 'X-Tenant-Slug': TB } });
     check(
       spoofed.status === 200 && JSON.stringify(spoofed.body.totals) === JSON.stringify(control.body.totals),
-      `X-Tenant-ID naming tenant B changes nothing: ${spoofed.body?.totals?.ticketsSold} tickets, as without it`,
+      `X-Tenant-ID and X-Tenant-Slug naming tenant B change nothing: ${spoofed.body?.totals?.ticketsSold} tickets, as without them`,
     );
     const asked = await funnel(SHARED, `?tenantId=${TB}`);
     check(asked.status === 400, `?tenantId=... is refused, not ignored (${asked.status})`);

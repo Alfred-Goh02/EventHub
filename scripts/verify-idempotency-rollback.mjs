@@ -48,6 +48,8 @@ const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
 const TICKETING = process.env['TICKETING_URL'] ?? 'http://localhost:3003';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const PRICE = 1000;
 
 const run = `ir_${Date.now()}`;
@@ -140,7 +142,7 @@ async function main() {
 
   const login = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
   });
   ({ accessToken } = await login.json());

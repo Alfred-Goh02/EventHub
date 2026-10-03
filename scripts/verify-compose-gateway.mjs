@@ -32,8 +32,10 @@
  *   - The snippet that does this is global, so a route added later cannot miss it.
  *   - Retries are off on every service.
  *   - In the real stack: a path reaches the real service (its own error shape, not
- *     Kong's), Auth never sees a forged X-Tenant-ID, and nothing routes /health or
- *     /metrics.
+ *     Kong's), and nothing routes /health or /metrics. Signing in at a subdomain is a
+ *     token for that subdomain's tenant, also when the request forges both tenant
+ *     headers for another one: the seed holds the same account in two tenants, so a
+ *     forgery that got through would sign in, not fail.
  *   - The Admin API is unreachable from the host AND from every other container: it
  *     has no authentication, and POST /config replaces the whole configuration. It is
  *     read here from inside Kong's own network namespace.
@@ -237,16 +239,54 @@ async function main() {
     realEvent.status === 401 && typeof realEvent.json?.error === 'string' && realEvent.json?.message === undefined,
     `a path reaches the real service: /events answers Event's own 401, not Kong's (${realEvent.status} ${realEvent.text.slice(0, 80)})`,
   );
-  const realLogin = await send(PROXY, '/auth/login', {
-    host: TENANT_HOST,
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'X-Tenant-ID': 'tenant_victim' },
-    body: JSON.stringify({ email: 'nobody@example.com', password: 'not-the-password' }),
-  });
+  // Signing in through the gateway: the tenant is the subdomain, whatever the request
+  // says. The seed puts the same address and password in both acme and globex, so a
+  // forged header that worked would sign in somewhere real, not fail.
+  const signIn = async (host, headers = {}) => {
+    const res = await send(PROXY, '/auth/login', {
+      host,
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
+    });
+    const token = res.json?.accessToken;
+    const claims = token ? JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')) : null;
+    return { status: res.status, tenant: claims?.tenantId ?? null };
+  };
+  const asAcme = await signIn(TENANT_HOST);
+  check(asAcme.status === 200 && asAcme.tenant === 'tenant_acme', `CONTROL: signing in at ${TENANT_HOST} is a token for tenant_acme (${asAcme.status}, ${asAcme.tenant})`);
+  const asGlobex = await signIn('globex.eventhub.localhost');
+  check(asGlobex.status === 200 && asGlobex.tenant === 'tenant_globex', `the same account at globex.eventhub.localhost is a token for tenant_globex (${asGlobex.status}, ${asGlobex.tenant})`);
+  const forged = await signIn(TENANT_HOST, { 'X-Tenant-ID': 'tenant_globex', 'X-Tenant-Slug': 'globex' });
   check(
-    realLogin.status === 400 && /X-Tenant-ID header is required/.test(realLogin.json?.error ?? ''),
-    `Auth never sees a forged X-Tenant-ID sent through the gateway: it answers that none arrived (${realLogin.status} ${realLogin.text.slice(0, 80)})`,
+    forged.status === 200 && forged.tenant === 'tenant_acme',
+    `forged X-Tenant-ID and X-Tenant-Slug naming globex, at ${TENANT_HOST}, still sign in to tenant_acme (${forged.status}, ${forged.tenant})`,
   );
+  const nowhere = await signIn('no-such-tenant.eventhub.localhost');
+  check(nowhere.status === 401 && nowhere.tenant === null, `a subdomain with no tenant behind it signs in nowhere (${nowhere.status})`);
+
+  // Behind the gateway, Auth must still tell one client from another. Its login budget
+  // that refuses a guesser is keyed on (tenant, email, ADDRESS) precisely so that
+  // spending it locks out only the address that spent it. If Auth saw every request as
+  // coming from Kong, one client would lock the account out for everyone. So: spend an
+  // account's budget from this host, through the gateway, then ask for the same account
+  // from another container, through the gateway. An invented account, per run, so no
+  // real one is touched and no earlier run is counted.
+  const target = JSON.stringify({ email: `lockout-${RUN}@acme.example`, password: 'not-the-password' });
+  let spentAfter = 0;
+  for (let i = 1; i <= 30; i += 1) {
+    const res = await send(PROXY, '/auth/login', { host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' }, body: target });
+    if (res.status === 429) {
+      spentAfter = i;
+      break;
+    }
+  }
+  check(spentAfter > 1, `CONTROL: this host, through the gateway, runs out of one account's budget (429 on attempt ${spentAfter || 'never, in 30'})`);
+  const elsewhere = await docker([
+    'exec', NEIGHBOUR, 'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '5',
+    '-X', 'POST', 'http://kong:8000/auth/login', '-H', `Host: ${TENANT_HOST}`, '-H', 'Content-Type: application/json', '-d', target,
+  ]);
+  check(elsewhere === '401', `the same account from another address, through the gateway, is still answered (${elsewhere}, want 401, not 429)`);
   for (const path of ['/health', '/ready', '/metrics']) {
     const res = await send(PROXY, path, { host: TENANT_HOST });
     check(res.status === 404 && /no Route matched/.test(res.json?.message ?? ''), `nothing routes ${path} to a service (${res.status})`);

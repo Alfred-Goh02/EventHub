@@ -30,7 +30,13 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TENANT = 'tenant_acme';
-const REAL = { email: 'alice@acme.com', password: 'hunter2222' };
+/** The seeded tenants' subdomains: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const SLUG = { tenant_acme: 'acme', tenant_globex: 'globex' };
+function slugOf(tenant) {
+  if (!SLUG[tenant]) throw new Error(`no subdomain known for ${tenant}`);
+  return SLUG[tenant];
+}
+const REAL ={ email: 'alice@acme.com', password: 'hunter2222' };
 const MAX_FAILURES = 3;
 const MAX_PER_IP = 4;
 
@@ -63,7 +69,7 @@ function client(port) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Tenant-ID': tenant,
+        'X-Tenant-Slug': slugOf(tenant),
         ...(ip ? { 'X-Forwarded-For': ip } : {}),
       },
       body: JSON.stringify({ email, password }),
