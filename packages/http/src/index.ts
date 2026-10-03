@@ -69,14 +69,26 @@ const CLIENT_ERRORS = new Map<string, string>([
  * raises exactly those for a body it cannot read: 400 for malformed JSON, 413 past the
  * size limit, 415 for an encoding or charset it does not know. `status` first, then
  * `statusCode`, the order Express's own final handler reads them in.
+ *
+ * ONE EXCEPTION, BY NAME: a URL Express cannot percent-decode. Express 4 raises a route
+ * parameter like `/events/%E0%A4%A` as a URIError with status 400 and no `expose`, so it
+ * fell through to the 500 below -- measured on Event before routing reached
+ * requireAuth, so with no token at all. Only that exact shape is let through: a URIError
+ * Express marked 400. Any other unexposed 4xx stays ours.
  */
 function clientStatus(err: unknown): number | null {
   if (typeof err !== 'object' || err === null) return null;
   const { status, statusCode, expose } = err as { status?: unknown; statusCode?: unknown; expose?: unknown };
-  if (expose !== true) return null;
   const code = typeof status === 'number' ? status : statusCode;
+  if (expose !== true) return isUndecodableUrl(err) ? 400 : null;
   return typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 499 ? code : null;
 }
+
+/** Express 4's own error for a route parameter that is not valid percent-encoding. */
+const isUndecodableUrl = (err: object): boolean => {
+  const { status, statusCode } = err as { status?: unknown; statusCode?: unknown };
+  return err instanceof URIError && (status === 400 || statusCode === 400);
+};
 
 /**
  * The error middleware every HTTP service mounts last.
@@ -111,9 +123,12 @@ export function errorHandler(logger: ErrorLogger): ErrorRequestHandler {
     }
     const status = clientStatus(err);
     if (status !== null) {
-      const type = (err as { type?: unknown }).type;
-      const known = typeof type === 'string' ? CLIENT_ERRORS.get(type) : undefined;
-      logger.info({ status, type: typeof type === 'string' ? type : null, method: req.method }, 'client error');
+      // The URL's message quotes the URL, as a parse error's quotes the body: fixed text.
+      const undecodable = isUndecodableUrl(err as object);
+      const raw = (err as { type?: unknown }).type;
+      const type = undecodable ? 'url.malformed' : typeof raw === 'string' ? raw : null;
+      const known = undecodable ? 'malformed URL' : type ? CLIENT_ERRORS.get(type) : undefined;
+      logger.info({ status, type, method: req.method }, 'client error');
       res.status(status).json({ error: known ?? 'bad request' });
       return;
     }
