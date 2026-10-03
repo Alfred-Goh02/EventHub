@@ -7,7 +7,9 @@ import { CHECKPOINT_UPSERT_SQL } from './checkpoint-upsert.js';
 
 const TOPIC = 'events.activity';
 const DLQ = 'events.activity.dlq';
-const GROUP = 'ticketing-event-projection';
+
+/** The group compose runs, and what the service uses when KAFKA_CONSUMER_GROUP is not set. */
+export const DEFAULT_GROUP = 'ticketing-event-projection';
 
 /**
  * When the projection consumer last heartbeat to its group.
@@ -66,12 +68,29 @@ const HEARTBEAT_STALE_MS = 15_000;
  *   transaction commits. Committing the offset first would mean a crash in
  *   between silently skips the message forever; this way a crash merely
  *   redelivers, which deduplication already handles.
+ *
+ * THE GROUP IS CONFIGURATION, KAFKA_CONSUMER_GROUP, as every other consumer's is.
+ * It was a constant here, which no example could name, so a verifier that booted
+ * this service from its .env.example could not move it off the deployed group:
+ * for the seconds it was up it took partitions from the real projection consumer
+ * and committed that group's offsets. The same name keys this consumer's rows in
+ * ProcessedMessage and ConsumerCheckpoint and its dead letters, so a process on a
+ * group of its own leaves the deployed consumer's bookkeeping alone.
  */
 export function createProjectionConsumer(opts: {
   brokers: string[];
   registryUrl: string;
   logger: Logger;
+  groupId: string;
+  /**
+   * Where a group with no committed offset starts. earliest is the real setting:
+   * the topic is compacted so a new deployment, or a wiped database, rebuilds the
+   * projection by replaying it. latest is for a verifier's throwaway group, which
+   * would otherwise replay every event into ProcessedMessage under its own name.
+   */
+  startFrom: 'earliest' | 'latest';
 }) {
+  const GROUP = opts.groupId;
   // A TimeoutNegativeWarning in this service's logs is an upstream kafkajs bug,
   // not this code: its request queue schedules a timer with `-1 - Date.now()`
   // whenever a request is fulfilled with an empty pending queue. One needless
@@ -272,8 +291,9 @@ export function createProjectionConsumer(opts: {
       await consumer.connect();
       // fromBeginning matters: events.activity is COMPACTED, so replaying from
       // the start rebuilds the whole projection. A new deployment or a wiped
-      // database needs no bootstrap endpoint.
-      await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
+      // database needs no bootstrap endpoint. It is earliest unless configured
+      // otherwise, and it only applies to a group with no committed offset.
+      await consumer.subscribe({ topic: TOPIC, fromBeginning: opts.startFrom === 'earliest' });
 
       // A heartbeat proves the consumer holds an assignment and is being fed.
       // It is the one cheap signal that separates "idle and caught up" from
@@ -306,7 +326,7 @@ export function createProjectionConsumer(opts: {
         },
       });
 
-      opts.logger.info({ topic: TOPIC, group: GROUP }, 'projection consumer running');
+      opts.logger.info({ topic: TOPIC, group: GROUP, startFrom: opts.startFrom }, 'projection consumer running');
     },
 
     async stop(): Promise<void> {
