@@ -46,6 +46,14 @@ x-app: &app
 # Quitting Docker Desktop or shutting Windows down can still cut a stop short
 # (docker/desktop-feedback#494). Stop the stack first when that matters.
 # scripts/verify-stop-grace-periods.mjs requires a value on every service.
+#
+# EVERY PORT IS PUBLISHED ON 127.0.0.1 EXCEPT THE GATEWAY'S PROXY. "5432:5432" means
+# every interface, so this machine's LAN could reach Postgres, Redis, Kafka and
+# ClickHouse with the passwords in this file, and every service directly -- past the
+# gateway, where a client can name any tenant slug and, behind TRUST_PROXY, its own
+# address. The host ports stay for the tools and verifiers that run on this machine;
+# kong:8000 is the one way in from anywhere else. verify-compose-gateway.mjs reads
+# every running container's bindings and fails on any other.
 services:
   postgres:
     image: postgres:16
@@ -61,7 +69,7 @@ services:
       # script below, each owned by its own non-superuser role.
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       # Runs ONLY on an empty data directory. To re-run it after changing the
@@ -96,7 +104,7 @@ services:
     stop_grace_period: 10s
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -164,7 +172,7 @@ services:
       memlock: { soft: -1, hard: -1 }
       nofile: { soft: 65536, hard: 65536 }
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     volumes:
       - opensearch-data:/usr/share/opensearch/data
     healthcheck:
@@ -196,7 +204,7 @@ services:
       - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"
     depends_on:
       opensearch:
         condition: service_healthy
@@ -233,7 +241,7 @@ services:
       CLICKHOUSE_PASSWORD: eventhub
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     volumes:
@@ -260,7 +268,7 @@ services:
     stop_grace_period: 60s
     ports:
       # Only the host listener is published. Containers use kafka:29092 instead.
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -327,7 +335,7 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       # The INTERNAL listener: this container talks to Kafka over the Docker network.
@@ -357,8 +365,8 @@ services:
     # A local inbox with nothing that depends on it surviving a restart.
     stop_grace_period: 10s
     ports:
-      - "1025:1025"
-      - "8025:8025"
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
     healthcheck:
       test: ["CMD", "/mailpit", "readyz"]
       interval: 10s
@@ -507,7 +515,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       <<: *app-env
       PORT: 3001
@@ -542,7 +550,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3002:3002"
+      - "127.0.0.1:3002:3002"
     environment:
       <<: *app-env
       PORT: 3002
@@ -571,7 +579,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3003:3003"
+      - "127.0.0.1:3003:3003"
     environment:
       <<: *app-env
       PORT: 3003
@@ -652,7 +660,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "3004:3004"
+      - "127.0.0.1:3004:3004"
     environment:
       <<: *app-env
       PORT: 3004
@@ -696,7 +704,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3010:3010"
+      - "127.0.0.1:3010:3010"
     environment:
       <<: *app-env
       RELAY_DATABASE_URL: postgresql://eventhub_event_relay:eventhub_event_relay@postgres:5432/eventhub_event
@@ -731,7 +739,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3011:3011"
+      - "127.0.0.1:3011:3011"
     environment:
       <<: *app-env
       RELAY_DATABASE_URL: postgresql://eventhub_ticketing_relay:eventhub_ticketing_relay@postgres:5432/eventhub_ticketing
@@ -766,7 +774,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3012:3012"
+      - "127.0.0.1:3012:3012"
     environment:
       <<: *app-env
       RELAY_DATABASE_URL: postgresql://eventhub_auth_relay:eventhub_auth_relay@postgres:5432/eventhub_auth
@@ -800,7 +808,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3013:3013"
+      - "127.0.0.1:3013:3013"
     environment:
       <<: *app-env
       RELAY_DATABASE_URL: postgresql://eventhub_community_relay:eventhub_community_relay@postgres:5432/eventhub_community
@@ -834,7 +842,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "3008:3008"
+      - "127.0.0.1:3008:3008"
     environment:
       <<: *app-env
       PORT: 3008
@@ -872,7 +880,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3005:3005"
+      - "127.0.0.1:3005:3005"
     environment:
       <<: *app-env
       PORT: 3005
@@ -907,7 +915,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3006:3006"
+      - "127.0.0.1:3006:3006"
     environment:
       <<: *app-env
       PORT: 3006
@@ -944,7 +952,7 @@ services:
       setup:
         condition: service_completed_successfully
     ports:
-      - "3016:3016"
+      - "127.0.0.1:3016:3016"
     environment:
       <<: *app-env
       INGEST_PORT: 3016
@@ -981,7 +989,7 @@ services:
       mailpit:
         condition: service_healthy
     ports:
-      - "3007:3007"
+      - "127.0.0.1:3007:3007"
     environment:
       <<: *app-env
       PORT: 3007
