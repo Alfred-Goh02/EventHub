@@ -15,11 +15,14 @@
  *   - Matching slug: accepted. No slug header at all (a caller that did not come
  *     through the gateway): accepted, and the tenant is still the token's.
  *   - Another tenant's slug: 403, on both.
- *   - A token with no slug claim, through the gateway: 403, not waved through.
+ *   - A token with no slug claim, through the gateway: 401, which a refresh cures --
+ *     not waved through, and not a 403 that would blame another tenant.
  *   - Live refuses a genuine signature with the wrong audience or issuer. It did not:
  *     its check passed anything Auth's key had signed in the right shape.
- *   - Live refuses an Origin that merely ends in the allowed suffix's letters, and
- *     refuses to start on a suffix with no leading dot, which is what allowed that.
+ *   - Live refuses to start on an Origin suffix with no leading dot. Its check is
+ *     hostname.endsWith(suffix), so `eventhub.com` admits `evileventhub.com`; the
+ *     look-alike handshake here is only a control, since a dotted suffix already
+ *     refuses it.
  *
  * Every token here is minted with Auth's private key from services/auth/keys, so the
  * signature is genuine and only the claims differ. Needs Postgres, Redis and Kafka up,
@@ -111,6 +114,18 @@ function handshake(bearer, headers = {}) {
 }
 
 async function main() {
+  // Nothing may already answer on these ports: a process from an earlier run, or this
+  // verifier running in another worktree, would pass the health checks below on
+  // behalf of code this run never started, and every assertion would test that.
+  for (const port of [EVENT_PORT, LIVE_PORT]) {
+    const taken = await fetch(`http://127.0.0.1:${port}/health`).then(() => true, () => false);
+    if (taken) {
+      console.error(`FAIL: something already answers on :${port}. Stop it before running this.`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   const event = start('event', eventEnv);
   const liveEnv = serviceEnv(ROOT, 'live', { PORT: String(LIVE_PORT), AUTH_PUBLIC_KEY_B64: PUBLIC_B64, LIVE_DRAIN_DELAY_MS: '0' });
   const live = start('live', liveEnv);
@@ -135,7 +150,10 @@ async function main() {
     const oldDirect = await whoami(unslugged);
     check(oldDirect.status === 200, `CONTROL: a token with no slug claim, called directly, is accepted (${oldDirect.status})`);
     const oldGateway = await whoami(unslugged, { 'X-Tenant-Slug': 'acme' });
-    check(oldGateway.status === 403, `the same token through the gateway is refused, not waved through (${oldGateway.status})`);
+    check(
+      oldGateway.status === 401 && /refresh/.test(oldGateway.error ?? ''),
+      `the same token through the gateway is refused with 401, which a refresh cures, not waved through and not a cross-tenant 403 (${oldGateway.status} ${JSON.stringify(oldGateway.error)})`,
+    );
 
     console.log('');
     console.log("  over a WebSocket, at Live's handshake");
@@ -144,7 +162,7 @@ async function main() {
     const wsOther = await handshake(acme, { 'X-Tenant-Slug': 'globex' });
     check(wsOther === 403, `on globex's subdomain the handshake is refused with 403 (${wsOther})`);
     const wsOld = await handshake(unslugged, { 'X-Tenant-Slug': 'acme' });
-    check(wsOld === 403, `a token with no slug claim, through the gateway, is refused (${wsOld})`);
+    check(wsOld === 401, `a token with no slug claim, through the gateway, is refused with 401 (${wsOld})`);
     // A genuine signature on a token for someone else: what Auth's sealed email
     // requests are, given a role. The audience is what tells them apart.
     const wrongAud = await handshake(token({ aud: 'eventhub-notification' }));
@@ -154,9 +172,12 @@ async function main() {
     const suffix = liveEnv.ALLOWED_ORIGIN_SUFFIX;
     const goodOrigin = await handshake(acme, { Origin: `https://acme${suffix}` });
     check(goodOrigin === 101, `CONTROL: Origin https://acme${suffix} is allowed (${goodOrigin})`);
+    // A control, not the test of the fix: with this suffix's leading dot, the
+    // comparison already refuses a look-alike. The bug was a suffix WITHOUT one, which
+    // only the startup refusal below can show, since Live no longer runs with one.
     const lookalike = `https://evil${suffix.slice(1)}`;
     const badOrigin = await handshake(acme, { Origin: lookalike });
-    check(badOrigin === 403, `Origin ${lookalike}, which ends in the same letters, is refused (${badOrigin})`);
+    check(badOrigin === 403, `CONTROL: with a dotted suffix, Origin ${lookalike} is refused (${badOrigin})`);
   } finally {
     event.child.kill();
     live.child.kill();

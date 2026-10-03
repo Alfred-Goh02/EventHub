@@ -127,8 +127,13 @@ export function attachUpgrade(server: HttpServer): void {
       (claims) => {
         // One tenant's token on another tenant's subdomain, refused exactly as the
         // HTTP middleware refuses it (@eventhub/auth-middleware), and only when the
-        // gateway has named a subdomain.
+        // gateway has named a subdomain: 401 for a token minted before the claim,
+        // which a refresh cures, and 403 for a real mismatch.
         const subdomain = req.headers['x-tenant-slug'];
+        if (subdomain !== undefined && claims.tenantSlug === null) {
+          reject(socket, 401, 'Unauthorized');
+          return;
+        }
         if (subdomain !== undefined && claims.tenantSlug !== subdomain) {
           reject(socket, 403, 'Forbidden');
           return;

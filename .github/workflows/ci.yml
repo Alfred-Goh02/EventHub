@@ -738,8 +738,9 @@ jobs:
       # answers 403 instead of quietly acting on the token's tenant. Asserted on the
       # shared middleware (Event's /whoami) and on Live's handshake, which verifies on
       # its own -- and which, before this, took a genuine signature for ANY audience or
-      # issuer, and an Origin that merely ended in the allowed suffix's letters.
-      # Starts its own Event and Live, from their .env.example.
+      # issuer, and would start on an Origin suffix with no leading dot (`localhost`
+      # admitted `evillocalhost`). Starts its own Event and Live, from their
+      # .env.example.
       - name: Assert a token is honoured only on its own tenant's subdomain
         run: node scripts/verify-token-tenant.mjs
 
