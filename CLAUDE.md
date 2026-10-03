@@ -196,6 +196,11 @@ one. Chapters 6 and 7 found five setups that could not:
 - A part-count metric that reported a table's total passed for one that found the
   worst partition, because every fixture row sat in one month and the two numbers
   were equal. A row in a second partition made the break visible: 52 against 51.
+- Live's Origin check is `hostname.endsWith(suffix)`, and the fix was to require a
+  leading dot on the suffix. A handshake from `evileventhub.local` was refused with
+  the fix deleted too, because the example's suffix already had its dot. Only Live
+  refusing to start on an undotted suffix shows the fix; the handshake is labelled a
+  control.
 
 Ask what the run would look like if the guard were missing. If the answer is
 "the same", the fixture is wrong, not the guard.
@@ -470,6 +475,11 @@ format. It found 0 failures, and also 0 passes: zero failures out of zero lines 
 a green run. Anchor on the timestamp (`\dZ\s+ok {4}\S`), and print the ok count as the
 control every time — 972 on #109, 1043 on #112.
 
+A count per step needs the step, and `gh run view --log` sometimes labels every line
+`UNKNOWN STEP`: a grep for the step's name then finds 0 ok in a step that ran 12. Slice
+the log at each `##[group]Run` line instead, and treat a step that matched nothing as
+not found, never as passed.
+
 ## Retrying a partial batch API never succeeds
 
 kafkajs's `admin.deleteGroups(list)` deletes what it can and throws for the rest.
@@ -584,6 +594,47 @@ A consumer on a new group, on a topic nothing has been written to, has no positi
 any partition, and its lag is unknown rather than zero — so "caught up" never becomes
 true and a control waiting for it fails on a healthy consumer. Prove a consumer is
 reading with a canary it must process, then wait for the lag.
+
+## A proxy in front makes every caller one address
+
+Auth's login budget is keyed on (tenant, email, address) so that spending it locks out
+only the address that spent it. Put Kong in front without telling Auth, and `req.ip` is
+Kong's for everyone. Measured through the gateway: an account's budget spent from the
+host locked out the same account from another container, 429. With `TRUST_PROXY=1`
+the other container got its 401.
+
+Anything keyed on the caller's address has to be looked at again whenever something is
+put in front of the service. And trusting a hop is only safe while nothing can reach
+the service around the proxy: on its own port, a client names its own address.
+
+## Published on loopback is not unreachable
+
+Kong's Admin API listened on 0.0.0.0 inside its container and was published only to
+the host's 127.0.0.1. The host could not reach it from outside; every container on the
+compose network could. Measured: Auth's container got 200 from `kong:8001`, and from
+Kong Manager on 8002 and 8445. The Admin API has no authentication, and `POST /config`
+replaces the whole configuration, the tenant-header snippet included.
+
+It listens on the container's own loopback now, and is read by joining Kong's network
+namespace (`docker run --network container:eventhub-kong`). Ask what a neighbour can
+reach, not only what the host can.
+
+## A gateway caches names, and recreated containers trade addresses
+
+Recreating Event and Live gave each the other's old IP. Kong honoured the long TTL of
+Docker's DNS and kept proxying `/events` to Event's old address, now Live's: 502 for
+over 100 s, until Kong itself was restarted. With `KONG_DNS_VALID_TTL=5` it recovered
+about 2 s after the first request. A verifier run straight after a mass recreate still
+lands in that window, and its first proxied checks fail.
+
+## Two names for this machine can reach two processes
+
+On the development machine a game's helper, Dota2ArxApplet.exe, listens on
+127.0.0.1:3002, Event's port. With Event published on 0.0.0.0 and ::, a request to
+127.0.0.1:3002 reached the applet and got no HTTP answer, and `localhost:3002` reached
+Event over ::1. Bound to 127.0.0.1, Event cannot publish 3002 there at all while the
+applet runs. `netstat -ano` with `tasklist` names the owner. Same family as checking
+what owns a port before trusting its answer.
 
 ## Make the race happen; do not wait for it
 
