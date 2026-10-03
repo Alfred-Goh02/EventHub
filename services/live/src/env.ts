@@ -30,8 +30,14 @@ const liveEnvSchema = z.object({
    * enforces nothing, so checking it is ours to do — cheap, and the only thing
    * standing between a cookie-less socket and a page on another origin opening
    * one. Suffix rather than exact match so subdomains work without a list.
+   *
+   * It must START WITH A DOT. The check is `hostname.endsWith(suffix)`, so a suffix
+   * of `eventhub.com` admits `evileventhub.com`, a name anyone can register. A dot
+   * makes it a label boundary: `.eventhub.com` admits `acme.eventhub.com` only.
    */
-  ALLOWED_ORIGIN_SUFFIX: z.string().min(1),
+  ALLOWED_ORIGIN_SUFFIX: z
+    .string()
+    .regex(/^\.[a-z0-9-]+(\.[a-z0-9-]+)*$/, 'must start with a dot, like .eventhub.com, or evileventhub.com would match'),
 });
 
 const base = loadBaseEnv();

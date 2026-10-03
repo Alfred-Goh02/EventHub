@@ -280,11 +280,12 @@ async function main() {
       const r = await funnel(SHARED, '', { auth });
       check(r.status === want, `${label}: ${r.status} (want ${want})`);
     }
-    // X-Tenant-Slug too: the gateway sends it on every request, and only Auth reads it.
-    const spoofed = await funnel(SHARED, '', { headers: { 'X-Tenant-ID': TB, 'X-Tenant-Slug': TB } });
+    // X-Tenant-Slug is not ignored: one that disagrees with the token is a 403, the
+    // shared middleware's rule, asserted in verify-token-tenant.mjs.
+    const spoofed = await funnel(SHARED, '', { headers: { 'X-Tenant-ID': TB } });
     check(
       spoofed.status === 200 && JSON.stringify(spoofed.body.totals) === JSON.stringify(control.body.totals),
-      `X-Tenant-ID and X-Tenant-Slug naming tenant B change nothing: ${spoofed.body?.totals?.ticketsSold} tickets, as without them`,
+      `X-Tenant-ID naming tenant B changes nothing: ${spoofed.body?.totals?.ticketsSold} tickets, as without it`,
     );
     const asked = await funnel(SHARED, `?tenantId=${TB}`);
     check(asked.status === 400, `?tenantId=... is refused, not ignored (${asked.status})`);
