@@ -35,6 +35,8 @@ const MAILPIT = process.env['MAILPIT_URL'] ?? 'http://127.0.0.1:8025';
 const POSTGRES = process.env['POSTGRES_CONTAINER'] ?? 'eventhub-postgres';
 /** The seeded tenant: this adds a user to it and takes it away again. */
 const TENANT = 'tenant_acme';
+/** Its subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const SUBJECT = 'Reset your EventHub password';
 
 const RUN = randomBytes(4).toString('hex');
@@ -122,14 +124,14 @@ async function main() {
 
     console.log('');
     console.log('  the account works before the reset');
-    const before = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-ID': TENANT });
+    const before = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(before.status === 200 && Boolean(before.body.refreshToken), `CONTROL: it signs in with the old password (${before.status})`);
     const oldRefresh = before.body.refreshToken;
 
     console.log('');
     console.log('  a reset asked for in the stack arrives in the stack');
     const startedAt = Date.now();
-    const asked = await post(AUTH, '/forgot-password', { email: EMAIL }, { 'X-Tenant-ID': TENANT });
+    const asked = await post(AUTH, '/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(asked.status === 202, `/forgot-password answered 202 (${asked.status})`);
     const delivered = await waitFor(async () => {
       const found = await inbox(EMAIL);
@@ -151,9 +153,9 @@ async function main() {
     const token = new URL(link).searchParams.get('token') ?? '';
     const reset = await post(AUTH, '/reset-password', { token, password: NEW_PASSWORD });
     check(reset.status === 200, `the link read out of the inbox resets the password (${reset.status})`);
-    const withNew = await post(AUTH, '/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-ID': TENANT });
+    const withNew = await post(AUTH, '/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(withNew.status === 200, `the new password signs in (${withNew.status})`);
-    const withOld = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-ID': TENANT });
+    const withOld = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(withOld.status === 401, `and the old one no longer does (${withOld.status})`);
     const refreshed = await post(AUTH, '/refresh', { refreshToken: oldRefresh });
     check(refreshed.status === 401, `the session issued before the reset is revoked (${refreshed.status})`);

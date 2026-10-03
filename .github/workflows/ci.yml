@@ -147,6 +147,13 @@ jobs:
       - name: Assert no migration writes to a table row security hides from it
         run: node scripts/verify-migration-force-rls.mjs
 
+      # Kong reads infra/kong/kong.yml at boot and refuses to start on one it cannot
+      # parse, so a bad edit would surface as an unhealthy container in the compose
+      # job, named nowhere. This names it. KONG_DATABASE=off is required: without it
+      # the parser looks for Postgres before it looks at the file.
+      - name: Assert the gateway's declarative config parses
+        run: docker run --rm -e KONG_DATABASE=off -v "$PWD/infra/kong:/cfg:ro" kong:3.9 kong config parse /cfg/kong.yml
+
       # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
       # ClickHouse measured the 72G root filesystem at 91% used by the time the
       # Search verifiers ran, and OpenSearch refuses to create any index past its
@@ -463,7 +470,7 @@ jobs:
           echo "--- login as the seeded admin ---"
           TOKEN=$(curl -sf -X POST http://localhost:3001/login \
             -H 'Content-Type: application/json' \
-            -H 'X-Tenant-ID: tenant_acme' \
+            -H 'X-Tenant-Slug: acme' \
             -d '{"email":"alice@acme.com","password":"hunter2222"}' \
             | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).accessToken))")
           test -n "$TOKEN" || { echo "no access token returned"; kill $SERVER_PID; exit 1; }
@@ -481,7 +488,7 @@ jobs:
           # that looks identical to a wrong password.
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/login \
             -H 'Content-Type: application/json' \
-            -H 'X-Tenant-ID: tenant_acme' \
+            -H 'X-Tenant-Slug: acme' \
             -d '{"email":"ALICE@ACME.COM","password":"hunter2222"}')
           test "$CODE" = "200" || { echo "expected 200 for an upper-case address, got $CODE"; kill $SERVER_PID; exit 1; }
           echo "upper-case address accepted ($CODE)"
@@ -615,6 +622,24 @@ jobs:
             sleep 1
           done
           node scripts/verify-logout.mjs
+          pkill -f "node dist/index.js" || true
+
+      # /login and /forgot-password used to believe a client-sent X-Tenant-ID. The
+      # gateway now clears it and passes the Host's subdomain as X-Tenant-Slug, and
+      # Auth resolves that to a tenant. This asserts Auth's half: a slug signs in to
+      # its own tenant (the seed holds one account in two, so only the slug can tell
+      # them apart), X-Tenant-ID is read nowhere, an unknown slug is a wrong
+      # password, and a tenant created just after its slug missed signs in at once,
+      # which a cache that kept misses would break.
+      - name: Assert a sign-in's tenant is the gateway's slug and nothing else
+        working-directory: .
+        run: |
+          (cd services/auth && node dist/index.js &)
+          for i in $(seq 1 25); do
+            if curl -sf http://localhost:3001/health >/dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/verify-tenant-slug.mjs
           pkill -f "node dist/index.js" || true
 
       # Seventeen variables the code read that no .env.example mentioned -- the
@@ -1158,7 +1183,7 @@ jobs:
           echo ""
 
           TOKEN=$(curl -sf -X POST http://localhost:3001/login \
-            -H 'Content-Type: application/json' -H 'X-Tenant-ID: tenant_acme' \
+            -H 'Content-Type: application/json' -H 'X-Tenant-Slug: acme' \
             -d '{"email":"alice@acme.com","password":"hunter2222"}' \
             | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).accessToken))")
           test -n "$TOKEN" || { echo "auth did not issue a token"; exit 1; }
@@ -2199,23 +2224,27 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Through the gateway, as a reader would: the tenant is the subdomain.
+          # curl resolves any *.localhost name to loopback by itself.
+          GATEWAY=http://acme.eventhub.localhost:8000
+
           # Auth signs with the private key the setup container generated into a
           # volume. If that volume wiring were wrong, auth would not have started.
-          TOKEN=$(curl -sf -X POST http://localhost:3001/login \
-            -H 'Content-Type: application/json' -H 'X-Tenant-ID: tenant_acme' \
+          # And it knows the tenant only from the slug Kong took from the Host.
+          TOKEN=$(curl -sf -X POST "$GATEWAY/auth/login" \
+            -H 'Content-Type: application/json' \
             -d '{"email":"alice@acme.com","password":"hunter2222"}' \
             | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
-          test -n "$TOKEN" || { echo "no token: the seed or the signing key did not survive setup"; exit 1; }
-          echo "  signed in as the seeded admin"
+          test -n "$TOKEN" || { echo "no token: the seed, the signing key or the gateway's tenant did not survive setup"; exit 1; }
+          echo "  signed in as the seeded admin, through the gateway"
 
           # THE CROSS-SERVICE ASSERTION. Event holds no private key; it verifies
           # this token with the PUBLIC half, read from the jwt-public volume via
           # AUTH_PUBLIC_KEY_FILE. A 201 here is the only proof that path works,
           # and it is a path the native CI job never takes -- it passes the key as
           # a base64 environment value instead.
-          CREATED=$(curl -sf -X POST http://localhost:3002/events \
+          CREATED=$(curl -sf -X POST "$GATEWAY/events" \
             -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -H 'X-Tenant-ID: tenant_acme' \
             -d '{"title":"Compose CI","capacity":42,"startsAt":"2027-11-01T10:00:00Z","endsAt":"2027-11-01T18:00:00Z"}')
           echo "  Event accepted a token it can verify but cannot mint"
 
@@ -2267,6 +2296,14 @@ jobs:
       # serves unfanned posts too and would look the same with Kafka broken.
       - name: Prove Community works across the whole stack
         run: node scripts/verify-compose-community.mjs
+
+      # The gateway, as the stack runs it. Every route reaches the service its table
+      # says, a client-sent tenant header never arrives upstream, the tenant is the
+      # Host's subdomain or the request is refused, and the admin API is not on the
+      # network. The upstream half runs a scratch Kong with this config pointed at an
+      # echo server, because no service reports the headers it was given.
+      - name: Prove the gateway routes, and no client can name its tenant
+        run: node scripts/verify-compose-gateway.mjs
 
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already

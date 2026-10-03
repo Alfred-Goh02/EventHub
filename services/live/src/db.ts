@@ -58,7 +58,7 @@ export async function assertRuntimeRoleCannotBypassRls(): Promise<void> {
  * which would be an injection hole.
  *
  * THE TENANT ID PASSED HERE ALWAYS COMES FROM THE VERIFIED JWT CLAIM. On a
- * WebSocket there is no Kong-injected X-Tenant-ID to fall back to and no header
+ * WebSocket the gateway's X-Tenant-Slug is never read and there is no header
  * to read per message — the socket carries the tenant it authenticated as, for
  * its whole life.
  */

@@ -34,6 +34,8 @@ const POD_B = 3114;
 
 const TENANT = 'tenant_acme';
 const OTHER_TENANT = 'tenant_globex';
+/** Their subdomains: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const SLUG = { [TENANT]: 'acme', [OTHER_TENANT]: 'globex' };
 const USER = { email: 'alice@acme.com', password: 'hunter2222' };
 
 /** Fresh per run, so nothing a previous run left behind can be mistaken for this one. */
@@ -57,7 +59,7 @@ function fatal(msg) {
 async function login(tenantId) {
   const res = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': tenantId },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': SLUG[tenantId] },
     body: JSON.stringify(USER),
   });
   const body = await res.json().catch(() => null);

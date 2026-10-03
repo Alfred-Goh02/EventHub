@@ -46,6 +46,8 @@ const AUTH_OWNER_URL =
 const AUTH = process.env['AUTH_URL'] ?? 'http://localhost:3001';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const run = `lt_${Date.now()}`;
 
 /** Enough samples that one scheduling hiccup cannot move the median. */
@@ -94,7 +96,7 @@ async function timeLogin(email, password) {
   const started = process.hrtime.bigint();
   const res = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email, password }),
   });
   await res.text();

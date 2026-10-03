@@ -13,8 +13,8 @@ const logger = createLogger('live-ws');
  * A `ws` socket plus the things this service needs to remember about it.
  *
  * The tenant lives HERE, for the socket's whole life, taken once from the signed
- * claim at the handshake. There is no per-message header to read and no
- * Kong-injected X-Tenant-ID to trust on this route.
+ * claim at the handshake. There is no per-message header to read, and the
+ * gateway's X-Tenant-Slug is not read on this route.
  */
 export interface LiveSocket extends WsSocket {
   userId: string;

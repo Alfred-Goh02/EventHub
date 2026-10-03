@@ -25,6 +25,8 @@ const AUTH_APP_URL =
 
 const TENANT = 'tenant_acme';
 const OTHER_TENANT = 'tenant_globex';
+/** Their subdomains: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const SLUG = { [TENANT]: 'acme', [OTHER_TENANT]: 'globex' };
 const ADMIN = { email: 'alice@acme.com', password: 'hunter2222' };
 
 let failures = 0;
@@ -47,7 +49,7 @@ const post = (path, body, headers = {}) =>
   }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) }));
 
 const login = (email, password, tenantId = TENANT) =>
-  post('/login', { email, password }, { 'X-Tenant-ID': tenantId });
+  post('/login', { email, password }, { 'X-Tenant-Slug': SLUG[tenantId] });
 
 /**
  * Reads the freshly-issued reset token straight from the database.
@@ -86,20 +88,29 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log('\n1. /forgot-password is not an existence oracle');
   // -------------------------------------------------------------------------
-  const known = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-ID': TENANT });
-  const unknownEmail = await post('/forgot-password', { email: 'nobody@nowhere.test' }, { 'X-Tenant-ID': TENANT });
-  const unknownTenant = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-ID': 'tenant_does_not_exist' });
+  const known = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-Slug': SLUG[TENANT] });
+  const unknownEmail = await post('/forgot-password', { email: 'nobody@nowhere.test' }, { 'X-Tenant-Slug': SLUG[TENANT] });
+  const unknownTenant = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-Slug': 'no-such-tenant' });
+  // Not a subdomain at all. The gateway would never pass one on; a caller that reaches
+  // Auth directly can, and it is answered like any other unknown tenant.
+  const malformed = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-Slug': 'Not_A.Slug' });
 
   check(known.status === 202, `known address -> 202, got ${known.status}`);
   check(unknownEmail.status === 202, `unknown address -> 202, got ${unknownEmail.status}`);
   check(unknownTenant.status === 202, `unknown tenant -> 202, got ${unknownTenant.status}`);
+  check(malformed.status === 202, `a slug that is not a subdomain -> 202, got ${malformed.status}`);
 
-  const bodies = [known, unknownEmail, unknownTenant].map((r) => JSON.stringify(r.body));
-  check(new Set(bodies).size === 1, `all three bodies identical, got ${[...new Set(bodies)].join(' vs ')}`);
+  const bodies = [known, unknownEmail, unknownTenant, malformed].map((r) => JSON.stringify(r.body));
+  check(new Set(bodies).size === 1, `all four bodies identical, got ${[...new Set(bodies)].join(' vs ')}`);
   check(!bodies[0].includes('token'), `no token-shaped field in the response, got ${bodies[0]}`);
 
   const missingHeader = await post('/forgot-password', { email: ADMIN.email });
-  check(missingHeader.status === 400, `missing X-Tenant-ID -> 400, got ${missingHeader.status}`);
+  check(missingHeader.status === 400, `missing X-Tenant-Slug -> 400, got ${missingHeader.status}`);
+
+  // The header this replaced. Through the gateway it never arrives, and Auth must not
+  // fall back to it when it does.
+  const oldHeader = await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-ID': TENANT });
+  check(oldHeader.status === 400, `X-Tenant-ID alone is no tenant -> 400, got ${oldHeader.status}`);
 
   // -------------------------------------------------------------------------
   console.log('\n2. a reset actually changes the password');
@@ -188,7 +199,7 @@ async function main() {
   console.log('\n6. issuing a new reset supersedes the previous one');
   // -------------------------------------------------------------------------
   const superseded = await plantToken(userId, TENANT);
-  await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-ID': TENANT });
+  await post('/forgot-password', { email: ADMIN.email }, { 'X-Tenant-Slug': SLUG[TENANT] });
   const stale = await post('/reset-password', { token: superseded, password: 'should-not-work-1' });
   check(stale.status === 400, `a token superseded by a new request is dead, got ${stale.status}`);
 

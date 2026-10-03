@@ -17,6 +17,7 @@ import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
 import { queueContactCard } from './contact-card.js';
 import { emit } from './outbox.js';
 import { createRateLimiter } from './rate-limit.js';
+import { resolveTenantSlug } from './tenant-slug.js';
 
 const logger = createLogger('auth-service');
 
@@ -189,7 +190,7 @@ const registerSchema = z.object({
   password: z.string().min(8),
 });
 
-// No X-Tenant-ID. The tenant comes from the invite, which was created by
+// No tenant header. The tenant comes from the invite, which was created by
 // someone already inside that tenant — so the registering user never gets to
 // state which tenant they are joining, and there is nothing to lie about.
 // The email is pinned by the invite too, for the same reason.
@@ -385,9 +386,11 @@ const loginAttemptsPerIp = createRateLimiter({
 });
 
 app.post('/login', ah(async (req, res) => {
-  const tenantId = req.header('X-Tenant-ID');
-  if (!tenantId) {
-    return res.status(400).json({ error: 'X-Tenant-ID header is required' });
+  // The tenant is the subdomain the request came in on, named by the gateway. See
+  // tenant-slug.ts.
+  const slug = req.header('X-Tenant-Slug');
+  if (!slug) {
+    return res.status(400).json({ error: 'X-Tenant-Slug header is required' });
   }
 
   const parsed = loginSchema.safeParse(req.body);
@@ -399,11 +402,20 @@ app.post('/login', ah(async (req, res) => {
 
   const ip = req.ip ?? 'unknown';
   if (!loginAttemptsPerIp.hit(ip)) {
-    logger.warn({ tenantId, ip }, 'login refused: too many attempts from one address');
+    logger.warn({ slug, ip }, 'login refused: too many attempts from one address');
     // The same body as the per-account refusal below, so a caller cannot tell
     // which of the two limits it hit.
     res.set('Retry-After', String(Math.ceil(loginAttemptsPerIp.blockedFor(ip) / 1000)));
     return res.status(429).json({ error: 'too many login attempts, try again later' });
+  }
+
+  // Resolved after the per-address limit, so that limit also bounds the lookups one
+  // client can make. A subdomain with no tenant behind it is answered as a wrong
+  // password, at the same cost: the existing behaviour for an unknown tenant id.
+  const tenantId = await resolveTenantSlug(slug);
+  if (!tenantId) {
+    await verify(DUMMY_PASSWORD_HASH, password).catch(() => false);
+    return res.status(401).json({ error: 'invalid credentials' });
   }
 
   const accountKey = `${tenantId}:${email}`;
@@ -576,12 +588,13 @@ const forgotSchema = z.object({ email: emailField });
  * user exists — one status, one body, every time. The moment those differ, the
  * endpoint becomes an account-existence oracle for an unauthenticated caller.
  *
- * X-Tenant-ID is required, and keeping it is a deliberate departure from the
- * reasoning that removed the header from /register. There, the header let a
- * caller conjure membership of a tenant they had no claim to — pure privilege
- * escalation. Here it only selects WHICH tenant's user record to look up, and
- * the resulting link still goes to the address on that row, i.e. to the mailbox
- * the real user controls. Naming somebody else's tenant gets you nothing.
+ * A tenant is required -- the subdomain, named by the gateway in X-Tenant-Slug --
+ * and requiring one is a deliberate departure from the reasoning that removed the
+ * tenant header from /register. There, the header let a caller conjure membership
+ * of a tenant they had no claim to — pure privilege escalation. Here it only
+ * selects WHICH tenant's user record to look up, and the resulting link still goes
+ * to the address on that row, i.e. to the mailbox the real user controls. Naming
+ * somebody else's tenant gets you nothing.
  *
  * It is also load-bearing rather than cosmetic: User is unique on
  * (tenantId, email), and the seed deliberately puts alice@acme.com in two
@@ -590,9 +603,9 @@ const forgotSchema = z.object({ email: emailField });
  * means more unauthenticated mail for the same ambiguity.
  */
 app.post('/forgot-password', ah(async (req, res) => {
-  const tenantId = req.header('X-Tenant-ID');
-  if (!tenantId) {
-    return res.status(400).json({ error: 'X-Tenant-ID header is required' });
+  const slug = req.header('X-Tenant-Slug');
+  if (!slug) {
+    return res.status(400).json({ error: 'X-Tenant-Slug header is required' });
   }
 
   const parsed = forgotSchema.safeParse(req.body);
@@ -609,7 +622,17 @@ app.post('/forgot-password', ah(async (req, res) => {
   // is an oracle of a different kind: "this address is rate-limited" means
   // somebody has been asking about it, which means it is worth asking about.
   const ip = req.ip ?? 'unknown';
-  if (!resetPerIp.hit(ip) || !resetPerAccount.hit(`${tenantId}:${email}`)) {
+  if (!resetPerIp.hit(ip)) {
+    logger.warn({ slug, ip }, 'password reset rate limited');
+    return res.status(202).json(accepted);
+  }
+
+  // No tenant behind the subdomain: nothing to send, and the same 202.
+  const tenantId = await resolveTenantSlug(slug);
+  if (!tenantId) {
+    return res.status(202).json(accepted);
+  }
+  if (!resetPerAccount.hit(`${tenantId}:${email}`)) {
     logger.warn({ tenantId, ip }, 'password reset rate limited');
     return res.status(202).json(accepted);
   }
@@ -677,7 +700,7 @@ const resetSchema = z.object({
 /**
  * POST /reset-password
  *
- * No X-Tenant-ID, on purpose. The tenant comes from the token row, exactly as
+ * No tenant header, on purpose. The tenant comes from the token row, exactly as
  * /register takes it from the invite — the caller states nothing that could be
  * a lie.
  *
