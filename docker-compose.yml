@@ -1060,11 +1060,17 @@ services:
       # Inside the container, so the port mapping below can reach it; published to
       # 127.0.0.1 only.
       KONG_STATUS_LISTEN: 0.0.0.0:8100
-      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      # Off: nginx writes the request line whole, query string included, and an
+      # unsubscribe link carries its token there. The file-log plugin in kong.yml
+      # writes one JSON line per request with the credentials taken out.
+      KONG_PROXY_ACCESS_LOG: "off"
       KONG_PROXY_ERROR_LOG: /dev/stderr
       KONG_ADMIN_ACCESS_LOG: /dev/stdout
       KONG_ADMIN_ERROR_LOG: /dev/stderr
-      KONG_LOG_LEVEL: info
+      # notice, Kong's default. At info, nginx's error log wrote routine lines with the
+      # request line as context -- the unsubscribe token included. An error still
+      # carries the request line; nginx always adds it.
+      KONG_LOG_LEVEL: notice
       # The default, written down: the tenant snippet runs in Kong's Lua sandbox.
       KONG_UNTRUSTED_LUA: sandbox
       # Re-resolve service names every 5 s, whatever TTL Docker's DNS gives them.

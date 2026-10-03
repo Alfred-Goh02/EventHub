@@ -2316,6 +2316,16 @@ jobs:
       - name: Prove the gateway routes, and no client can name its tenant
         run: node scripts/verify-compose-gateway.mjs
 
+      # What the gateway does to every request besides routing it: a request id the
+      # service also receives, CORS for the tenants' own origins only, a 1 MB body
+      # ceiling, and an access log with no Authorization, cookie or query string in
+      # it. The rate limit is asserted by its effect: the running node's count rises
+      # in Redis, and two scratch nodes on one Redis database share a single count of
+      # four, which the same node on another database does not. Waits for a fresh
+      # minute, so it takes up to one.
+      - name: Prove the gateway's request ids, CORS, limits and logs
+        run: node scripts/verify-compose-gateway-edge.mjs
+
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
       # issued, and the symptom is a 401 with no explanation.

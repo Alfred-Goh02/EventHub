@@ -145,6 +145,83 @@ services:
         strip_path: false
 
 plugins:
+  # A REQUEST ID on every request, passed to the service and echoed to the client, so
+  # a reported failure can be found in this log. A client that sends one keeps it: it
+  # is for correlation, not for trust.
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid
+      echo_downstream: true
+
+  # CORS, for a web app served from a tenant's own subdomain on another port while it
+  # is developed, or a tenant's subdomain calling the API. Kong anchors each pattern
+  # at both ends, so acme.eventhub.com.attacker.net does not match. A pattern with a
+  # colon is matched against scheme://host:port, so production is https only.
+  # Credentials are allowed: the origins are ours. A preflight is answered here and
+  # never reaches a service.
+  - name: cors
+    config:
+      origins:
+        - 'https://[a-z0-9][a-z0-9-]*\.eventhub\.com'
+        - 'http://[a-z0-9][a-z0-9-]*\.eventhub\.localhost(:[0-9]+)?'
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type, Idempotency-Key, X-Request-ID]
+      exposed_headers: [X-Request-ID, Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset]
+      credentials: true
+      max_age: 600
+
+  # A ceiling on what nginx will buffer for a service: no request body here is near a
+  # megabyte, and each service's own JSON parser refuses far smaller ones.
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 1
+      size_unit: megabytes
+
+  # A COARSE LIMIT PER CLIENT ADDRESS, counted in Redis so that every Kong node shares
+  # one count (decided 2026-09-28). Nodes loading this file give its entities the same
+  # ids, so their counters have the same keys. Coarse on purpose: the services keep
+  # the limits that know what a login or a post is.
+  #
+  # Fault tolerant: if Redis cannot be reached, requests pass and only this limit is
+  # lost, rather than the whole API answering 500.
+  #
+  # "The client address" is what reaches Kong. Behind a load balancer that is the
+  # balancer, for everyone, until KONG_TRUSTED_IPS and KONG_REAL_IP_HEADER name it --
+  # the lesson Auth's TRUST_PROXY already taught.
+  - name: rate-limiting
+    config: &rate-limit
+      minute: 600
+      limit_by: ip
+      policy: redis
+      redis:
+        host: redis
+        port: 6379
+        database: 1
+        timeout: 2000
+      fault_tolerant: true
+  # Tighter on everything Auth answers: sign-in, registration, refresh, reset.
+  - name: rate-limiting
+    route: auth
+    config:
+      <<: *rate-limit
+      minute: 120
+
+  # One JSON line per request, with the credentials taken out. The nginx access log is
+  # off (docker-compose.yml): it writes the request line whole, and an unsubscribe link
+  # carries its token in the query string. Fields set to nil are removed.
+  - name: file-log
+    config:
+      path: /dev/stdout
+      custom_fields_by_lua:
+        request.headers.authorization: "return nil"
+        request.headers.cookie: "return nil"
+        request.querystring: "return nil"
+        request.uri: "return kong.request.get_path()"
+        upstream_uri: "return nil"
+        request.url: "return kong.request.get_scheme() .. '://' .. kong.request.get_host() .. ':' .. kong.request.get_port() .. kong.request.get_path()"
+        response.headers.set-cookie: "return nil"
+
   # THE TENANT HEADERS. Security critical: shared-schema tenancy holds only if no
   # client can say which tenant it is. Global, so that a route added later cannot
   # forget it; a route with no tenant opts out of the SUBDOMAIN rule — never out of the

@@ -44,13 +44,11 @@
  *   node scripts/verify-compose-gateway.mjs
  */
 
-import { execFile } from 'node:child_process';
-import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
+import { KONG_CONTAINER, admin, docker, echoConfig, listAll, loadConfig, send, sleep, startEcho, startScratchKong, waitFor } from './lib/kong.mjs';
 
 const PROXY = process.env['KONG_PROXY_URL'] ?? 'http://127.0.0.1:8000';
 const STATUS = process.env['KONG_STATUS_URL'] ?? 'http://127.0.0.1:8100';
-const KONG_CONTAINER = 'eventhub-kong';
 /** Another container on the compose network, with curl, to ask what Kong exposes there. */
 const NEIGHBOUR = 'eventhub-auth';
 const RUN = randomBytes(4).toString('hex');
@@ -101,76 +99,11 @@ function check(ok, msg) {
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn, timeoutMs = 30_000, stepMs = 250) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await fn().catch(() => null);
-    if (value) return value;
-    await sleep(stepMs);
-  }
-  return null;
-}
-const docker = (args) =>
-  new Promise((resolve, reject) =>
-    execFile('docker', args, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => (err ? reject(new Error(`${err.message}\n${stderr}`)) : resolve(stdout.trim()))),
-  );
 const getJson = async (url) => {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} answered ${res.status}`);
   return res.json();
 };
-
-/**
- * A request with an explicit Host header. fetch() will not send one, and a name like
- * acme.eventhub.localhost needs no resolving when the connection goes to loopback.
- */
-async function send(base, path, { host, headers = {}, method = 'GET', body } = {}) {
-  const { request } = await import('node:http');
-  const url = new URL(path, base);
-  return new Promise((resolve, reject) => {
-    const req = request(
-      { hostname: url.hostname, port: url.port, path: `${url.pathname}${url.search}`, method, headers: { ...(host ? { host } : {}), ...headers } },
-      (res) => {
-        let text = '';
-        res.setEncoding('utf8');
-        res.on('data', (d) => (text += d));
-        res.on('end', () => {
-          let json = null;
-          try {
-            json = JSON.parse(text);
-          } catch {}
-          resolve({ status: res.statusCode, headers: res.headers, text, json });
-        });
-      },
-    );
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-/**
- * The Admin API listens on Kong's own loopback and is published nowhere, so it is read
- * from a container that joins Kong's network namespace: the application image, for its
- * curl. Kong's image has none.
- */
-async function admin(appImage, path) {
-  const out = await docker(['run', '--rm', '--network', `container:${KONG_CONTAINER}`, '--entrypoint', 'curl', appImage, '-sf', `http://127.0.0.1:8001${path}`]);
-  return JSON.parse(out);
-}
-
-/** Every page of an Admin API listing. */
-async function listAll(appImage, path) {
-  const out = [];
-  let next = `${path}?size=1000`;
-  while (next) {
-    const page = await admin(appImage, next);
-    out.push(...page.data);
-    next = page.next ? new URL(page.next, 'http://admin').pathname + new URL(page.next, 'http://admin').search : null;
-  }
-  return out;
-}
 
 /** What a neighbour on the compose network gets from one of Kong's ports: an HTTP status, or 000 and curl's exit code. */
 async function fromNeighbour(port) {
@@ -246,7 +179,6 @@ async function main() {
   const services = await listAll(appImage, '/services');
   const routes = await listAll(appImage, '/routes');
   const plugins = await listAll(appImage, '/plugins');
-  const serviceName = new Map(services.map((s) => [s.id, s.name]));
   check(services.length > 0 && routes.length > 0, `CONTROL: read the running config: ${services.length} services, ${routes.length} routes, ${plugins.length} plugin(s)`);
 
   const routeNames = routes.map((r) => r.name).sort();
@@ -332,83 +264,28 @@ async function main() {
 
   console.log('');
   console.log('  every route, against an echo of what the service would receive');
-  const seen = [];
-  const echo = createServer((req, res) => {
-    seen.push({ url: req.url, method: req.method, headers: req.headers });
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ echoed: req.url }));
-  });
-  await new Promise((r) => echo.listen(0, '0.0.0.0', r));
-  const echoPort = echo.address().port;
+  const echo = await startEcho();
+  const { seen } = echo;
 
-  let started = false;
+  let scratchNode = null;
   try {
-    // The running config, with every upstream pointed at the echo server.
-    const scratch = {
-      _format_version: '3.0',
-      services: services.map((s) => ({
-        name: s.name,
-        protocol: 'http',
-        host: 'host.docker.internal',
-        port: echoPort,
-        path: `/__upstream/${s.name}`,
-        retries: s.retries,
-        connect_timeout: s.connect_timeout,
-        read_timeout: s.read_timeout,
-        write_timeout: s.write_timeout,
-      })),
-      routes: routes.map((r) => ({
-        name: r.name,
-        service: serviceName.get(r.service?.id),
-        hosts: r.hosts,
-        paths: r.paths,
-        methods: r.methods,
-        protocols: r.protocols,
-        strip_path: r.strip_path,
-        preserve_host: r.preserve_host,
-        path_handling: r.path_handling,
-        regex_priority: r.regex_priority,
-        tags: r.tags,
-      })),
-      plugins: plugins.map((p) => ({
-        name: p.name,
-        config: p.config,
-        enabled: p.enabled,
-        protocols: p.protocols,
-        ...(p.service ? { service: serviceName.get(p.service.id) } : {}),
-        ...(p.route ? { route: routes.find((r) => r.id === p.route.id)?.name } : {}),
-      })),
-    };
+    // The running config, with every upstream pointed at the echo server. Without its
+    // rate limits: this node is not on the compose network, they are counted in Redis,
+    // and verify-compose-gateway-edge.mjs is where they are asserted.
+    const scratch = echoConfig({ services, routes, plugins }, echo.port, (p) => (p.name === 'rate-limiting' ? null : p));
     const image = await docker(['inspect', '-f', '{{.Config.Image}}', KONG_CONTAINER]);
-    // ONE worker. A config posted to /config reaches each nginx worker on its own
-    // time, so the first request after a 201 can land on a worker still routing the
-    // empty config: measured, the first probe of the first run answered 404 while
-    // every later one passed. With one worker, a warm-up request that reaches the
-    // echo proves the whole router is live.
-    await docker([
-      'run', '-d', '--rm', '--name', SCRATCH,
-      '-e', 'KONG_DATABASE=off', '-e', 'KONG_PROXY_LISTEN=0.0.0.0:8000', '-e', 'KONG_ADMIN_LISTEN=0.0.0.0:8001',
-      '-e', 'KONG_NGINX_WORKER_PROCESSES=1',
-      '-p', '127.0.0.1::8000', '-p', '127.0.0.1::8001',
-      '--add-host', 'host.docker.internal:host-gateway',
-      image,
-    ]);
-    started = true;
-    const portOf = async (p) => (await docker(['port', SCRATCH, `${p}/tcp`])).split('\n')[0].split(':').pop();
-    const scratchProxy = `http://127.0.0.1:${await portOf(8000)}`;
-    const scratchAdmin = `http://127.0.0.1:${await portOf(8001)}`;
-    const up = await waitFor(async () => (await fetch(`${scratchAdmin}/status`)).ok, 60_000, 500);
-    const loaded = up ? await fetch(`${scratchAdmin}/config`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(scratch) }) : null;
+    scratchNode = await startScratchKong({ name: SCRATCH, image });
+    const loaded = scratchNode.up ? await loadConfig(scratchNode, scratch) : null;
     check(loaded?.status === 201, `CONTROL: a scratch Kong (${image}) loaded the running config with an echo behind every service (${loaded?.status ?? 'never up'})`);
     if (loaded?.status !== 201) {
-      console.error(`  ${await loaded?.text().catch(() => '')}`);
+      console.error(`  ${loaded?.text ?? ''}`);
       return;
     }
 
     /** One request through the scratch Kong; what the echo saw for it, if anything. */
     async function probe(path, host, headers = FORGED) {
       const before = seen.length;
-      const res = await send(scratchProxy, path, { host, headers });
+      const res = await send(scratchNode.proxy, path, { host, headers });
       await sleep(20);
       return { res, upstream: seen.length > before ? seen[seen.length - 1] : null };
     }
@@ -453,8 +330,10 @@ async function main() {
       check(upstream === null && (res.status === 400 || res.status === 404), `${what} (${host.slice(0, 40)}) never reaches a service (${res.status})`);
     }
   } finally {
-    if (started) await docker(['rm', '-f', SCRATCH]).catch(() => {});
-    echo.close();
+    // By name, whether or not the start returned: a start that failed after `docker
+    // run` would otherwise leave its container behind.
+    await docker(['rm', '-f', SCRATCH]).catch(() => {});
+    await echo.close();
   }
 
   const left = await docker(['ps', '-aq', '--filter', `name=${SCRATCH}`]).catch(() => '');
