@@ -70,6 +70,8 @@ const relayEnv = serviceEnv(ROOT, 'relay', {
 
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_mailcheck_${RUN}`;
+/** Its subdomain, which is how Auth is told the tenant. */
+const TENANT_SLUG = `mailcheck-${RUN}`;
 const USER_ID = `user_mailcheck_${RUN}`;
 const EMAIL = `reset-${RUN}@mailcheck.example`;
 const NEW_PASSWORD = `new-password-${RUN}`;
@@ -220,7 +222,7 @@ async function main() {
 
   try {
     console.log('  the fixture');
-    await app.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail check ${RUN}`, `mailcheck-${RUN}`]);
+    await app.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail check ${RUN}`, TENANT_SLUG]);
     await inTenant(app, TENANT, (c) =>
       c.query(`INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [USER_ID, TENANT, EMAIL]),
     );
@@ -230,13 +232,13 @@ async function main() {
 
     console.log('');
     console.log('  an address that is not a user queues nothing');
-    const unknown = await post('/forgot-password', { email: `nobody-${RUN}@mailcheck.example` }, { 'X-Tenant-ID': TENANT });
+    const unknown = await post('/forgot-password', { email: `nobody-${RUN}@mailcheck.example` }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(unknown.status === 202, `an unknown address still gets 202 (got ${unknown.status})`);
     check((await outboxRows()).length === 0, 'and writes no outbox row');
 
     console.log('');
     console.log('  a real reset queues one request, holding only ciphertext and identifiers');
-    const known = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-ID': TENANT });
+    const known = await post('/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(known.status === 202, `the user's reset gets 202 (got ${known.status})`);
     let link = null;
     for (let i = 0; i < 40 && !link; i += 1) {
@@ -357,7 +359,7 @@ async function main() {
     console.log('  the sealed link is the live credential');
     const reset = await post('/reset-password', { token: new URL(claims.link).searchParams.get('token'), password: NEW_PASSWORD });
     check(reset.status === 200, `the link from inside the seal resets the password (${reset.status})`);
-    const login = await post('/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-ID': TENANT });
+    const login = await post('/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
     check(login.status === 200, `and the new password signs in (${login.status})`);
   } finally {
     auth.child.kill();

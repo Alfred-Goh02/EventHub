@@ -73,6 +73,8 @@ const TTL_DAYS = 7;
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_suppress_${RUN}`;
 const OTHER_TENANT = `tenant_suppress_other_${RUN}`;
+/** A tenant's subdomain, which is how Auth is told the tenant. */
+const slugOf = (tenant) => tenant.replace(/_/g, '-');
 const GROUP = `verify-email-suppression-${RUN}`;
 const SMTP_PORT = 3290;
 const NOTIFICATION_PORT = 3291;
@@ -268,7 +270,7 @@ async function main() {
   try {
     console.log('  the fixture');
     for (const tenant of [TENANT, OTHER_TENANT]) {
-      await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Suppression ${tenant}`, tenant.replace(/_/g, '-')]);
+      await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Suppression ${tenant}`, slugOf(tenant)]);
     }
     for (const u of Object.values(users)) {
       await inTenant(authApp, u.tenant, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [u.id, u.tenant, u.email]);
@@ -311,7 +313,7 @@ async function main() {
 
     const lastIds = new Map();
     async function requestReset(u) {
-      const status = await post('/forgot-password', { email: u.email }, { 'X-Tenant-ID': u.tenant });
+      const status = await post('/forgot-password', { email: u.email }, { 'X-Tenant-Slug': slugOf(u.tenant) });
       const messageId = await waitFor(async () => {
         const id = await outboxIdFor(u);
         return id && id !== lastIds.get(u.id) ? id : null;

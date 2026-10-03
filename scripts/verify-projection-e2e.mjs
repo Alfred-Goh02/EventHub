@@ -38,6 +38,8 @@ const BROKERS = (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',');
 const REGISTRY = process.env['SCHEMA_REGISTRY_URL'] ?? 'http://localhost:8081';
 
 const TENANT = 'tenant_acme';
+/** The seeded tenant's subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const stamp = Date.now();
 
 const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
@@ -73,7 +75,7 @@ async function waitForProjection(db, eventId, predicate, label, timeoutMs = 30_0
 async function main() {
   const login = await fetch(`${AUTH}/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': TENANT },
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-Slug': TENANT_SLUG },
     body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
   });
   const { accessToken } = await login.json();

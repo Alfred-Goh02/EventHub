@@ -37,6 +37,8 @@ const COMMUNITY = process.env['COMMUNITY_URL'] ?? 'http://127.0.0.1:3008';
 const POSTGRES = process.env['POSTGRES_CONTAINER'] ?? 'eventhub-postgres';
 /** The seeded tenant: this adds two users to it and takes them away again. */
 const TENANT = 'tenant_acme';
+/** Its subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
+const TENANT_SLUG = 'acme';
 const PASSWORD = 'hunter2222';
 
 const RUN = randomBytes(4).toString('hex');
@@ -80,12 +82,12 @@ function psql(database, sql) {
 const deleted = async (database, table, where) =>
   Number(await psql(database, `WITH d AS (DELETE FROM "${table}" WHERE ${where} RETURNING 1) SELECT count(*) FROM d`).catch(() => '0'));
 
-async function api(base, path, { method = 'GET', token, tenant, body } = {}) {
+async function api(base, path, { method = 'GET', token, slug, body } = {}) {
   const res = await fetch(`${base}${path}`, {
     method,
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(tenant ? { 'X-Tenant-ID': tenant } : {}),
+      ...(slug ? { 'X-Tenant-Slug': slug } : {}),
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -124,7 +126,7 @@ async function main() {
 
     console.log('');
     console.log("  Auth's token, verified by Community with the volume's public key");
-    const signIn = async (user) => (await api(AUTH, '/login', { method: 'POST', tenant: TENANT, body: { email: user.email, password: PASSWORD } })).body?.accessToken;
+    const signIn = async (user) => (await api(AUTH, '/login', { method: 'POST', slug: TENANT_SLUG, body: { email: user.email, password: PASSWORD } })).body?.accessToken;
     const asAuthor = await signIn(AUTHOR);
     const asReader = await signIn(READER);
     check(Boolean(asAuthor && asReader), 'both users sign in through Auth');

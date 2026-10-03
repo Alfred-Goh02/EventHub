@@ -513,6 +513,14 @@ services:
       PORT: 3001
       DATABASE_URL: postgresql://eventhub_auth_owner:eventhub_auth_owner@postgres:5432/eventhub_auth
       APP_DATABASE_URL: postgresql://eventhub_auth_app:eventhub_auth_app@postgres:5432/eventhub_auth
+      # One proxy hop: the gateway. Without it Auth sees every sign-in as coming from
+      # Kong, and the login budget keyed on the caller's address becomes one budget
+      # for everybody -- measured: an account locked out from this host was locked
+      # out from another container too. With it, req.ip is the address Kong saw;
+      # anything a client put in X-Forwarded-For sits to its left and is ignored.
+      # The cost, while this port is still published: a client calling Auth
+      # directly can name its own address. scripts/verify-compose-gateway.mjs.
+      TRUST_PROXY: "1"
     volumes:
       # The only container that gets the PRIVATE key, because it is the only one
       # that signs. jwt.ts resolves keys/ relative to its own file, so the mount
@@ -1004,6 +1012,59 @@ services:
       # /ready, not /health: it queries Postgres as the app role, and nothing else
       # here would notice the database being unreachable.
       test: ["CMD-SHELL", "curl -sf http://localhost:3007/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # The gateway. Every external request enters here: Kong OSS, DB-less, reading
+  # infra/kong/kong.yml at boot and holding no state, so a config that does not
+  # parse stops it starting rather than leaving it half-configured. That file says
+  # what it routes and why.
+  #
+  # The proxy, 8000, is the one port meant for the outside. The Admin API listens
+  # on the container's OWN loopback and is published nowhere: in DB-less mode it
+  # cannot change one entity, but POST /config replaces the whole configuration,
+  # tenant snippet included, and it has no authentication. On 0.0.0.0 inside the
+  # container, any service on this network could have rewritten the gateway. To
+  # read it, join Kong's network namespace:
+  #   docker run --rm --network container:eventhub-kong --entrypoint curl \
+  #     eventhub/app:local -s http://127.0.0.1:8001/routes
+  # Kong Manager, the GUI on 8002 and 8445 by default, is off for the same reason.
+  # The status endpoint is read-only and published on loopback.
+  #
+  # A tenant is a subdomain, so locally: http://acme.eventhub.localhost:8000/...
+  # Browsers and curl resolve any *.localhost name to loopback by themselves.
+  # ---------------------------------------------------------------------------
+  kong:
+    image: kong:3.9
+    container_name: eventhub-kong
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001
+      KONG_ADMIN_GUI_LISTEN: "off"
+      # Inside the container, so the port mapping below can reach it; published to
+      # 127.0.0.1 only.
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_LOG_LEVEL: info
+      # The default, written down: the tenant snippet runs in Kong's Lua sandbox.
+      KONG_UNTRUSTED_LUA: sandbox
+    volumes:
+      - ./infra/kong:/kong/declarative:ro
+    ports:
+      - "8000:8000"
+      - "127.0.0.1:8100:8100"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
       interval: 10s
       timeout: 5s
       retries: 6
