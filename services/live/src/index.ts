@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma, withTenant } from './db.js';
 import { closeRedis } from './redis.js';
@@ -102,10 +103,9 @@ app.get('/live/events/:eventId/questions', requireAuth, (req, res, next) => {
     .catch(next);
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http.
+app.use(errorHandler(logger));
 
 /**
  * How long to keep serving after readiness fails.

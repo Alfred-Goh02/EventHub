@@ -1,5 +1,6 @@
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { env } from './env.js';
 import { createClickHouse } from './clickhouse.js';
 import { requireAnalyst, requireAuth } from './auth.js';
@@ -47,10 +48,11 @@ app.get('/metrics', (_req, res) => {
 
 app.use(createAnalyticsRouter({ ch, guards: [requireAuth, requireAnalyst] }));
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http. A route's failure was counted in the
+// query metrics by its handle() before it was passed here; a body refused by
+// express.json() never reached a route, and counts as no query.
+app.use(errorHandler(logger));
 
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');

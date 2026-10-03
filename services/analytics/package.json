@@ -15,6 +15,7 @@
     "@clickhouse/client": "^1.23.1",
     "@eventhub/auth-middleware": "workspace:*",
     "@eventhub/config": "workspace:*",
+    "@eventhub/http": "workspace:*",
     "@eventhub/kafka": "workspace:*",
     "@eventhub/logger": "workspace:*",
     "@kafkajs/confluent-schema-registry": "^4.1.0",
