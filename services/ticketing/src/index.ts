@@ -1,6 +1,7 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
@@ -60,12 +61,9 @@ app.use('/reservations', pay);
 // The HMAC signature is the authentication. See routes/webhooks.ts.
 app.use('/webhooks', webhooks);
 
-// Express 4 identifies an error handler by its ARITY: four parameters. Drop
-// `_next` and it silently becomes ordinary middleware that never runs on error.
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http.
+app.use(errorHandler(logger));
 
 const consumer = createProjectionConsumer({
   brokers: (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',').map((b) => b.trim()),

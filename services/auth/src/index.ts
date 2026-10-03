@@ -3,7 +3,7 @@ import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
-import { ah } from '@eventhub/http';
+import { ah, errorHandler } from '@eventhub/http';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
@@ -820,14 +820,11 @@ app.post('/reset-password', ah(async (req, res) => {
   }
 }));
 
-// Express 4 identifies an error handler by its ARITY: four parameters. Drop
-// `_next` and it silently becomes ordinary middleware that never runs on error.
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http.
 //
 // Auth had none at all, and eight unwrapped async handlers feeding it nothing.
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+app.use(errorHandler(logger));
 
 async function main(): Promise<void> {
   await assertRuntimeRoleCannotBypassRls();

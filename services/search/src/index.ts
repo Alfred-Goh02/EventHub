@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { env } from './env.js';
 import { clusterInfo, os } from './opensearch.js';
 import { createIndexer, indexerMetrics } from './indexer/consumer.js';
@@ -74,10 +75,9 @@ app.get('/metrics', async (_req, res) => {
 
 app.use(search);
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http.
+app.use(errorHandler(logger));
 
 const indexer = createIndexer({
   brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),

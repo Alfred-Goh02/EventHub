@@ -1,5 +1,6 @@
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
@@ -75,16 +76,6 @@ app.get('/metrics', async (_req, res) => {
   res.json({ feed: { ...feedMetrics(), lag: lagCache?.value ?? null } });
 });
 
-/**
- * Registered AFTER the routes, in main(), because Express matches middleware in order:
- * an error handler mounted before the routes never sees their errors. It sat here at
- * first, and a handler that threw took the process down instead of answering 500.
- */
-const errorHandler: express.ErrorRequestHandler = (err, _req, res, _next) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-};
-
 let feed: ReturnType<typeof createFeedConsumer> | null = null;
 
 async function shutdown(signal: string): Promise<void> {
@@ -133,7 +124,13 @@ async function main(): Promise<void> {
   app.use(requireAuth, feedRoutes());
   app.use(requireAuth, moderationRoutes(logger, limiter, env.RATE_LIMIT_REPORT_PER_MINUTE));
 
-  app.use(errorHandler);
+  /**
+   * Registered AFTER the routes, here in main(), because Express matches middleware in
+   * order: an error handler mounted before the routes never sees their errors. It sat at
+   * the top of the file at first, and a handler that threw took the process down instead
+   * of answering 500. A body the client got wrong answers 4xx; see @eventhub/http.
+   */
+  app.use(errorHandler(logger));
 
   /**
    * The consumer runs in this process, as Search's indexer does.
