@@ -60,7 +60,8 @@ import { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { CompactEncrypt, SignJWT, calculateJwkThumbprint, exportJWK, importPKCS8, importSPKI } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
-import { busyGroups, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { busyGroups, commitAtEnd, deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { CONTACTS_TOPIC, contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -73,6 +74,9 @@ const TENANT = `tenant_digest_${RUN}`;
 const OTHER = `tenant_digest_other_${RUN}`;
 const SPACE = `space_digest_${RUN}`;
 const GROUP = `verify-reply-digest-${RUN}`;
+/** The service's groups, and the second set the refused start below runs on. See scripts/lib/notification-groups.mjs. */
+const GROUPS = notificationGroups(GROUP);
+const WIDE = notificationGroups(`${GROUP}-wide`);
 const PORT = 3987;
 const APP_URL = `https://app-${RUN}.digest.example`;
 /** In every reply's body, so a digest that quoted any of them would show it. */
@@ -106,8 +110,9 @@ const Z2 = who('scheduledagain');
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
-  CONTACTS_CONSUMER_GROUP: `${GROUP}-contacts`,
+  // Both of its groups are this run's, and its contact-card group is committed at the end
+  // of auth.user-contact before it starts: this run's cards are written straight to the table.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   DISPATCH_RETRY_DELAYS_MS: '3000,3000,3000',
   NOTIFICATION_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
@@ -322,9 +327,13 @@ async function main() {
     (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = $1 AND cardinality(pg_blocking_pids(pid)) > 0', [APP_ROLE])).rows[0].n;
 
   const everyone = [ACTOR, D, D2, F, W1, X1, Y1, G, H, S, J, J2, J3, J4, V1, T, Q, Z, Z2];
-  let service = start(notificationEnv);
+  // The service starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let service = { child: { kill: () => {} }, log: () => '', exited: Promise.resolve(null) };
 
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    service = start(notificationEnv);
     console.log('  the fixture');
     for (const user of everyone.filter((u) => u !== ACTOR)) await storeCard(user);
     await inTenant(
@@ -342,6 +351,8 @@ async function main() {
       return described.length === groups.length && described.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
     check(Boolean(joined), 'CONTROL: its replies group and replies retry group have both joined');
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     const reading = await waitFor(async () => {
       const before = (await metrics()).replies.notAReplyTotal;
       await produce(reply(D, { kind: 'POST_CREATED', recipientId: null }), { headers: { 'event-type': 'community.post_created' } });
@@ -611,7 +622,10 @@ async function main() {
       const got = await refusal(sql);
       check(got === '42501', `it cannot read or write ${what} (${got})`);
     }
-    const wide = start({ ...notificationEnv, PORT: String(PORT + 1), DIGEST_DATABASE_URL: notificationEnv.APP_DATABASE_URL, KAFKA_CONSUMER_GROUP: `${GROUP}-wide`, CONTACTS_CONSUMER_GROUP: `${GROUP}-wide-contacts` });
+    // Its consumers start before the digest refuses, so its contact-card group is committed
+    // at the end too, or that consumer would read the topic from the start until the exit.
+    await commitAtEnd(admin, WIDE.contacts, [CONTACTS_TOPIC]);
+    const wide = start({ ...notificationEnv, PORT: String(PORT + 1), DIGEST_DATABASE_URL: notificationEnv.APP_DATABASE_URL, ...WIDE.env });
     const wideExit = await Promise.race([wide.exited, sleep(45_000).then(() => 'still running')]);
     if (wideExit === 'still running') {
       wide.child.kill();
@@ -670,10 +684,7 @@ async function main() {
       await fetch(`${MAILPIT}/api/v1/messages`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ IDs: ids }) }).catch(() => {});
     }
     check(removed > 0 && left === 0, `cleanup: this run's rows are gone (${removed} deleted, ${left} left), and ${ids.length} email(s) removed from Mailpit`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [
-      GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, `${GROUP}-contacts`,
-      `${GROUP}-wide`, `${GROUP}-wide-retry`, `${GROUP}-wide-replies`, `${GROUP}-wide-replies-retry`, `${GROUP}-wide-contacts`,
-    ]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, ...WIDE.all]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), owner.end(), digestRole.end()]);
   }

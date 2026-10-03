@@ -40,6 +40,7 @@ import pg from 'pg';
 import { Kafka, logLevel } from 'kafkajs';
 import { serviceEnv } from './lib/service-env.mjs';
 import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -50,12 +51,14 @@ const OTHER = `tenant_prefs_other_${RUN}`;
 const U = `user_prefs_u_${RUN}`;
 const V = `user_prefs_v_${RUN}`;
 const W = `user_prefs_w_${RUN}`;
-const GROUP = `verify-notification-preferences-${RUN}`;
+const GROUPS = notificationGroups(`verify-notification-preferences-${RUN}`);
 const PORT = 3984;
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs. Every
+  // process below, the production ones included, starts its consumers on them.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
 });
@@ -163,11 +166,17 @@ async function main() {
   const replyOn = async (tenant, user, t = token(tenant, user)) =>
     ((await api('/preferences', { bearer: t })).body?.preferences ?? []).find((p) => p.category === 'COMMUNITY_REPLY')?.enabled;
 
-  const service = start(notificationEnv);
+  // The service starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let service = { child: { kill: () => {} }, log: () => '', exited: Promise.resolve(null) };
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    service = start(notificationEnv);
     const ready = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT}/ready`)).ok, 60_000, 500);
     check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${PORT}` : `Notification never became ready:\n${excerpt(service.log())}`);
     if (!ready) return;
+    const own = await contacts.joined();
+    check(own.ok, own.message);
 
     console.log('');
     console.log('  /preferences is the signed-in user\'s own, and nobody else\'s');
@@ -310,7 +319,7 @@ async function main() {
   }
   const left = (await inTenant(owner, TENANT, `SELECT count(*)::int AS n FROM "NotificationPreference" WHERE "tenantId" = $1`, [TENANT])).rows[0].n;
   check(deleted > 0 && left === 0, `cleanup: this run's preference rows are gone (${deleted} deleted, ${left} left)`);
-  const stuck = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`]);
+  const stuck = await deleteGroupsWhenEmpty(admin, GROUPS.all);
   if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
   await Promise.allSettled([admin.disconnect(), owner.end()]);
 

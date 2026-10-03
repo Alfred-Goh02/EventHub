@@ -56,6 +56,7 @@ import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { serviceEnv } from './lib/service-env.mjs';
 import { createFakeSmtp } from './lib/fake-smtp.mjs';
 import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -76,6 +77,7 @@ const OTHER_TENANT = `tenant_suppress_other_${RUN}`;
 /** A tenant's subdomain, which is how Auth is told the tenant. */
 const slugOf = (tenant) => tenant.replace(/_/g, '-');
 const GROUP = `verify-email-suppression-${RUN}`;
+const GROUPS = notificationGroups(GROUP);
 const SMTP_PORT = 3290;
 const NOTIFICATION_PORT = 3291;
 const AUTH_PORT = 3293;
@@ -89,7 +91,8 @@ const relayEnv = serviceEnv(ROOT, 'relay', {
 });
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(NOTIFICATION_PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   DISPATCH_RETRY_DELAYS_MS: DELAYS_MS.join(','),
   SUPPRESSION_TTL_DAYS: String(TTL_DAYS),
@@ -264,10 +267,14 @@ async function main() {
   const suppressionsIn = async (tenant) =>
     (await inTenant(notifyApp, tenant, `SELECT s.* FROM "EmailSuppression" s WHERE s."tenantId" = $1`, [tenant])).rows;
 
-  const notification = start('notification', ['dist/index.js'], notificationEnv);
+  // Notification starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let notification = { child: { kill: () => {}, exitCode: null, signalCode: null }, log: () => '' };
   const auth = start('auth', ['dist/index.js'], authEnv);
 
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    notification = start('notification', ['dist/index.js'], notificationEnv);
     console.log('  the fixture');
     for (const tenant of [TENANT, OTHER_TENANT]) {
       await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Suppression ${tenant}`, slugOf(tenant)]);
@@ -288,6 +295,8 @@ async function main() {
       return groups.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
     check(Boolean(joined), 'CONTROL: its dispatch and retry consumer groups have both joined');
+    const own = await contacts.joined();
+    check(own.ok, own.message);
 
     // Canaries: expired messages keyed by every user, on the main topic and on every
     // tier, so each consumer is known to be reading every partition used below.
@@ -565,7 +574,7 @@ async function main() {
       await inTenant(authApp, tenant, 'DELETE FROM "User" WHERE "tenantId" = $1', [tenant]).catch(() => {});
       await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [tenant]).catch(() => {});
     }
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, ...scanGroups]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, ...scanGroups]);
     await admin.disconnect().catch(() => {});
     const left = { outbox: 0, deliveries: 0, suppressions: 0 };
     for (const tenant of [TENANT, OTHER_TENANT]) {

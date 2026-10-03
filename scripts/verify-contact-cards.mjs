@@ -21,9 +21,11 @@
  *     so a genuine card sent AFTER them must still land.
  *   - A tombstone withdraws the card.
  *
- * Notification runs on groups of its own. Its contact consumer reads the compacted
- * topic from the start, as the real one does, so every baseline is taken after it
- * has caught up.
+ * Notification runs on groups of its own. Its contact consumer's group is committed at
+ * the end of the topic before it starts (scripts/lib/notification-groups.mjs): from the
+ * start, as a new real group reads, it replayed every card on the topic, and put every
+ * forgery earlier runs of this file had left there onto the dead-letter topic again.
+ * Every baseline is still taken after it has caught up.
  *
  * Scoped to tenants created for this run; they, their users, invites, outbox rows and
  * cards, and the run's consumer groups are removed at the end.
@@ -53,6 +55,7 @@ import {
 } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
 import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -64,6 +67,7 @@ const OTHER = `tenant_contact_other_${RUN}`;
 const EMAIL = `contact-${RUN}@mailcheck.example`;
 const DIRECT_EMAIL = `contact-direct-${RUN}@mailcheck.example`;
 const GROUP = `verify-contact-cards-${RUN}`;
+const GROUPS = notificationGroups(GROUP);
 const CANARY = `user_contact_canary_${RUN}`;
 
 const NOTIFICATION_PORT = 3981;
@@ -88,9 +92,8 @@ const relayEnv = serviceEnv(ROOT, 'relay', {
 });
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(NOTIFICATION_PORT),
-  KAFKA_CONSUMER_GROUP: `${GROUP}-dispatch`,
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
-  CONTACTS_CONSUMER_GROUP: `${GROUP}-contacts`,
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
 });
 
@@ -234,12 +237,16 @@ async function main() {
     return payload;
   }
 
-  const notification = start('notification', ['dist/index.js'], notificationEnv);
+  // Notification starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let notification = { child: { kill: () => {} }, log: () => '' };
   const auth = start('auth', ['dist/index.js'], authEnv);
   let userId = null;
   let directId = null;
 
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    notification = start('notification', ['dist/index.js'], notificationEnv);
     console.log('  the fixture');
     for (const [id, slug] of [[TENANT, `contact-${RUN}`], [OTHER, `contact-other-${RUN}`]]) {
       await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [id, `Contact ${RUN}`, slug]);
@@ -251,6 +258,8 @@ async function main() {
     check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${NOTIFICATION_PORT}` : `Notification never became ready:\n${excerpt(notification.log())}`);
     check(Boolean(authUp), authUp ? `CONTROL: a private Auth is listening on :${AUTH_PORT}` : `Auth never came up:\n${excerpt(auth.log())}`);
     check(auth.log().includes('clock skewed by +3600s'), "CONTROL: Auth's clock is an hour fast, so a stamp from it cannot pass for the database's");
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     if (failures > 0) return;
     /**
      * A CANARY FIRST, then the lag. On a topic nothing has been written to, a new group
@@ -457,7 +466,7 @@ async function main() {
       (await authApp.query(`SELECT count(*)::int AS n FROM "Tenant" WHERE id IN ($1, $2)`, [TENANT, OTHER])).rows[0].n +
       (await relayDb.query(`SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" IN ($1, $2)`, [TENANT, OTHER])).rows[0].n;
     check(deleted > 0 && left === 0, `cleanup: this run's rows are gone (${deleted} deleted, ${left} left)`);
-    const stuck = await deleteGroupsWhenEmpty(admin, [`${GROUP}-dispatch`, `${GROUP}-dispatch-retry`, `${GROUP}-dispatch-replies`, `${GROUP}-dispatch-replies-retry`, `${GROUP}-contacts`, `${GROUP}-scan`]);
+    const stuck = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, `${GROUP}-scan`]);
     if (stuck.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuck.join(', ')}`);
     await Promise.allSettled([producer.disconnect(), admin.disconnect(), authApp.end(), relayDb.end(), notifyApp.end()]);
   }

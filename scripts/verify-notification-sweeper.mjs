@@ -43,10 +43,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { Kafka, logLevel } from 'kafkajs';
 // The reason the sweep writes, from the service itself rather than copied here, so the
 // rows a pass ended are found by exactly what it wrote.
 import { ABANDONED } from '../services/notification/dist/sweeper/sweep.js';
 import { serviceEnv } from './lib/service-env.mjs';
+import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -56,10 +59,14 @@ const OTHER_TENANT = `tenant_sweep_other_${RUN}`;
 const NOTIFICATION_PORT = 3391;
 /** Seconds, not the hour the service ships with: the fixtures are backdated past this and no further. */
 const STUCK_AFTER_MS = 5_000;
+const GROUPS = notificationGroups(`verify-sweeper-${RUN}`);
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(NOTIFICATION_PORT),
-  KAFKA_CONSUMER_GROUP: `verify-sweeper-${RUN}`,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs. The
+  // service starts its consumers whatever this run is about, and both processes below
+  // start them on these.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   SWEEP_STUCK_AFTER_MS: String(STUCK_AFTER_MS),
   SWEEP_INTERVAL_MS: '1000',
@@ -125,6 +132,8 @@ async function main() {
   const owner = new pg.Client({ connectionString: notificationEnv.DATABASE_URL });
   const sweeperRole = new pg.Client({ connectionString: notificationEnv.SWEEPER_DATABASE_URL });
   await Promise.all([owner.connect(), sweeperRole.connect()]);
+  const admin = new Kafka({ clientId: `verify-sweeper-${RUN}`, brokers: notificationEnv.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING }).admin();
+  await admin.connect();
 
   /** One delivery row, written as the owner with its age chosen. */
   const put = async (tenant, name, status, ageMs) => {
@@ -147,6 +156,10 @@ async function main() {
   let service = notification;
 
   try {
+    // Before the fixture, not just before the service starts: the young delivery must
+    // still be younger than the threshold at the service's first pass, and the commit
+    // takes about five seconds.
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
     console.log('  the fixture');
     const stuck = await put(TENANT, 'stuck', 'PENDING', 60_000);
     const young = await put(TENANT, 'young', 'PENDING', 0);
@@ -258,6 +271,8 @@ async function main() {
     check(Boolean(swept), swept ? `it swept without being asked (${swept.abandonedTotal} in ${swept.passesTotal} pass(es))` : `no sweep was reported:\n${excerpt(service.log())}`);
     check((await rowById(TENANT, later))?.status === 'FAILED', 'and the delivery it found is FAILED');
     check(swept?.failuresTotal === 0 && typeof swept?.oldestPendingMs === 'number', `/metrics reports the oldest delivery still pending (${swept?.oldestPendingMs} ms) with no failed passes`);
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     service.child.kill();
 
     console.log('');
@@ -283,7 +298,12 @@ async function main() {
       left += (await rowsOf(tenant).catch(() => [])).length;
     }
     check(deleted > 0 && left === 0, `cleanup: this run's deliveries are gone (${deleted} deleted, ${left} left)`);
-    await Promise.all([owner.end().catch(() => {}), sweeperRole.end().catch(() => {})]);
+    // Both processes were killed or exited mid-session, so their groups empty only once
+    // the sessions time out, and the second joined while the first's dead member was
+    // still listed: the contacts group outlasted the default 45 s once, measured.
+    const stuckGroups = await deleteGroupsWhenEmpty(admin, GROUPS.all, { timeoutMs: 90_000 });
+    if (stuckGroups.length > 0) console.log(`    note  consumer group(s) left to expire: ${stuckGroups.join(', ')}`);
+    await Promise.all([owner.end().catch(() => {}), sweeperRole.end().catch(() => {}), admin.disconnect().catch(() => {})]);
   }
 
   console.log('');
