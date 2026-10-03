@@ -196,10 +196,12 @@ async function main() {
   );
 
   // The real services, through the real gateway.
-  const realEvent = await send(PROXY, '/events', { host: TENANT_HOST });
+  // Auth's /me, because Auth's routes carry no signature check at the edge: with no
+  // token the answer is Auth's own 401, in its shape, not Kong's.
+  const realAuth = await send(PROXY, '/auth/me', { host: TENANT_HOST });
   check(
-    realEvent.status === 401 && typeof realEvent.json?.error === 'string' && realEvent.json?.message === undefined,
-    `a path reaches the real service: /events answers Event's own 401, not Kong's (${realEvent.status} ${realEvent.text.slice(0, 80)})`,
+    realAuth.status === 401 && typeof realAuth.json?.error === 'string' && realAuth.json?.message === undefined,
+    `a path reaches the real service: /auth/me answers Auth's own 401, not Kong's (${realAuth.status} ${realAuth.text.slice(0, 80)})`,
   );
   // Signing in through the gateway: the tenant is the subdomain, whatever the request
   // says. The seed puts the same address and password in both acme and globex, so a
@@ -270,9 +272,10 @@ async function main() {
   let scratchNode = null;
   try {
     // The running config, with every upstream pointed at the echo server. Without its
-    // rate limits: this node is not on the compose network, they are counted in Redis,
-    // and verify-compose-gateway-edge.mjs is where they are asserted.
-    const scratch = echoConfig({ services, routes, plugins }, echo.port, (p) => (p.name === 'rate-limiting' ? null : p));
+    // rate limits and edge signature checks: this node is not on the compose network,
+    // the limits are counted in Redis, and the signature checks need the consumer the
+    // running node renders at start. verify-compose-gateway-edge.mjs asserts both.
+    const scratch = echoConfig({ services, routes, plugins }, echo.port, (p) => (p.name === 'rate-limiting' || p.name === 'jwt' ? null : p));
     const image = await docker(['inspect', '-f', '{{.Config.Image}}', KONG_CONTAINER]);
     scratchNode = await startScratchKong({ name: SCRATCH, image });
     const loaded = scratchNode.up ? await loadConfig(scratchNode, scratch) : null;

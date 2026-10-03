@@ -2321,9 +2321,11 @@ jobs:
       # ceiling, and an access log with no Authorization, cookie or query string in
       # it. The rate limit is asserted by its effect: the running node's count rises
       # in Redis, and two scratch nodes on one Redis database share a single count of
-      # four, which the same node on another database does not. Waits for a fresh
+      # four, which the same node on another database does not. Token signatures are
+      # checked at the edge with Auth's own key: an expired or wrong-issuer token signed
+      # with that real key is refused by Kong, not by the service. Waits for a fresh
       # minute, so it takes up to one.
-      - name: Prove the gateway's request ids, CORS, limits and logs
+      - name: Prove the gateway's request ids, CORS, signatures, limits and logs
         run: node scripts/verify-compose-gateway-edge.mjs
 
       # Re-running must be safe, because a reader will do it. The keypair

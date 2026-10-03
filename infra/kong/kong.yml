@@ -207,6 +207,42 @@ plugins:
       <<: *rate-limit
       minute: 120
 
+  # SIGNATURES, CHECKED AT THE EDGE, so a forged, expired or garbage token never costs a
+  # service a request. Only on routes where every path needs a token: not Auth's
+  # (sign-in, registration and reset need none), not Live's (its token rides in the
+  # WebSocket subprotocol, which this plugin cannot read), and not the two tenantless
+  # routes. The services still verify everything themselves -- audience included,
+  # which this plugin does not check -- so this only ever refuses earlier.
+  #
+  # The key is found by the token's `iss`, in the one consumer render-consumer.lua adds
+  # at start with Auth's public key. Tokens are read from Authorization only: none from
+  # a cookie or the query string, where they would be logged. A preflight passes, and
+  # CORS answers it.
+  - name: jwt
+    route: event
+    config: &edge-jwt
+      key_claim_name: iss
+      claims_to_verify: [exp]
+      header_names: [authorization]
+      uri_param_names: []
+      cookie_names: []
+      run_on_preflight: false
+  - name: jwt
+    route: ticketing
+    config: *edge-jwt
+  - name: jwt
+    route: search
+    config: *edge-jwt
+  - name: jwt
+    route: analytics
+    config: *edge-jwt
+  - name: jwt
+    route: notification
+    config: *edge-jwt
+  - name: jwt
+    route: community
+    config: *edge-jwt
+
   # One JSON line per request, with the credentials taken out. The nginx access log is
   # off (docker-compose.yml): it writes the request line whole, and an unsubscribe link
   # carries its token in the query string. Fields set to nil are removed.

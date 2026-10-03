@@ -279,7 +279,10 @@ payment webhook and the unsubscribe link carry no tenant and live on
 `api.eventhub.localhost`.
 
 On the way through, every request gets an `X-Request-ID`, which the service
-receives and the response carries. CORS is answered for tenant subdomains only
+receives and the response carries. On every route where each path needs a token
+(Event, Ticketing, Search, Analytics, Notification's preferences, Community), Kong
+checks the token's signature and expiry with Auth's public key before the service
+sees it; the services still verify everything themselves, audience included. CORS is answered for tenant subdomains only
 (`https` in production; any port on `*.eventhub.localhost`). Bodies over 1 MB are
 refused. Each client address gets 600 requests a minute, 120 on `/auth`, counted
 in Redis so every Kong node shares one count. Each request is logged as one JSON

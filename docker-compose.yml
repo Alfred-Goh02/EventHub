@@ -27,7 +27,7 @@ x-app: &app
     # and then fail to resolve a name that means nothing here.
     KAFKA_BROKERS: kafka:29092
     SCHEMA_REGISTRY_URL: http://schema-registry:8081
-    JWT_ISSUER: https://auth.eventhub.local
+    JWT_ISSUER: &jwt-issuer https://auth.eventhub.local
     JWT_AUDIENCE: eventhub-api
 
 # EVERY SERVICE SETS stop_grace_period. None is left to the default, because the
@@ -1051,9 +1051,19 @@ services:
     container_name: eventhub-kong
     restart: unless-stopped
     stop_grace_period: 15s
+    # Auth's public key exists once setup has run, and Kong verifies tokens with it.
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    # kong.yml plus the consumer holding that key, rendered to /tmp before Kong starts;
+    # render-consumer.lua says why, and stops the start if anything is missing. The
+    # image's entrypoint runs this and then the usual start.
+    command: ["sh", "-c", "resty /kong/declarative/render-consumer.lua && exec /docker-entrypoint.sh kong docker-start"]
     environment:
       KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_DECLARATIVE_CONFIG: /tmp/kong.yml
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      JWT_ISSUER: *jwt-issuer
       KONG_PROXY_LISTEN: 0.0.0.0:8000
       KONG_ADMIN_LISTEN: 127.0.0.1:8001
       KONG_ADMIN_GUI_LISTEN: "off"
@@ -1080,6 +1090,7 @@ services:
       KONG_DNS_VALID_TTL: "5"
     volumes:
       - ./infra/kong:/kong/declarative:ro
+      - jwt-public:/run/eventhub/keys:ro
     ports:
       - "8000:8000"
       - "127.0.0.1:8100:8100"

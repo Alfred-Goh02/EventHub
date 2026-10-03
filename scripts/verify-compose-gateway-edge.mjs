@@ -18,6 +18,12 @@
  *     With Redis unreachable, the limit fails open rather than failing the request.
  *   - The access log has a line for the request, by its id, with no Authorization, no
  *     cookie and no query string in it, and the nginx access log is off.
+ *   - Token signatures are checked at the edge on exactly the routes where every path
+ *     needs one, with Auth's own public key, rendered into Kong's config at start (the
+ *     render refuses without the key). No token, another key's signature, HS256 keyed
+ *     with the public key, an expired or wrong-issuer token signed with Auth's REAL key,
+ *     and a real token in the query string or a cookie are all refused by Kong, in
+ *     Kong's shape -- a service answers { error } -- and a real token reaches Event.
  *
  * The limits are exercised on scratch nodes with a limit of 4 and their own Redis
  * databases, so the real stack's counters are never spent and nothing is left behind.
@@ -26,9 +32,13 @@
  *   node scripts/verify-compose-gateway-edge.mjs
  */
 
-import { randomBytes } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { createHmac, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { KONG_CONTAINER, admin, containerLogs, docker, echoConfig, loadConfig, runningConfig, send, sleep, startEcho, startScratchKong, waitFor } from './lib/kong.mjs';
 
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROXY = process.env['KONG_PROXY_URL'] ?? 'http://127.0.0.1:8000';
 const NEIGHBOUR = 'eventhub-auth';
 const REDIS_CONTAINER = 'eventhub-redis';
@@ -123,17 +133,21 @@ async function main() {
 
   console.log('');
   console.log('  a ceiling on the body');
+  // On Auth's sign-in, which needs no token: on a route with the edge signature check,
+  // a request without one is refused with 401 before its size is looked at.
   const kongRefusal = (res) => res.status === 413 && /Request size limit exceeded/.test(res.json?.message ?? '');
-  const big = await send(PROXY, '/events', { host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' }, body: `{"pad":"${'x'.repeat(2 * 1024 * 1024)}"}` });
+  const big = await send(PROXY, '/auth/login', { host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' }, body: `{"pad":"${'x'.repeat(2 * 1024 * 1024)}"}` });
   check(kongRefusal(big), `a 2 MiB body is refused by the gateway (${big.status} ${big.text.slice(0, 60)})`);
-  const small = await send(PROXY, '/events', { host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' }, body: `{"pad":"${'x'.repeat(512 * 1024)}"}` });
+  const small = await send(PROXY, '/auth/login', { host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' }, body: `{"pad":"${'x'.repeat(512 * 1024)}"}` });
   check(!kongRefusal(small), `CONTROL: a 512 KiB body is passed on to the service (${small.status} ${small.text.slice(0, 60)})`);
 
   console.log('');
   console.log('  the running node counts in Redis');
+  // /live for the global limit: it carries no edge signature check, which would refuse
+  // a tokenless request before the limit is counted.
   const limitOf = async (path) => Number((await send(PROXY, path, { host: TENANT_HOST })).headers['ratelimit-limit']);
-  const [eventsLimit, authLimit] = [await limitOf('/events'), await limitOf('/auth/me')];
-  check(eventsLimit === rl?.config.minute && authLimit === rlAuth?.config.minute, `responses carry the limit that applied: /events ${eventsLimit}, /auth/me ${authLimit}`);
+  const [globalLimit, authLimit] = [await limitOf('/live'), await limitOf('/auth/me')];
+  check(globalLimit === rl?.config.minute && authLimit === rlAuth?.config.minute, `responses carry the limit that applied: /live ${globalLimit}, /auth/me ${authLimit}`);
   // The effect, not the setting: this minute's counter in Redis must rise when a request
   // goes through. Keys left by an earlier minute or an earlier configuration cannot
   // pass this; only a node counting in Redis now can.
@@ -148,7 +162,7 @@ async function main() {
   };
   if (new Date().getUTCSeconds() > 55) await sleep(6_000);
   const countBefore = await minuteCounts();
-  await send(PROXY, '/events', { host: TENANT_HOST });
+  await send(PROXY, '/live', { host: TENANT_HOST });
   const countAfter = await minuteCounts();
   check(countAfter > countBefore, `one request through the running node raises this minute's count in Redis database ${realDb} (${countBefore} -> ${countAfter})`);
 
@@ -172,6 +186,110 @@ async function main() {
   check(leaks.length === 0, `its token, Authorization and cookie appear nowhere in Kong's output, either stream (${leaks.length} line(s))`);
 
   console.log('');
+  console.log('  signatures checked at the edge');
+  // Which routes: every route where every path needs a token, and no other. Read from
+  // the running node, so a route added later has to be put on one side or the other.
+  const SIGNED = ['analytics', 'community', 'event', 'notification', 'search', 'ticketing'];
+  const jwtPlugins = running.plugins.filter((p) => p.name === 'jwt' && p.enabled);
+  const jwtRoutes = jwtPlugins.map((p) => routeName.get(p.route?.id)).sort();
+  check(
+    JSON.stringify(jwtRoutes) === JSON.stringify(SIGNED) && jwtPlugins.every((p) => p.route && !p.service),
+    `the signature check is on exactly ${SIGNED.join(', ')} -- not Auth, Live or the tenantless routes (${jwtRoutes.join(', ') || 'none'})`,
+  );
+  check(
+    jwtPlugins.length > 0 &&
+      jwtPlugins.every(
+        (p) =>
+          p.config.claims_to_verify?.includes('exp') &&
+          JSON.stringify(p.config.header_names) === '["authorization"]' &&
+          (p.config.uri_param_names ?? []).length === 0 &&
+          (p.config.cookie_names ?? []).length === 0 &&
+          p.config.run_on_preflight === false,
+      ),
+    'each checks exp, reads the token from Authorization only (never a cookie or the query string), and lets a preflight through',
+  );
+  const creds = await admin(appImage, '/consumers/eventhub-auth/jwt').catch(() => null);
+  const cred = creds?.data?.[0];
+  const authKey = await docker(['exec', NEIGHBOUR, 'cat', 'keys/public.pem']).catch(() => '');
+  const norm = (pem) => (pem ?? '').replace(/\s+/g, '');
+  check(
+    creds?.data?.length === 1 && cred.algorithm === 'RS256' && norm(cred.rsa_public_key) === norm(authKey) && norm(authKey).length > 100,
+    `one consumer, eventhub-auth, verifies with Auth's own public key, RS256, for issuer ${cred?.key ?? 'none'}`,
+  );
+
+  // The render step refuses rather than start Kong on a config with no key in it: run
+  // as compose runs it, in a throwaway container, with the key's path pointing nowhere.
+  // The control is the same run with the real key volume, which succeeds.
+  const kongDir = join(ROOT, 'infra', 'kong');
+  const kongImage = await docker(['inspect', '-f', '{{.Config.Image}}', KONG_CONTAINER]);
+  const keyVolume = await docker(['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/run/eventhub/keys"}}{{.Name}}{{end}}{{end}}', KONG_CONTAINER]);
+  const render = (keyFile) =>
+    new Promise((resolve) =>
+      execFile(
+        'docker',
+        ['run', '--rm', '-v', `${kongDir}:/kong/declarative:ro`, '-v', `${keyVolume}:/run/eventhub/keys:ro`,
+          '-e', `AUTH_PUBLIC_KEY_FILE=${keyFile}`, '-e', 'JWT_ISSUER=https://auth.eventhub.local', '-e', 'KONG_DECLARATIVE_CONFIG=/tmp/kong.yml',
+          '--entrypoint', 'resty', kongImage, '/kong/declarative/render-consumer.lua'],
+        (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: `${stdout}${stderr}` }),
+      ),
+    );
+  const rendered = await render('/run/eventhub/keys/public.pem');
+  const missing = await render('/run/eventhub/keys/absent.pem');
+  check(rendered.code === 0 && /wrote \/tmp\/kong\.yml/.test(rendered.out), `CONTROL: the render step succeeds with Auth's key volume (exit ${rendered.code})`);
+  check(missing.code !== 0 && /cannot read/.test(missing.out), `and refuses, exit ${missing.code}, when the key is not there: ${missing.out.trim().slice(0, 90)}`);
+
+  const realToken = (await send(PROXY, '/auth/login', {
+    host: TENANT_HOST, method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'alice@acme.com', password: 'hunter2222' }),
+  })).json?.accessToken;
+  const issuer = cred?.key ?? '';
+  const b64url = (v) => Buffer.from(v).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const body = b64url(JSON.stringify({ sub: `u_edge_${RUN}`, tenantId: 'tenant_acme', tenantSlug: 'acme', role: 'ATTENDEE', iss: issuer, aud: 'eventhub-api', iat: now, exp: now + 600 }));
+  const rs256 = (key) => {
+    const head = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    return `${head}.${body}.${b64url(sign('sha256', Buffer.from(`${head}.${body}`), key))}`;
+  };
+  const forged = rs256(generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey);
+  const hsHead = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const confused = `${hsHead}.${body}.${b64url(createHmac('sha256', authKey).update(`${hsHead}.${body}`).digest())}`;
+  // Two tokens with Auth's REAL signature, minted inside Auth's container with its
+  // private key: one expired, one naming another issuer. Only the edge's own checks
+  // could be what refuses them there.
+  const minted = JSON.parse(
+    await docker([
+      'exec', NEIGHBOUR, 'node', '--input-type=module', '-e',
+      `import { importPKCS8, SignJWT } from 'jose';
+       import { readFileSync } from 'node:fs';
+       const key = await importPKCS8(readFileSync('keys/private.pem', 'utf8'), 'RS256');
+       const now = Math.floor(Date.now() / 1000);
+       const claims = { tenantId: 'tenant_acme', tenantSlug: 'acme', role: 'ATTENDEE' };
+       const make = (iss, iat, exp) => new SignJWT(claims).setProtectedHeader({ alg: 'RS256' }).setSubject('u_edge_${RUN}')
+         .setIssuer(iss).setAudience(process.env.JWT_AUDIENCE).setIssuedAt(iat).setExpirationTime(exp).sign(key);
+       console.log(JSON.stringify({ expired: await make(process.env.JWT_ISSUER, now - 3600, now - 1800), otherIssuer: await make('https://someone-else.example', now, now + 600) }));`,
+    ]).catch((err) => JSON.stringify({ error: err.message })),
+  );
+  check(Boolean(realToken) && Boolean(minted.expired), `CONTROL: a real token from the gateway's sign-in, and two minted with Auth's key (${minted.error ?? 'minted'})`);
+
+  const atEvents = (headers, path = '/events') => send(PROXY, path, { host: TENANT_HOST, headers });
+  const real = await atEvents({ authorization: `Bearer ${realToken}` });
+  check(real.status === 200, `CONTROL: the real token reaches Event (${real.status})`);
+  // Refused AT THE EDGE: 401 in Kong's shape. A service answers { error: ... }.
+  const atEdge = (res) => res.status === 401 && res.json && res.json.error === undefined;
+  for (const [what, headers, path] of [
+    ['no token', {}],
+    ['a token signed with another key', { authorization: `Bearer ${forged}` }],
+    ['HS256, keyed with the public key', { authorization: `Bearer ${confused}` }],
+    ["Auth's signature, expired", { authorization: `Bearer ${minted.expired}` }],
+    ["Auth's signature, another issuer", { authorization: `Bearer ${minted.otherIssuer}` }],
+    ['the real token in the query string', {}, `/events?jwt=${realToken}`],
+    ['the real token in a cookie', { cookie: `jwt=${realToken}` }],
+  ]) {
+    const res = await atEvents(headers, path);
+    check(atEdge(res), `${what}: refused by the gateway (${res.status} ${res.text.slice(0, 60)})`);
+  }
+
+  console.log('');
   console.log('  two nodes, one count');
   const network = await docker(['inspect', '-f', '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}', KONG_CONTAINER]);
   const image = await docker(['inspect', '-f', '{{.Config.Image}}', KONG_CONTAINER]);
@@ -182,9 +300,11 @@ async function main() {
   const withoutShorthands = (config) => Object.fromEntries(Object.entries(config).filter(([k]) => !k.startsWith('redis_')));
   const scratchConfig = (db, host = 'redis') =>
     echoConfig(running, echo.port, (p) =>
-      p.name === 'rate-limiting'
-        ? { ...p, config: { ...withoutShorthands(p.config), minute: SCRATCH_LIMIT, redis: { ...p.config.redis, host, database: db } } }
-        : p,
+      p.name === 'jwt'
+        ? null // the scratch nodes have no consumer to verify with; the section above asserts these
+        : p.name === 'rate-limiting'
+          ? { ...p, config: { ...withoutShorthands(p.config), minute: SCRATCH_LIMIT, redis: { ...p.config.redis, host, database: db } } }
+          : p,
     );
   const before = await Promise.all([countKeys(SHARED_DB), countKeys(OTHER_DB)]);
   check(before[0] === 0 && before[1] === 0, `CONTROL: the scratch databases ${SHARED_DB} and ${OTHER_DB} start empty (${before.join(', ')} keys)`);
