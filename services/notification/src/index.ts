@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
@@ -125,19 +126,6 @@ app.get('/ready', async (_req, res) => {
 });
 
 /**
- * Registered in main(), AFTER the routes: Express matches middleware in order, so an
- * error handler registered before a route never sees its errors. It sat up here while
- * every route was synchronous and defined above it; /preferences is mounted in main()
- * because requireAuth needs Auth's public key loaded first, which put the handler in
- * front of it. Community shipped exactly that once — a handler that threw took the
- * process down instead of answering 500.
- */
-const errorHandler: express.ErrorRequestHandler = (err, _req, res, _next) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-};
-
-/**
  * Started, not awaited into the listen, and retried for ever: a broker slow to answer
  * at boot must not leave a consumer dead behind a process that looks healthy.
  */
@@ -192,7 +180,16 @@ async function main(): Promise<void> {
       logger,
     }),
   );
-  app.use(errorHandler);
+  /**
+   * Registered here, AFTER the routes: Express matches middleware in order, so an error
+   * handler registered before a route never sees its errors. It sat at the top of the
+   * file while every route was synchronous and defined above it; /preferences is mounted
+   * in main() because requireAuth needs Auth's public key loaded first, which put the
+   * handler in front of it. Community shipped exactly that once — a handler that threw
+   * took the process down instead of answering 500. A body the client got wrong answers
+   * 4xx; see @eventhub/http.
+   */
+  app.use(errorHandler(logger));
 
   dispatcher = createDispatcher({
     brokers: env.KAFKA_BROKERS.split(',').map((b) => b.trim()),

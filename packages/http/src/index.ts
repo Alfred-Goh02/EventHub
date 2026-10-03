@@ -1,4 +1,4 @@
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import type { ErrorRequestHandler, NextFunction, Request, RequestHandler, Response } from 'express';
 
 /**
  * Hands a rejected async handler to Express.
@@ -36,3 +36,88 @@ export const ah =
   (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
+
+/**
+ * What errorHandler needs from a logger. @eventhub/logger's pino logger is one; named
+ * structurally so this package does not depend on that one.
+ */
+export interface ErrorLogger {
+  error(obj: object, msg: string): void;
+  info(obj: object, msg: string): void;
+}
+
+/**
+ * The answer to each kind of request body that body-parser refuses, by its `type`.
+ *
+ * FIXED TEXT, NEVER THE ERROR'S MESSAGE. A JSON parse error's message quotes the body it
+ * could not parse (`Unexpected token 'a', "abc" is not valid JSON`), so echoing it would
+ * reflect whatever the client sent, and logging it would copy the client's body into the
+ * log, password fields included.
+ */
+const CLIENT_ERRORS = new Map<string, string>([
+  ['entity.parse.failed', 'malformed JSON body'],
+  ['entity.too.large', 'request body too large'],
+  ['charset.unsupported', 'unsupported charset'],
+  ['encoding.unsupported', 'unsupported content encoding'],
+]);
+
+/**
+ * The status to answer when the error says the CLIENT was at fault, otherwise null.
+ *
+ * Both conditions, as http-errors states them: a 4xx status, and `expose: true`, which is
+ * how a library marks an error whose status it means the client to see. body-parser
+ * raises exactly those for a body it cannot read: 400 for malformed JSON, 413 past the
+ * size limit, 415 for an encoding or charset it does not know. `status` first, then
+ * `statusCode`, the order Express's own final handler reads them in.
+ */
+function clientStatus(err: unknown): number | null {
+  if (typeof err !== 'object' || err === null) return null;
+  const { status, statusCode, expose } = err as { status?: unknown; statusCode?: unknown; expose?: unknown };
+  if (expose !== true) return null;
+  const code = typeof status === 'number' ? status : statusCode;
+  return typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 499 ? code : null;
+}
+
+/**
+ * The error middleware every HTTP service mounts last.
+ *
+ * A REQUEST BODY THE CLIENT GOT WRONG IS THE CLIENT'S FAULT. Each service ended with its
+ * own copy of a handler that mapped every error to 500 and logged it as "unhandled
+ * error", and express.json() runs before any route, so `--data '{'` and a body past its
+ * 100 kB limit answered 500 from all seven services that were measured: Auth's /login,
+ * Event's /events, Ticketing's /reservations, Community's /spaces, Analytics, Search
+ * and Live. The gateway admits bodies up to 1 MB, so any caller could produce a 500, and
+ * an error-rate alert, on demand. Now those answer 400 and 413, with a fixed message,
+ * and are logged at info rather than as a server fault.
+ *
+ * Everything else is unchanged: logged as "unhandled error" with the error, and 500
+ * "internal error". An error that does not say it is the client's — no status, a 5xx,
+ * or a 4xx without `expose` — is treated as ours, because a client error answered as a
+ * 500 is noisy, while a server fault answered as a 400 is hidden.
+ *
+ * Once the headers have gone there is no status left to choose, so the error goes to
+ * Express's default handler, which closes the connection.
+ *
+ * Express 4 identifies an error handler by its ARITY: four parameters. Drop `next` and
+ * this silently becomes ordinary middleware that never runs on error, and every thrown
+ * error turns into a hung request. It must also be mounted AFTER the routes, for the
+ * reason `ah` gives above.
+ */
+export function errorHandler(logger: ErrorLogger): ErrorRequestHandler {
+  return (err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const status = clientStatus(err);
+    if (status !== null) {
+      const type = (err as { type?: unknown }).type;
+      const known = typeof type === 'string' ? CLIENT_ERRORS.get(type) : undefined;
+      logger.info({ status, type: typeof type === 'string' ? type : null, method: req.method }, 'client error');
+      res.status(status).json({ error: known ?? 'bad request' });
+      return;
+    }
+    logger.error({ err }, 'unhandled error');
+    res.status(500).json({ error: 'internal error' });
+  };
+}

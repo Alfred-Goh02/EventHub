@@ -467,6 +467,21 @@ jobs:
       - name: Assert every service boots from its own .env.example
         run: node scripts/verify-env-example.mjs
 
+      # A request body the client got wrong is the client's fault. Every service's
+      # error middleware answered all errors 500, and express.json() runs before
+      # any route, so `--data '{'` and a body past its 100 kB limit both answered
+      # 500 {"error":"internal error"} and were logged as "unhandled error", from
+      # all seven services measured -- and the gateway admits bodies up to 1 MB.
+      # They share one handler now, in @eventhub/http, which answers 400 and 413.
+      #
+      # Boots every service whose source calls express.json(), from its own
+      # .env.example on spare ports it first proves are free, as the step above
+      # does and with the same rule for Kafka: every group is this run's, starts
+      # at the end, and is deleted afterwards. Here because everything it needs is
+      # up and built, and nothing long-running has started yet.
+      - name: Assert a malformed or oversized body answers 4xx from every service
+        run: node scripts/verify-client-errors.mjs
+
       # The check that actually matters: does the COMPILED output boot and serve?
       # Type-checking proves the code is consistent, not that it runs.
       - name: Smoke test the compiled service

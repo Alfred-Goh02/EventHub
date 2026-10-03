@@ -1,6 +1,7 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
+import { errorHandler } from '@eventhub/http';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { events } from './routes/events.js';
@@ -23,13 +24,9 @@ app.get('/whoami', requireAuth, (req, res) => {
 
 app.use('/events', events);
 
-// Express 4 identifies an error handler by its ARITY: four parameters. Drop
-// `_next` and it silently becomes ordinary middleware that never runs on error,
-// and every thrown error turns into a hung request instead of a 500.
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'internal error' });
-});
+// Last, after the routes. A body the client got wrong answers 4xx; everything else
+// is logged and answers 500. See @eventhub/http.
+app.use(errorHandler(logger));
 
 async function main() {
   // Refuse to start rather than run with tenant isolation silently disabled.
