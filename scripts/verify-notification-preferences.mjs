@@ -128,8 +128,21 @@ async function api(path, { method = 'GET', bearer, body, raw } = {}) {
   } catch {
     parsed = null;
   }
-  return { status: res.status, body: parsed, text };
+  return { status: res.status, body: parsed, text, headers: res.headers };
 }
+
+/**
+ * The headers every unsubscribe page must carry: its URL and its form hold a token that
+ * never expires. Which of them a page lacks, or the empty list.
+ */
+const PAGE_HEADERS = {
+  'referrer-policy': (v) => v === 'no-referrer',
+  'cache-control': (v) => /\bno-store\b/.test(v),
+  'content-security-policy': (v) => /frame-ancestors 'none'/.test(v) && /form-action 'self'/.test(v) && /default-src 'none'/.test(v),
+  'x-frame-options': (v) => v === 'DENY',
+  'x-content-type-options': (v) => v === 'nosniff',
+};
+const missingPageHeaders = (res) => Object.entries(PAGE_HEADERS).filter(([name, ok]) => !ok(res.headers.get(name) ?? '')).map(([name]) => name);
 
 async function inTenant(client, tenant, sql, params = []) {
   await client.query('BEGIN');
@@ -229,6 +242,18 @@ async function main() {
     const twice = await api(`/unsubscribe?token=${encodeURIComponent(good)}`, { method: 'POST', raw: 'List-Unsubscribe=One-Click' });
     check(twice.status === 200 && (await rows(TENANT, V)).length === 1, 'and a second POST is still fine, and still one row');
     check((await replyOn(OTHER, V)) === true, 'the same user id in another tenant is untouched');
+
+    // Every page carries the headers a page holding a never-expiring credential needs:
+    // no Referer (the button's own POST sent the token as one), no caching, nothing
+    // loaded, no framing of the one-click button, no sniffing.
+    const invalidPage = await api('/unsubscribe?token=not-a-token');
+    for (const [what, res] of [['the page with the button', shown], ['the page after unsubscribing', oneClick], ['the page for a bad link', invalidPage]]) {
+      const missing = missingPageHeaders(res);
+      check(
+        /text\/html/.test(res.headers.get('content-type') ?? '') && missing.length === 0,
+        `${what} (${res.status}) carries Referrer-Policy, Cache-Control, CSP, X-Frame-Options and nosniff (${missing.length ? `missing or wrong: ${missing.join(', ')}` : 'all'})`,
+      );
+    }
 
     // A genuine body and signature, with another user's id pasted into the body.
     const [, goodBody, goodMac] = good.split('.');

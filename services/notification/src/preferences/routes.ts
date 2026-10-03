@@ -1,4 +1,4 @@
-import { Router, type RequestHandler } from 'express';
+import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
 import { getAuth } from '@eventhub/auth-middleware';
 import { ah } from '@eventhub/http';
@@ -39,6 +39,34 @@ const page = (title: string, body: string) =>
 
 const invalid = page('Unsubscribe', '<h1>This unsubscribe link is not valid</h1><p>It may have been changed or cut short. Use the link from the email again, or change your notification settings after signing in.</p>');
 
+/**
+ * Every page this router sends -- the only HTML any service sends -- with the headers a
+ * page holding a credential needs. The unsubscribe token is in the URL and in the form's
+ * action, and it never expires.
+ *
+ *   Referrer-Policy: no-referrer   the button's own POST sent the page's URL, token and
+ *                                  all, as its Referer, which the gateway's log recorded
+ *                                  until it kept an allowlist of headers; any other
+ *                                  request from the page would send it to somebody else.
+ *   Cache-Control: no-store        no cache between here and the reader keeps it.
+ *   Content-Security-Policy        nothing loads, the form posts only here, no base can
+ *                                  move it, and no other site can frame the one-click
+ *                                  button to trick a reader into pressing it.
+ *   X-Frame-Options: DENY          the same, for browsers that ignore frame-ancestors.
+ *   X-Content-Type-Options         the page is HTML because it says so, not by sniffing.
+ *
+ * The style attribute on <body> is why style-src allows inline styles: it is the page's
+ * only styling, and it carries no data.
+ */
+const PAGE_HEADERS = {
+  'Referrer-Policy': 'no-referrer',
+  'Cache-Control': 'no-store',
+  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+  'X-Frame-Options': 'DENY',
+  'X-Content-Type-Options': 'nosniff',
+};
+const sendPage = (res: Response, status: number, html: string) => res.status(status).set(PAGE_HEADERS).type('html').send(html);
+
 export function preferenceRoutes(opts: { requireAuth: RequestHandler; unsubscribeSecret: string; logger: Logger }): Router {
   const router = Router();
 
@@ -64,9 +92,11 @@ export function preferenceRoutes(opts: { requireAuth: RequestHandler; unsubscrib
   router.get('/unsubscribe', (req, res) => {
     const token = typeof req.query['token'] === 'string' ? req.query['token'] : '';
     const claims = verifyUnsubscribe(opts.unsubscribeSecret, token);
-    if (!claims) return res.status(400).type('html').send(invalid);
+    if (!claims) return sendPage(res, 400, invalid);
     const label = CATEGORIES[claims.category].label.toLowerCase();
-    return res.type('html').send(
+    return sendPage(
+      res,
+      200,
       page(
         'Unsubscribe',
         `<h1>Stop emails about ${escapeHtml(label)}?</h1>` +
@@ -80,12 +110,14 @@ export function preferenceRoutes(opts: { requireAuth: RequestHandler; unsubscrib
   router.post('/unsubscribe', ah(async (req, res) => {
     const token = typeof req.query['token'] === 'string' ? req.query['token'] : '';
     const claims = verifyUnsubscribe(opts.unsubscribeSecret, token);
-    if (!claims) return res.status(400).type('html').send(invalid);
+    if (!claims) return sendPage(res, 400, invalid);
     const changed = await setPreference(claims.tenantId, claims.userId, claims.category, 'EMAIL', false);
     // Logged without the token: it is a credential for exactly this action.
     opts.logger.info({ tenantId: claims.tenantId, userId: claims.userId, category: claims.category, changed }, 'unsubscribed');
     const label = CATEGORIES[claims.category].label.toLowerCase();
-    return res.type('html').send(
+    return sendPage(
+      res,
+      200,
       page('Unsubscribed', `<h1>You are unsubscribed</h1><p>You will not get emails about ${escapeHtml(label)} any more. You can turn them back on in your settings.</p>`),
     );
   }));
