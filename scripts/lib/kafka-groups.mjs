@@ -42,6 +42,55 @@ export async function busyGroups(admin, groupIds, { timeoutMs = 40_000, stepMs =
   }
 }
 
+/**
+ * Commits `groupId` at the current end of each topic, and reads the commit back.
+ *
+ * For a group new to this run whose consumer would otherwise start at the beginning. A
+ * consumer resumes from a committed offset whatever it was told about where to start,
+ * so this is how a verifier starts a service's consumer where the topic ends when the
+ * service has no setting for it, or ignores the one it has for a new group.
+ *
+ * THE EFFECT IS READ BACK, not trusted: the offsets the group holds afterwards must be
+ * exactly the ends that were set, or this throws. A commit that quietly did nothing
+ * would otherwise look the same as one that worked, until the consumer replayed the
+ * topic.
+ *
+ * admin.setOffsets refuses a group with members, so call this before the consumer
+ * starts. It joins the group to seek, which takes about five seconds per topic.
+ *
+ * Resolves to each topic's committed offsets, in partition order.
+ */
+export async function commitAtEnd(admin, groupId, topics) {
+  const set = {};
+  for (const topic of topics) {
+    const ends = (await admin.fetchTopicOffsets(topic)).sort((a, b) => a.partition - b.partition);
+    await admin.setOffsets({ groupId, topic, partitions: ends.map((p) => ({ partition: p.partition, offset: p.high })) });
+    set[topic] = ends.map((p) => String(p.high));
+  }
+  for (const { topic, partitions } of await admin.fetchOffsets({ groupId, topics })) {
+    const read = partitions.sort((a, b) => a.partition - b.partition).map((p) => String(p.offset));
+    if (read.join(',') !== set[topic].join(',')) {
+      throw new Error(`${groupId} was committed at ${set[topic].join(',')} on ${topic}, and reads back ${read.join(',')}`);
+    }
+  }
+  return set;
+}
+
+/** The current members of each group, as memberId to "clientId@host". A group the cluster does not know has none. */
+export async function membersOf(admin, groupIds) {
+  const { groups } = await admin.describeGroups([...new Set(groupIds)]);
+  return new Map(groups.map((g) => [g.groupId, new Map(g.members.map((m) => [m.memberId, `${m.clientId}@${m.clientHost}`]))]));
+}
+
+/** Every member in `now` that was not in `before`, as "group (as clientId@host)". */
+export function joinedSince(before, now) {
+  const joined = [];
+  for (const [groupId, members] of now) {
+    for (const [memberId, who] of members) if (!before.get(groupId)?.has(memberId)) joined.push(`${groupId} (as ${who})`);
+  }
+  return joined.sort();
+}
+
 /** The groups among these that the cluster still lists. An unanswered listing counts all of them as still there. */
 async function listed(admin, groupIds) {
   try {

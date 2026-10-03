@@ -23,8 +23,9 @@
  * Notification to count it before anything real is sent. Every later message has
  * the same key, so the same partition, and the consumer is known to be reading it.
  *
- * Scoped to a tenant, a user and a consumer group created for this run; all of them,
- * the delivery rows and the inbox messages are removed at the end.
+ * Scoped to a tenant, a user and consumer groups created for this run, the contact-card
+ * group among them (scripts/lib/notification-groups.mjs); all of them, the delivery rows
+ * and the inbox messages are removed at the end.
  *
  * Run (with Postgres, Kafka, the Schema Registry and Mailpit up; Auth, the relay and
  * Notification built; both keypairs generated): node scripts/verify-email-delivery.mjs
@@ -41,6 +42,7 @@ import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { CompactEncrypt, SignJWT, calculateJwkThumbprint, exportJWK, importPKCS8, importSPKI } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
 import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -57,6 +59,7 @@ const USER_ID = `user_maildelivery_${RUN}`;
 const EMAIL = `deliver-${RUN}@mailcheck.example`;
 const VICTIM = `victim-${RUN}@mailcheck.example`;
 const GROUP = `verify-email-delivery-${RUN}`;
+const GROUPS = notificationGroups(GROUP);
 const NEW_PASSWORD = `new-password-${RUN}`;
 
 const NOTIFICATION_PORT = 3091;
@@ -77,7 +80,8 @@ const relayEnv = serviceEnv(ROOT, 'relay', {
 });
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(NOTIFICATION_PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
 });
@@ -288,12 +292,16 @@ async function main() {
       [TENANT],
     ).then((r) => r.rows);
 
-  const notification = start('notification', ['dist/index.js'], notificationEnv);
+  // Notification starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let notification = { child: { kill: () => {}, exitCode: null, signalCode: null }, log: () => '' };
   const auth = start('auth', ['dist/index.js'], authEnv);
   const mailIds = new Set();
   const secrets = [];
 
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    notification = start('notification', ['dist/index.js'], notificationEnv);
     console.log('  the fixture');
     await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail delivery ${RUN}`, TENANT_SLUG]);
     await inTenant(authApp, TENANT, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [USER_ID, TENANT, EMAIL]);
@@ -313,6 +321,8 @@ async function main() {
       return groups[0]?.state === 'Stable' && groups[0].members.length > 0;
     }, 60_000, 500);
     check(Boolean(joined), 'CONTROL: its consumer group has joined');
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     const base = await dispatch();
     await produce({ messageId: randomUUID(), expiresAt: new Date(Date.now() - 60_000).toISOString(), sealed: 'canary' });
     const reading = await waitFor(async () => (await dispatch()).expiredSkippedTotal > base.expiredSkippedTotal, 30_000);
@@ -488,7 +498,7 @@ async function main() {
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
     await producer.disconnect().catch(() => {});
     // The group empties once the killed consumer's session times out.
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, GROUPS.all);
     await admin.disconnect().catch(() => {});
     const left = {
       outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,

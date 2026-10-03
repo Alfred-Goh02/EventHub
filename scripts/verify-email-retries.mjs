@@ -42,6 +42,7 @@ import { CompactEncrypt, SignJWT, calculateJwkThumbprint, exportJWK, importPKCS8
 import { serviceEnv } from './lib/service-env.mjs';
 import { createFakeSmtp } from './lib/fake-smtp.mjs';
 import { deleteGroupsWhenEmpty } from './lib/kafka-groups.mjs';
+import { contactsFromTheEnd, notificationGroups } from './lib/notification-groups.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
@@ -56,6 +57,7 @@ const TENANT = `tenant_mailretry_${RUN}`;
 /** Its subdomain, which is how Auth is told the tenant. */
 const TENANT_SLUG = `mailretry-${RUN}`;
 const GROUP = `verify-email-retries-${RUN}`;
+const GROUPS = notificationGroups(GROUP);
 const SMTP_PORT = 3190;
 const NOTIFICATION_PORT = 3191;
 const AUTH_PORT = 3193;
@@ -69,7 +71,8 @@ const relayEnv = serviceEnv(ROOT, 'relay', {
 });
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(NOTIFICATION_PORT),
-  KAFKA_CONSUMER_GROUP: GROUP,
+  // Both of its groups are this run's: see scripts/lib/notification-groups.mjs.
+  ...GROUPS.env,
   DISPATCH_START_FROM: 'latest',
   DISPATCH_RETRY_DELAYS_MS: DELAYS_MS.join(','),
   SMTP_HOST: '127.0.0.1',
@@ -248,10 +251,14 @@ async function main() {
   const deliveryFor = async (messageId) =>
     (await inTenant(notifyApp, `SELECT d.status::text AS status, d.attempts, d."lastError" FROM "NotificationDelivery" d WHERE d."tenantId" = $1 AND d."sourceMessageId" = $2`, [TENANT, messageId])).rows;
 
-  const notification = start('notification', ['dist/index.js'], notificationEnv);
+  // Notification starts inside the try, once its contact-card group is committed, so a
+  // failure there is still cleaned up. Until then this stands in for it.
+  let notification = { child: { kill: () => {}, exitCode: null, signalCode: null }, log: () => '' };
   const auth = start('auth', ['dist/index.js'], authEnv);
 
   try {
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    notification = start('notification', ['dist/index.js'], notificationEnv);
     console.log('  the fixture');
     await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail retries ${RUN}`, TENANT_SLUG]);
     for (const user of Object.values(users)) {
@@ -270,6 +277,8 @@ async function main() {
       return groups.every((g) => g.state === 'Stable' && g.members.length > 0);
     }, 60_000, 500);
     check(Boolean(joined), 'CONTROL: its dispatch and retry consumer groups have both joined');
+    const own = await contacts.joined();
+    check(own.ok, own.message);
     check(
       partitionOf(users.troubled) === partitionOf(users.neighbour),
       `CONTROL: the troubled address's user and its neighbour share partition ${partitionOf(users.troubled)}, so a blocked partition would hold the neighbour up`,
@@ -469,7 +478,7 @@ async function main() {
     await inTenant(notifyOwner, 'DELETE FROM "EmailSuppression" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await inTenant(authApp, 'DELETE FROM "User" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
-    const groupsLeft = await deleteGroupsWhenEmpty(admin, [GROUP, `${GROUP}-retry`, `${GROUP}-replies`, `${GROUP}-replies-retry`, ...scanGroups]);
+    const groupsLeft = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, ...scanGroups]);
     await admin.disconnect().catch(() => {});
     const left = {
       outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
