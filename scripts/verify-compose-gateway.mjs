@@ -201,6 +201,28 @@ async function main() {
     `nothing but the proxy leaves the host's loopback, and the Admin API is published nowhere (${published.join(', ')})`,
   );
 
+  // And nothing ELSE in the stack is published beyond this machine. Every container
+  // compose runs in Kong's project, read from the containers rather than the file: a
+  // service published on every interface lets the LAN past the gateway, where a client
+  // names its own tenant slug, and the databases answer with the passwords in the
+  // compose file.
+  const project = await docker(['inspect', '-f', '{{index .Config.Labels "com.docker.compose.project"}}', KONG_CONTAINER]);
+  const ids = (await docker(['ps', '-q', '--filter', `label=com.docker.compose.project=${project}`])).split('\n').filter(Boolean);
+  const exposed = [];
+  let bindings2 = 0;
+  for (const id of ids) {
+    const [name, portsJson] = (await docker(['inspect', '-f', '{{.Name}}|{{json .NetworkSettings.Ports}}', id])).split('|');
+    for (const [port, binds] of Object.entries(JSON.parse(portsJson) ?? {})) {
+      for (const b of binds ?? []) {
+        bindings2 += 1;
+        const isProxy = name === `/${KONG_CONTAINER}` && port === '8000/tcp';
+        if (b.HostIp !== '127.0.0.1' && !isProxy) exposed.push(`${name.slice(1)} ${port}@${b.HostIp}`);
+      }
+    }
+  }
+  check(ids.length >= 10 && bindings2 >= 10, `CONTROL: read the published ports of ${ids.length} running containers in project ${project} (${bindings2} bindings)`);
+  check(exposed.length === 0, `every other published port in the stack is on 127.0.0.1 (${exposed.join(', ') || 'none beyond it'})`);
+
   // And on the compose network, where every service is a neighbour: the Admin API has
   // no authentication, and POST /config would replace the tenant snippet. Asked from a
   // real service's container; the proxy answering the same neighbour is the control

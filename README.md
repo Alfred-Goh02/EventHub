@@ -278,10 +278,13 @@ quietly acting on acme. Paths are each service's own (`/events`,
 payment webhook and the unsubscribe link carry no tenant and live on
 `api.eventhub.localhost`.
 
-Every service's own port is still published, so the gateway's guarantee covers
-only what comes through it: a client on Auth's port can still name any slug, and,
-since Auth now trusts one proxy hop to tell it the caller's address, its own
-address too.
+Every port in the table below is published on 127.0.0.1 only, for tools and
+verifiers on this machine; from anywhere else the gateway on port 8000 is the one
+way in. On this machine the services' own ports still bypass it: a client on
+Auth's port can name any slug and, since Auth trusts one proxy hop to tell it the
+caller's address, its own address too. Inside the compose network every container
+can still reach every service directly; that isolation is the Kubernetes
+chapters' NetworkPolicy.
 
 Proof that it is working end to end, rather than just listening — sign in as the
 seeded admin, create an event through one service, and read it back out of
