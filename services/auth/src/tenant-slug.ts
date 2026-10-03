@@ -45,3 +45,13 @@ export async function resolveTenantSlug(slug: string): Promise<string | null> {
   cache.set(slug, { tenantId: tenant.id, expiresAt: now + TTL_MS });
   return tenant.id;
 }
+
+/**
+ * The other way round, for a refresh: the refresh token knows its tenant's id, and the
+ * new access token carries the slug. Read every time, so a renamed tenant's next token
+ * carries the new name. Null when the tenant no longer exists.
+ */
+export async function slugOfTenant(tenantId: string): Promise<string | null> {
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId }, select: { slug: true } });
+  return tenant?.slug ?? null;
+}

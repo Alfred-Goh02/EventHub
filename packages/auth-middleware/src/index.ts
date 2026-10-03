@@ -156,6 +156,37 @@ export function createRequireAuth(opts: RequireAuthOptions): RequestHandler {
         return res.status(401).json({ error: 'malformed token' });
       }
 
+      // ONE TENANT'S TOKEN ON ANOTHER TENANT'S SUBDOMAIN. The gateway names the
+      // subdomain a request came in on in X-Tenant-Slug, and the token names its
+      // tenant's. When they disagree, refuse: preferring the token silently would
+      // make an acme session work on globex's pages, which corrupts every cache,
+      // CORS rule and audit trail that assumes a subdomain is one tenant. 403, not
+      // 401: the token is genuine, and signing in again would not change the answer.
+      //
+      // Only when the header is there. It is set by the gateway, not by a client --
+      // a caller that reaches this service directly can send or omit anything, and
+      // the tenant it acts on is still the token's.
+      //
+      // A token with NO slug -- minted before the claim existed, valid for up to the
+      // access-token lifetime -- is refused through the gateway too, but with 401:
+      // one refresh mints a token that has the claim, and clients refresh on 401.
+      // A 403 there would name a cross-tenant problem that is not one, and leave a
+      // client that refreshes only on 401 failing until the old token expired.
+      //
+      // It compares slugs, not ids, so that no service needs a lookup. A slug that is
+      // renamed and then given to another tenant would let the old tenant's tokens
+      // pass on it for their remaining lifetime; nothing renames tenants today, and
+      // row security still confines the data to the token's tenantId.
+      const subdomain = req.header('X-Tenant-Slug');
+      if (subdomain !== undefined) {
+        if (typeof payload['tenantSlug'] !== 'string') {
+          return res.status(401).json({ error: 'token predates tenant subdomains; refresh it' });
+        }
+        if (payload['tenantSlug'] !== subdomain) {
+          return res.status(403).json({ error: "this token is for another tenant's subdomain" });
+        }
+      }
+
       req.auth = {
         userId: payload.sub,
         tenantId: payload.tenantId,

@@ -367,15 +367,16 @@ async function main() {
     }
 
     const mine = await ids('/search?q=jazz');
-    // X-Tenant-Slug too: the gateway sends it on every request, and only Auth reads it.
-    const withHeader = await ids('/search?q=jazz', t1, { 'X-Tenant-ID': T2, 'X-Tenant-Slug': T2 });
+    // X-Tenant-Slug is not ignored: one that disagrees with the token is a 403, the
+    // shared middleware's rule, asserted in verify-token-tenant.mjs.
+    const withHeader = await ids('/search?q=jazz', t1, { 'X-Tenant-ID': T2 });
     check(
       mine.includes(id('fest')) && !mine.includes(id('other')),
       `tenant A's search finds its own events and not B's: [${mine.join(', ')}]`,
     );
     check(
       JSON.stringify(withHeader) === JSON.stringify(mine),
-      'X-Tenant-ID and X-Tenant-Slug naming tenant B change nothing',
+      'X-Tenant-ID naming tenant B changes nothing',
     );
     const theirs = await ids('/search?q=jazz', token(T2));
     check(theirs.length === 1 && theirs[0] === id('other'), `tenant B's token finds [${theirs.join(', ')}]`);

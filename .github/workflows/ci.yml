@@ -748,6 +748,17 @@ jobs:
 
           pkill -f "node dist/index.js" || true
 
+      # A token is for one tenant's subdomain. Auth names it in the token, the gateway
+      # names the subdomain a request came in on, and when they disagree the service
+      # answers 403 instead of quietly acting on the token's tenant. Asserted on the
+      # shared middleware (Event's /whoami) and on Live's handshake, which verifies on
+      # its own -- and which, before this, took a genuine signature for ANY audience or
+      # issuer, and would start on an Origin suffix with no leading dot (`localhost`
+      # admitted `evillocalhost`). Starts its own Event and Live, from their
+      # .env.example.
+      - name: Assert a token is honoured only on its own tenant's subdomain
+        run: node scripts/verify-token-tenant.mjs
+
       # CHAPTER 6'S ISOLATION CLAIM: every tenant's events share ONE index, and
       # a tenant's search still cannot return another tenant's documents.
       #

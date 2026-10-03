@@ -213,6 +213,14 @@ async function main() {
   }
 
   const appImage = await docker(['inspect', '-f', '{{.Config.Image}}', NEIGHBOUR]);
+
+  // A recreated service can come back on another service's old address. Kong caches a
+  // name for as long as Docker's DNS says, and kept proxying /events to what had
+  // become Live, 502 for over 100 s until Kong was restarted. A short override makes
+  // it follow within seconds. Read from the running node, not the compose file.
+  const node = await admin(appImage, '/');
+  const ttl = node?.configuration?.dns_valid_ttl;
+  check(typeof ttl === 'number' && ttl > 0 && ttl <= 10, `Kong re-resolves service names within 10 s, whatever TTL Docker gives them (dns_valid_ttl ${ttl ?? 'unset'})`);
   const services = await listAll(appImage, '/services');
   const routes = await listAll(appImage, '/routes');
   const plugins = await listAll(appImage, '/plugins');
@@ -251,7 +259,7 @@ async function main() {
     });
     const token = res.json?.accessToken;
     const claims = token ? JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')) : null;
-    return { status: res.status, tenant: claims?.tenantId ?? null };
+    return { status: res.status, tenant: claims?.tenantId ?? null, token: token ?? null };
   };
   const asAcme = await signIn(TENANT_HOST);
   check(asAcme.status === 200 && asAcme.tenant === 'tenant_acme', `CONTROL: signing in at ${TENANT_HOST} is a token for tenant_acme (${asAcme.status}, ${asAcme.tenant})`);
@@ -264,6 +272,14 @@ async function main() {
   );
   const nowhere = await signIn('no-such-tenant.eventhub.localhost');
   check(nowhere.status === 401 && nowhere.tenant === null, `a subdomain with no tenant behind it signs in nowhere (${nowhere.status})`);
+
+  // And a token is honoured only on its own tenant's subdomain: the real Event, through
+  // the real gateway, with the token the gateway's sign-in just issued.
+  const bearer = { authorization: `Bearer ${asAcme.token}` };
+  const onOwn = await send(PROXY, '/events', { host: TENANT_HOST, headers: bearer });
+  check(onOwn.status === 200, `CONTROL: acme's token lists events on ${TENANT_HOST} (${onOwn.status})`);
+  const onOther = await send(PROXY, '/events', { host: 'globex.eventhub.localhost', headers: bearer });
+  check(onOther.status === 403, `acme's token on globex.eventhub.localhost is refused with 403 (${onOther.status} ${onOther.text.slice(0, 80)})`);
 
   // Behind the gateway, Auth must still tell one client from another. Its login budget
   // that refuses a guesser is keyed on (tenant, email, ADDRESS) precisely so that

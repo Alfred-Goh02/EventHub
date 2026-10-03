@@ -13,9 +13,23 @@ const ALG = 'RS256';
  */
 const publicKey = await publicKeyFromEnv();
 
+/**
+ * Enforced here as the middleware enforces them. They were not: this check took any
+ * token Auth's key had signed with the right shape, and Auth signs more than access
+ * tokens with that key. Only the missing role claim kept a sealed email request from
+ * passing for one; the audience is what is meant to.
+ */
+const issuer = process.env['JWT_ISSUER'];
+const audience = process.env['JWT_AUDIENCE'];
+if (!issuer || !audience) {
+  throw new Error('JWT_ISSUER and JWT_AUDIENCE are required');
+}
+
 export interface SocketClaims {
   userId: string;
   tenantId: string;
+  /** The subdomain the token's tenant is served on; null on a token minted before the claim. */
+  tenantSlug: string | null;
   role: Role;
   /** Seconds since epoch. The socket schedules its own close from this. */
   exp: number;
@@ -41,7 +55,7 @@ export interface SocketClaims {
  * PUBLIC key as the shared secret — and the public key is, by definition, public.
  */
 export async function verifyAccessToken(token: string): Promise<SocketClaims> {
-  const { payload } = await jwtVerify(token, publicKey, { algorithms: [ALG] });
+  const { payload } = await jwtVerify(token, publicKey, { algorithms: [ALG], issuer, audience });
 
   // The signature proves the token is ours and unaltered. It says nothing about
   // the payload having the shape this code expects: a token minted before
@@ -58,6 +72,7 @@ export async function verifyAccessToken(token: string): Promise<SocketClaims> {
   return {
     userId: payload.sub,
     tenantId: payload.tenantId,
+    tenantSlug: typeof payload['tenantSlug'] === 'string' ? payload['tenantSlug'] : null,
     role: payload.role,
     exp: payload.exp,
   };
