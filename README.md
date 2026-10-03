@@ -284,9 +284,12 @@ receives and the response carries. On every route where each path needs a token
 checks the token's signature and expiry with Auth's public key before the service
 sees it; the services still verify everything themselves, audience included. CORS is answered for tenant subdomains only
 (`https` in production; any port on `*.eventhub.localhost`). Bodies over 1 MB are
-refused. Each client address gets 600 requests a minute, 120 on `/auth`, counted
-in Redis so every Kong node shares one count. Each request is logged as one JSON
-line with its `Authorization`, cookies and query string removed.
+refused, chunked or not. Each client address gets 600 requests a minute, 120 on
+`/auth`, counted in Redis so every Kong node shares one count; on a route with a
+signature check the count starts after it, so a request without a valid token is
+refused with 401 and not counted. Each request is logged as one JSON line that
+keeps an allowlist of headers and no query string, so no token, cookie or
+`Authorization` reaches the log.
 
 Every port in the table below is published on 127.0.0.1 only, for tools and
 verifiers on this machine; from anywhere else the gateway on port 8000 is the one

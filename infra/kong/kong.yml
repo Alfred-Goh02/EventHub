@@ -171,8 +171,10 @@ plugins:
       credentials: true
       max_age: 600
 
-  # A ceiling on what nginx will buffer for a service: no request body here is near a
-  # megabyte, and each service's own JSON parser refuses far smaller ones.
+  # A ceiling on a request body: none here is near a megabyte, and each service's own
+  # JSON parser refuses far smaller ones. This plugin decides on Content-Length; a
+  # CHUNKED body it reads whole, to disk, before measuring -- so nginx's own limit
+  # (KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE in docker-compose.yml) is what bounds one.
   - name: request-size-limiting
     config:
       allowed_payload_size: 1
@@ -189,6 +191,15 @@ plugins:
   # "The client address" is what reaches Kong. Behind a load balancer that is the
   # balancer, for everyone, until KONG_TRUSTED_IPS and KONG_REAL_IP_HEADER name it --
   # the lesson Auth's TRUST_PROXY already taught.
+  #
+  # It counts AFTER the signature check. Kong runs plugins by priority, jwt before
+  # rate-limiting, and Kong OSS cannot reorder them: on a route with a signature check,
+  # a request without a valid token is refused with 401 and never counted. Those cost
+  # Kong one signature check and a log line each, and no service anything.
+  #
+  # With Redis down every request also writes an error line, and nginx appends the
+  # request line to it -- an unsubscribe token included. That lasts as long as the
+  # outage.
   - name: rate-limiting
     config: &rate-limit
       minute: 600
@@ -243,20 +254,26 @@ plugins:
     route: community
     config: *edge-jwt
 
-  # One JSON line per request, with the credentials taken out. The nginx access log is
-  # off (docker-compose.yml): it writes the request line whole, and an unsubscribe link
-  # carries its token in the query string. Fields set to nil are removed.
+  # One JSON line per request, with nothing in it that grants access. The nginx access
+  # log is off (docker-compose.yml): it writes the request line whole, and an
+  # unsubscribe link carries its token in the query string.
+  #
+  # HEADERS ARE AN ALLOWLIST. A list of headers to remove missed two that carry
+  # credentials -- Sec-WebSocket-Protocol holds Live's bearer token, and the Referer of
+  # the unsubscribe page's own button holds its token -- and would miss the next one.
+  # Only the headers below are logged, on both sides. The query string is dropped, the
+  # URI and URL are rebuilt from the path, and the upstream URI goes. A field set to nil
+  # is removed.
   - name: file-log
     config:
       path: /dev/stdout
       custom_fields_by_lua:
-        request.headers.authorization: "return nil"
-        request.headers.cookie: "return nil"
+        request.headers: "local h = kong.request.get_headers() return { host = h['host'], ['user-agent'] = h['user-agent'], ['content-type'] = h['content-type'], ['content-length'] = h['content-length'], origin = h['origin'], ['x-request-id'] = h['x-request-id'] }"
+        response.headers: "local h = kong.response.get_headers() return { ['content-type'] = h['content-type'], ['content-length'] = h['content-length'], ['x-request-id'] = h['x-request-id'] }"
         request.querystring: "return nil"
         request.uri: "return kong.request.get_path()"
         upstream_uri: "return nil"
         request.url: "return kong.request.get_scheme() .. '://' .. kong.request.get_host() .. ':' .. kong.request.get_port() .. kong.request.get_path()"
-        response.headers.set-cookie: "return nil"
 
   # THE TENANT HEADERS. Security critical: shared-schema tenancy holds only if no
   # client can say which tenant it is. Global, so that a route added later cannot

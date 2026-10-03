@@ -1088,6 +1088,10 @@ services:
       # to Event's old one, which was now Live's, and answered 502 for as long as it
       # was measured (over 100 s) until Kong itself was restarted.
       KONG_DNS_VALID_TTL: "5"
+      # nginx's own body limit, unlimited by default. The request-size-limiting plugin
+      # reads a chunked body to disk before measuring it; this refuses one as it
+      # arrives.
+      KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE: 1m
     volumes:
       - ./infra/kong:/kong/declarative:ro
       - jwt-public:/run/eventhub/keys:ro
