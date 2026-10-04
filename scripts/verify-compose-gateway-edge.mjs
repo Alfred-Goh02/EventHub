@@ -75,7 +75,18 @@ async function vmNow() {
   return seconds * 1000 + Math.floor(micros / 1000);
 }
 
-/** Streams a chunked body through the gateway; the status, and how much had been written when it answered. */
+/**
+ * Streams a chunked body through the gateway; the status, and how much had been written
+ * when it answered.
+ *
+ * PACED, one chunk per timer tick. Once nginx has refused, it keeps reading and
+ * discarding the body until it closes, so the socket drains as fast as it is filled, and
+ * a tight write loop on a fast runner's loopback kept the event loop from delivering the
+ * 413 it had already received: measured in CI, "413 after 44.2 MiB" against 2.6 MiB on
+ * the machine this was written on. Pacing gives the answer a turn between chunks. It
+ * does not blur the red: without nginx's limit the plugin answers only after the whole
+ * body, however slowly it arrives.
+ */
 function streamUntilAnswered(path, total) {
   const chunk = Buffer.alloc(64 * 1024, 120);
   return new Promise((done) => {
@@ -98,11 +109,11 @@ function streamUntilAnswered(path, total) {
     );
     req.on('error', (err) => !answered && finish({ error: err.code ?? err.message }));
     (function pump() {
-      while (written < total && !answered) {
-        written += chunk.length;
-        if (!req.write(chunk)) return req.once('drain', pump);
-      }
-      if (!answered) req.end();
+      if (answered) return;
+      if (written >= total) return req.end();
+      written += chunk.length;
+      if (req.write(chunk)) setTimeout(pump, 1);
+      else req.once('drain', () => setTimeout(pump, 1));
     })();
   });
 }
