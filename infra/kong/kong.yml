@@ -65,7 +65,8 @@ services:
     routes:
       - name: ticketing
         hosts: *tenant-hosts
-        paths: ["/reservations"]
+        # /ticket-types, not /events/:id/ticket-types: /events is the Event service's.
+        paths: ["/reservations", "/ticket-types"]
         strip_path: false
       # A payment provider's webhook carries no tenant: Ticketing resolves it from the
       # payment itself, on a credential that reads one column across tenants.

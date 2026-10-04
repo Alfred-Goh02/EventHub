@@ -1,0 +1,13 @@
+-- The inventory editor's own version of a ticket type.
+--
+-- "version" already exists, and every buyer path bumps it: a reservation, the sweeper
+-- returning an expired hold, a payment settling. An editor's If-Match on "version"
+-- would therefore answer "changed while you were editing" whenever a ticket sold in
+-- the meantime -- which, during a sale, is always. "revision" moves only when an
+-- organiser changes what the ticket type IS (its name, price or total), so two
+-- organisers' edits conflict and a buyer's purchase does not.
+--
+-- A new column with a default: no rows are read or written, so row security has
+-- nothing to hide. The app role's grant on "TicketType" is table-wide and covers it;
+-- the sweeper's column grants do not need it.
+ALTER TABLE "TicketType" ADD COLUMN "revision" INTEGER NOT NULL DEFAULT 1;

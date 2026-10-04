@@ -1569,6 +1569,18 @@ jobs:
           node scripts/verify-pool-resilience.mjs
           pkill -f "node dist/index.js" || true
 
+      # The inventory editor. Nothing created a ticket type before it -- every
+      # reservation verifier above inserts its own -- so through the API nobody could
+      # put a ticket on sale or buy one. Asserts who may create (the event's
+      # organiser, an admin), what may not (past the capacity, a duplicate name, a
+      # cancelled or deleted event), eight concurrent creates with room for three
+      # (exactly three succeed: every write locks the event first), who sees a
+      # draft's tickets, optimistic edits on `revision` that a sale does not make
+      # stale, and a reservation of an API-made type. Starts its own Ticketing on a
+      # consumer group of its own.
+      - name: Assert an organiser can put tickets on sale, within capacity, and edit them
+        run: node scripts/verify-ticket-types.mjs
+
       # The cross-service assertion, and the one that would have caught the
       # defect the Chapter 4 design review found: only /publish emitted an
       # outbox row, so Ticketing's projection was stale by construction for
