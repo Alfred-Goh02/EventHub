@@ -27,7 +27,7 @@ x-app: &app
     # and then fail to resolve a name that means nothing here.
     KAFKA_BROKERS: kafka:29092
     SCHEMA_REGISTRY_URL: http://schema-registry:8081
-    JWT_ISSUER: https://auth.eventhub.local
+    JWT_ISSUER: &jwt-issuer https://auth.eventhub.local
     JWT_AUDIENCE: eventhub-api
 
 # EVERY SERVICE SETS stop_grace_period. None is left to the default, because the
@@ -1051,20 +1051,36 @@ services:
     container_name: eventhub-kong
     restart: unless-stopped
     stop_grace_period: 15s
+    # Auth's public key exists once setup has run, and Kong verifies tokens with it.
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    # kong.yml plus the consumer holding that key, rendered to /tmp before Kong starts;
+    # render-consumer.lua says why, and stops the start if anything is missing. The
+    # image's entrypoint runs this and then the usual start.
+    command: ["sh", "-c", "resty /kong/declarative/render-consumer.lua && exec /docker-entrypoint.sh kong docker-start"]
     environment:
       KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_DECLARATIVE_CONFIG: /tmp/kong.yml
+      AUTH_PUBLIC_KEY_FILE: /run/eventhub/keys/public.pem
+      JWT_ISSUER: *jwt-issuer
       KONG_PROXY_LISTEN: 0.0.0.0:8000
       KONG_ADMIN_LISTEN: 127.0.0.1:8001
       KONG_ADMIN_GUI_LISTEN: "off"
       # Inside the container, so the port mapping below can reach it; published to
       # 127.0.0.1 only.
       KONG_STATUS_LISTEN: 0.0.0.0:8100
-      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      # Off: nginx writes the request line whole, query string included, and an
+      # unsubscribe link carries its token there. The file-log plugin in kong.yml
+      # writes one JSON line per request with the credentials taken out.
+      KONG_PROXY_ACCESS_LOG: "off"
       KONG_PROXY_ERROR_LOG: /dev/stderr
       KONG_ADMIN_ACCESS_LOG: /dev/stdout
       KONG_ADMIN_ERROR_LOG: /dev/stderr
-      KONG_LOG_LEVEL: info
+      # notice, Kong's default. At info, nginx's error log wrote routine lines with the
+      # request line as context -- the unsubscribe token included. An error still
+      # carries the request line; nginx always adds it.
+      KONG_LOG_LEVEL: notice
       # The default, written down: the tenant snippet runs in Kong's Lua sandbox.
       KONG_UNTRUSTED_LUA: sandbox
       # Re-resolve service names every 5 s, whatever TTL Docker's DNS gives them.
@@ -1072,8 +1088,13 @@ services:
       # to Event's old one, which was now Live's, and answered 502 for as long as it
       # was measured (over 100 s) until Kong itself was restarted.
       KONG_DNS_VALID_TTL: "5"
+      # nginx's own body limit, unlimited by default. The request-size-limiting plugin
+      # reads a chunked body to disk before measuring it; this refuses one as it
+      # arrives.
+      KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE: 1m
     volumes:
       - ./infra/kong:/kong/declarative:ro
+      - jwt-public:/run/eventhub/keys:ro
     ports:
       - "8000:8000"
       - "127.0.0.1:8100:8100"

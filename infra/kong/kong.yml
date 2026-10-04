@@ -145,6 +145,136 @@ services:
         strip_path: false
 
 plugins:
+  # A REQUEST ID on every request, passed to the service and echoed to the client, so
+  # a reported failure can be found in this log. A client that sends one keeps it: it
+  # is for correlation, not for trust.
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid
+      echo_downstream: true
+
+  # CORS, for a web app served from a tenant's own subdomain on another port while it
+  # is developed, or a tenant's subdomain calling the API. Kong anchors each pattern
+  # at both ends, so acme.eventhub.com.attacker.net does not match. A pattern with a
+  # colon is matched against scheme://host:port, so production is https only.
+  # Credentials are allowed: the origins are ours. A preflight is answered here and
+  # never reaches a service.
+  - name: cors
+    config:
+      origins:
+        - 'https://[a-z0-9][a-z0-9-]*\.eventhub\.com'
+        - 'http://[a-z0-9][a-z0-9-]*\.eventhub\.localhost(:[0-9]+)?'
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type, Idempotency-Key, X-Request-ID]
+      exposed_headers: [X-Request-ID, Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset]
+      credentials: true
+      max_age: 600
+
+  # A ceiling on a request body: none here is near a megabyte, and each service's own
+  # JSON parser refuses far smaller ones. This plugin decides on Content-Length; a
+  # CHUNKED body it reads whole, to disk, before measuring -- so nginx's own limit
+  # (KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE in docker-compose.yml) is what bounds one.
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 1
+      size_unit: megabytes
+
+  # A COARSE LIMIT PER CLIENT ADDRESS, counted in Redis so that every Kong node shares
+  # one count (decided 2026-09-28). Nodes loading this file give its entities the same
+  # ids, so their counters have the same keys. Coarse on purpose: the services keep
+  # the limits that know what a login or a post is.
+  #
+  # Fault tolerant: if Redis cannot be reached, requests pass and only this limit is
+  # lost, rather than the whole API answering 500.
+  #
+  # "The client address" is what reaches Kong. Behind a load balancer that is the
+  # balancer, for everyone, until KONG_TRUSTED_IPS and KONG_REAL_IP_HEADER name it --
+  # the lesson Auth's TRUST_PROXY already taught.
+  #
+  # It counts AFTER the signature check. Kong runs plugins by priority, jwt before
+  # rate-limiting, and Kong OSS cannot reorder them: on a route with a signature check,
+  # a request without a valid token is refused with 401 and never counted. Those cost
+  # Kong one signature check and a log line each, and no service anything.
+  #
+  # With Redis down every request also writes an error line, and nginx appends the
+  # request line to it -- an unsubscribe token included. That lasts as long as the
+  # outage.
+  - name: rate-limiting
+    config: &rate-limit
+      minute: 600
+      limit_by: ip
+      policy: redis
+      redis:
+        host: redis
+        port: 6379
+        database: 1
+        timeout: 2000
+      fault_tolerant: true
+  # Tighter on everything Auth answers: sign-in, registration, refresh, reset.
+  - name: rate-limiting
+    route: auth
+    config:
+      <<: *rate-limit
+      minute: 120
+
+  # SIGNATURES, CHECKED AT THE EDGE, so a forged, expired or garbage token never costs a
+  # service a request. Only on routes where every path needs a token: not Auth's
+  # (sign-in, registration and reset need none), not Live's (its token rides in the
+  # WebSocket subprotocol, which this plugin cannot read), and not the two tenantless
+  # routes. The services still verify everything themselves -- audience included,
+  # which this plugin does not check -- so this only ever refuses earlier.
+  #
+  # The key is found by the token's `iss`, in the one consumer render-consumer.lua adds
+  # at start with Auth's public key. Tokens are read from Authorization only: none from
+  # a cookie or the query string, where they would be logged. A preflight passes, and
+  # CORS answers it.
+  - name: jwt
+    route: event
+    config: &edge-jwt
+      key_claim_name: iss
+      claims_to_verify: [exp]
+      header_names: [authorization]
+      uri_param_names: []
+      cookie_names: []
+      run_on_preflight: false
+  - name: jwt
+    route: ticketing
+    config: *edge-jwt
+  - name: jwt
+    route: search
+    config: *edge-jwt
+  - name: jwt
+    route: analytics
+    config: *edge-jwt
+  - name: jwt
+    route: notification
+    config: *edge-jwt
+  - name: jwt
+    route: community
+    config: *edge-jwt
+
+  # One JSON line per request, with nothing in it that grants access. The nginx access
+  # log is off (docker-compose.yml): it writes the request line whole, and an
+  # unsubscribe link carries its token in the query string.
+  #
+  # HEADERS ARE AN ALLOWLIST. A list of headers to remove missed two that carry
+  # credentials -- Sec-WebSocket-Protocol holds Live's bearer token, and the Referer of
+  # the unsubscribe page's own button holds its token -- and would miss the next one.
+  # Only the headers below are logged, on both sides. The query string is dropped, the
+  # URI and URL are rebuilt from the path, and the upstream URI goes. A field set to nil
+  # is removed.
+  - name: file-log
+    config:
+      path: /dev/stdout
+      custom_fields_by_lua:
+        request.headers: "local h = kong.request.get_headers() return { host = h['host'], ['user-agent'] = h['user-agent'], ['content-type'] = h['content-type'], ['content-length'] = h['content-length'], origin = h['origin'], ['x-request-id'] = h['x-request-id'] }"
+        response.headers: "local h = kong.response.get_headers() return { ['content-type'] = h['content-type'], ['content-length'] = h['content-length'], ['x-request-id'] = h['x-request-id'] }"
+        request.querystring: "return nil"
+        request.uri: "return kong.request.get_path()"
+        upstream_uri: "return nil"
+        request.url: "return kong.request.get_scheme() .. '://' .. kong.request.get_host() .. ':' .. kong.request.get_port() .. kong.request.get_path()"
+
   # THE TENANT HEADERS. Security critical: shared-schema tenancy holds only if no
   # client can say which tenant it is. Global, so that a route added later cannot
   # forget it; a route with no tenant opts out of the SUBDOMAIN rule — never out of the
