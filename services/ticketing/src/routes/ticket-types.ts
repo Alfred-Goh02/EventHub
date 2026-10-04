@@ -46,15 +46,24 @@ export const ticketTypes: Router = Router();
 const MAX_PRICE_CENTS = 10_000_000; // 100,000.00 in the event's currency
 const MAX_TOTAL = 1_000_000;
 
+/**
+ * Text Postgres can store as written. A NUL is refused by Postgres itself, as a 500; a
+ * lone surrogate is stored as U+FFFD by the driver, so two different names could become
+ * the same one after the duplicate check passed. Refused here, before either.
+ */
+const storable = (s: string) => s.isWellFormed() && !s.includes('\u0000');
 const name = z
   .string()
   .trim()
   .min(1, 'a name is required')
-  .max(100, 'a name is at most 100 characters');
+  .max(100, 'a name is at most 100 characters')
+  .refine(storable, 'a name must be well-formed text');
+/** Event and ticket type ids: what this system issues, and nothing a database refuses. */
+const ID = /^[A-Za-z0-9_-]{1,64}$/;
 const priceCents = z.number().int('priceCents is a whole number of cents').min(0).max(MAX_PRICE_CENTS);
 const total = z.number().int('total is a whole number').min(1).max(MAX_TOTAL);
 
-const createBody = z.object({ eventId: z.string().min(1), name, priceCents, total }).strict();
+const createBody = z.object({ eventId: z.string().regex(ID, 'eventId is not an event id'), name, priceCents, total }).strict();
 const patchBody = z
   .object({ name: name.optional(), priceCents: priceCents.optional(), total: total.optional() })
   .strict()
@@ -95,10 +104,11 @@ interface LockedEvent {
  * a colleague's event exists is not theirs to learn either.
  */
 async function lockManagedEvent(tx: Prisma.TransactionClient, eventId: string, auth: { userId: string; role: string }): Promise<LockedEvent> {
-  // NO KEY UPDATE, not UPDATE: editors of one event still queue behind each other, but a
-  // buyer's foreign-key check takes a KEY SHARE lock on this row, which FOR UPDATE would
-  // block and this does not. Both take this row before any ticket type's, so the two
-  // cannot wait on each other in a cycle.
+  // NO KEY UPDATE, not UPDATE: editors of one event still queue behind each other, and
+  // this is the weakest lock that does that; a buyer's foreign-key check takes KEY SHARE
+  // on this row, which FOR UPDATE would also block. (Not separately asserted: an editor's
+  // transaction is too short for a buyer to notice either way.) Both take this row
+  // before any ticket type's, so the two cannot wait on each other in a cycle.
   const rows = await tx.$queryRaw<LockedEvent[]>`
     SELECT status, deleted, capacity, "organiserId"
       FROM "EventProjection"
@@ -150,7 +160,7 @@ ticketTypes.post('/', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(async (
 
 ticketTypes.get('/', requireAuth, ah(async (req, res) => {
   const eventId = typeof req.query['eventId'] === 'string' ? req.query['eventId'] : '';
-  if (!eventId) return res.status(400).json({ error: 'eventId is required' });
+  if (!ID.test(eventId)) return res.status(400).json({ error: 'eventId is required, and is an event id' });
   const auth = getAuth(req);
   const found = await withTenantRetry(auth.tenantId, async (tx) => {
     const event = await tx.eventProjection.findFirst({ where: { id: eventId }, select: { status: true, deleted: true, organiserId: true } });
@@ -171,6 +181,7 @@ ticketTypes.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(asy
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
   const auth = getAuth(req);
   const id = req.params['id']!;
+  if (!ID.test(id)) return res.status(404).json({ error: 'no such ticket type' });
   try {
     const updated = await withTenantRetry(auth.tenantId, async (tx) => {
       const current = await tx.ticketType.findFirst({ where: { id }, select: { eventId: true } });
@@ -185,7 +196,11 @@ ticketTypes.patch('/:id', requireAuth, requireRole('ORGANIZER', 'ADMIN'), ah(asy
       if (parsed.data.name !== undefined && others.names.has(next.name.toLocaleLowerCase('en'))) {
         throw new Refusal(409, { error: `this event already has a ticket type called "${next.name}"` });
       }
-      if (others.totals + next.total > event.capacity) {
+      // Only an edit that ADDS tickets is held to the capacity. An event can already be
+      // over it -- Event lets a draft's capacity be lowered after its tickets were set
+      // up, and reservations then refuse to sell -- and the organiser must still be able
+      // to reduce a total, or change a price or a name, to put it right.
+      if (next.total > row.total && others.totals + next.total > event.capacity) {
         throw new Refusal(409, { error: `the event's capacity is ${event.capacity}, and ${others.totals} are already in other ticket types`, capacity: event.capacity, allocated: others.totals });
       }
       // One statement, conditional on what it relies on: the revision, and a total that

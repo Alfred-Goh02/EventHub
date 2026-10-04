@@ -53,6 +53,9 @@ const EVENTS = {
   draft: `evt_tt_draft_${RUN}`, // draft, OWNER's
   cancelled: `evt_tt_cancelled_${RUN}`,
   deleted: `evt_tt_deleted_${RUN}`,
+  shrunk: `evt_tt_shrunk_${RUN}`, // draft, capacity 100, lowered to 20 after its tickets exist
+  edits: `evt_tt_edits_${RUN}`, // published, capacity 100: two edits race
+  priced: `evt_tt_priced_${RUN}`, // published: a price edit races a reservation
 };
 
 const env = serviceEnv(ROOT, 'ticketing', {
@@ -141,6 +144,9 @@ async function main() {
         [EVENTS.draft, 'DRAFT', 50, false],
         [EVENTS.cancelled, 'CANCELLED', 50, false],
         [EVENTS.deleted, 'PUBLISHED', 50, true],
+        [EVENTS.shrunk, 'DRAFT', 100, false],
+        [EVENTS.edits, 'PUBLISHED', 100, false],
+        [EVENTS.priced, 'PUBLISHED', 10, false],
       ];
       for (const [id, status, capacity, deleted] of rows) {
         await db.query(
@@ -275,6 +281,74 @@ async function main() {
     const counts = await inTenant(db, TENANT, () => db.query(`SELECT total, remaining, held, sold FROM "TicketType" WHERE id = $1`, [id]));
     const c = counts.rows[0];
     check(c && c.remaining + c.held + c.sold === c.total, `and the counts still add up (${c?.remaining} + ${c?.held} + ${c?.sold} = ${c?.total})`);
+
+    console.log('');
+    console.log("  a draft's capacity lowered after its tickets were set up");
+    // Event lets a draft's capacity change; the projection then carries it. Made here
+    // the way the projection consumer would, then the event is published.
+    const half = await create(AS.owner, { eventId: EVENTS.shrunk, name: 'Half A', priceCents: 1000, total: 50 });
+    const otherHalf = await create(AS.owner, { eventId: EVENTS.shrunk, name: 'Half B', priceCents: 1000, total: 50 });
+    check(half.status === 201 && otherHalf.status === 201, `CONTROL: 50 + 50 on a draft of capacity 100 (${half.status}, ${otherHalf.status})`);
+    await inTenant(db, TENANT, () => db.query(`UPDATE "EventProjection" SET capacity = 20, status = 'PUBLISHED', "sourceVersion" = "sourceVersion" + 1 WHERE id = $1`, [EVENTS.shrunk]));
+    const reserveShrunk = (key) => api('POST', '/reservations', { as: AS.attendee, headers: { 'Idempotency-Key': `tt-${RUN}-${key}` }, body: { eventId: EVENTS.shrunk, items: [{ ticketTypeId: half.json?.id, quantity: 1 }] } });
+    const overSold = await reserveShrunk('shrunk-1');
+    check(overSold.status === 409 && overSold.json?.capacity === 20 && overSold.json?.allocated === 100, `with 100 tickets on a capacity of 20, nothing is sold (${overSold.status} ${overSold.text.slice(0, 90)})`);
+    const shrunkPatch = (tt, body, rev) => api('PATCH', `/ticket-types/${tt}`, { as: AS.owner, body, headers: { 'If-Match': String(rev) } });
+    const priceOnly = await shrunkPatch(half.json?.id, { priceCents: 1200 }, 1);
+    check(priceOnly.status === 200, `the organiser can still change a price, which adds no tickets (${priceOnly.status} ${priceOnly.text.slice(0, 80)})`);
+    const grow = await shrunkPatch(half.json?.id, { total: 51 }, 2);
+    check(grow.status === 409, `but cannot add tickets (${grow.status})`);
+    const reduceA = await shrunkPatch(half.json?.id, { total: 1 }, 2);
+    const reduceB = await shrunkPatch(otherHalf.json?.id, { total: 19 }, 1);
+    check(reduceA.status === 200 && reduceB.status === 200, `and can reduce them, even while still over (${reduceA.status}, ${reduceB.status})`);
+    const repaired = await reserveShrunk('shrunk-2');
+    check(repaired.status === 201, `at 1 + 19 = 20, it sells again (${repaired.status} ${repaired.text.slice(0, 60)})`);
+
+    console.log('');
+    console.log('  two edits at once, room for one');
+    const ea = await create(AS.owner, { eventId: EVENTS.edits, name: 'Edit A', priceCents: 100, total: 30 });
+    const eb = await create(AS.owner, { eventId: EVENTS.edits, name: 'Edit B', priceCents: 100, total: 30 });
+    const raced = await Promise.all([
+      api('PATCH', `/ticket-types/${ea.json?.id}`, { as: AS.owner, body: { total: 70 }, headers: { 'If-Match': '1' } }),
+      api('PATCH', `/ticket-types/${eb.json?.id}`, { as: AS.owner, body: { total: 70 }, headers: { 'If-Match': '1' } }),
+    ]);
+    const editTotals = await inTenant(db, TENANT, () => db.query(`SELECT coalesce(sum(total), 0)::int AS total FROM "TicketType" WHERE "eventId" = $1`, [EVENTS.edits]));
+    check(
+      raced.filter((r) => r.status === 200).length === 1 && raced.filter((r) => r.status === 409).length === 1 && editTotals.rows[0].total === 100,
+      `each fits alone, together they do not: one 200, one 409, 100 of 100 allocated (${raced.map((r) => r.status).join(', ')}; ${editTotals.rows[0].total})`,
+    );
+
+    console.log('');
+    console.log('  a price edit that lands while a reservation waits for the row');
+    const pt = await create(AS.owner, { eventId: EVENTS.priced, name: 'Priced', priceCents: 2500, total: 5 });
+    // An editor's write, held open: it changes the price and keeps the row locked. The
+    // reservation reads the old price without a lock, then waits on this one.
+    const editor = new pg.Client({ connectionString: env.APP_DATABASE_URL });
+    await editor.connect();
+    await editor.query('BEGIN');
+    await editor.query(`SELECT set_config('app.tenant_id', $1, true)`, [TENANT]);
+    await editor.query(`UPDATE "TicketType" SET "priceCents" = 9999, revision = revision + 1, version = version + 1 WHERE id = $1`, [pt.json?.id]);
+    const waiting = api('POST', '/reservations', { as: AS.attendee, headers: { 'Idempotency-Key': `tt-${RUN}-priced` }, body: { eventId: EVENTS.priced, items: [{ ticketTypeId: pt.json?.id, quantity: 1 }] } });
+    await sleep(1_000);
+    await editor.query('COMMIT');
+    await editor.end();
+    const pricedHold = await waiting;
+    const pricedItem = await inTenant(db, TENANT, () => db.query(`SELECT "unitPriceCents" FROM "ReservationItem" WHERE "ticketTypeId" = $1`, [pt.json?.id]));
+    check(
+      pricedHold.status === 201 && pricedItem.rows[0]?.unitPriceCents === 9999,
+      `the hold, committed after the price changed, is at the new price (${pricedHold.status}; ${pricedItem.rows[0]?.unitPriceCents ?? 'no item'} cents)`,
+    );
+
+    console.log('');
+    console.log('  text a database would refuse or change');
+    const nul = await create(AS.owner, { eventId: EVENTS.open, name: 'Nul\u0000name', priceCents: 1, total: 1 });
+    check(nul.status === 400, `a name with a NUL is a 400, not the 500 Postgres would give (${nul.status})`);
+    const lone = await create(AS.owner, { eventId: EVENTS.open, name: '\uD800VIP', priceCents: 1, total: 1 });
+    check(lone.status === 400, `a name with a lone surrogate is a 400, not stored as U+FFFD (${lone.status})`);
+    const nulQuery = await api('GET', '/ticket-types?eventId=%00', { as: AS.attendee });
+    check(nulQuery.status === 400, `an eventId of NUL is a 400 for an attendee too, not a 500 (${nulQuery.status})`);
+    const nulPath = await api('PATCH', '/ticket-types/%00', { as: AS.owner, body: { priceCents: 1 }, headers: { 'If-Match': '1' } });
+    check(nulPath.status === 404, `a ticket type id of NUL is not found (${nulPath.status})`);
   } catch (err) {
     check(false, `the run stopped early: ${err instanceof Error ? err.stack : String(err)}`);
   } finally {
@@ -290,6 +364,10 @@ async function main() {
         ['Reservation', `"tenantId" = $1`],
         ['TicketType', `"tenantId" = $1`],
         ['EventProjection', `"tenantId" = $1`],
+        // What a reservation writes beside itself: its idempotency key and its
+        // tickets.reserved outbox row.
+        ['IdempotencyKey', `"tenantId" = $1`],
+        ['OutboxMessage', `"tenantId" = $1`],
       ]) {
         n[table] = (await db.query(`DELETE FROM "${table}" WHERE ${where}`, [TENANT])).rowCount;
       }
@@ -297,7 +375,7 @@ async function main() {
     }).catch((err) => ({ error: err.message }));
     const left = await inTenant(db, TENANT, () => db.query(`SELECT (SELECT count(*) FROM "TicketType" WHERE "tenantId" = $1)::int + (SELECT count(*) FROM "EventProjection" WHERE "tenantId" = $1)::int AS n`, [TENANT])).catch(() => ({ rows: [{ n: -1 }] }));
     check(
-      !deleted.error && deleted.EventProjection === 5 && left.rows[0].n === 0,
+      !deleted.error && deleted.EventProjection === Object.keys(EVENTS).length && left.rows[0].n === 0,
       `cleanup: deleted ${Object.entries(deleted).map(([t, n]) => `${n} ${t}`).join(', ')}; ${left.rows[0].n} types and events left`,
     );
     const groupLeft = await deleteGroupsWhenEmpty(admin, [GROUP]).catch((err) => [`${GROUP} (${err.message})`]);

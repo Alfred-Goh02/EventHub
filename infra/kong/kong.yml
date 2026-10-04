@@ -167,7 +167,9 @@ plugins:
         - 'https://[a-z0-9][a-z0-9-]*\.eventhub\.com'
         - 'http://[a-z0-9][a-z0-9-]*\.eventhub\.localhost(:[0-9]+)?'
       methods: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS]
-      headers: [Authorization, Content-Type, Idempotency-Key, X-Request-ID]
+      # If-Match: the ticket-type editor and Event's PATCH both require it, and Kong
+      # answers a preflight with exactly this list.
+      headers: [Authorization, Content-Type, Idempotency-Key, If-Match, X-Request-ID]
       exposed_headers: [X-Request-ID, Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset]
       credentials: true
       max_age: 600
