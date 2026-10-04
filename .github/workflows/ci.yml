@@ -151,8 +151,24 @@ jobs:
       # parse, so a bad edit would surface as an unhealthy container in the compose
       # job, named nowhere. This names it. KONG_DATABASE=off is required: without it
       # the parser looks for Postgres before it looks at the file.
+      #
+      # And the file Kong actually LOADS: the template plus the consumer that
+      # render-consumer.lua adds at start, rendered here with a throwaway key. Parsing
+      # the template alone said nothing about a render that broke the YAML, or a
+      # template the render refuses.
       - name: Assert the gateway's declarative config parses
-        run: docker run --rm -e KONG_DATABASE=off -v "$PWD/infra/kong:/cfg:ro" kong:3.9 kong config parse /cfg/kong.yml
+        run: |
+          set -euo pipefail
+          docker run --rm -e KONG_DATABASE=off -v "$PWD/infra/kong:/cfg:ro" kong:3.9 kong config parse /cfg/kong.yml
+          keys=$(mktemp -d)
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$keys/private.pem" 2>/dev/null
+          openssl pkey -in "$keys/private.pem" -pubout -out "$keys/public.pem"
+          rm "$keys/private.pem"
+          chmod 755 "$keys" && chmod 644 "$keys/public.pem"
+          docker run --rm -e KONG_DATABASE=off -e AUTH_PUBLIC_KEY_FILE=/keys/public.pem \
+            -e JWT_ISSUER=https://auth.eventhub.local -e KONG_DECLARATIVE_CONFIG=/tmp/kong.yml \
+            -v "$PWD/infra/kong:/kong/declarative:ro" -v "$keys:/keys:ro" --entrypoint sh kong:3.9 \
+            -c 'resty /kong/declarative/render-consumer.lua && kong config parse /tmp/kong.yml'
 
       # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
       # ClickHouse measured the 72G root filesystem at 91% used by the time the
@@ -2330,6 +2346,18 @@ jobs:
       # echo server, because no service reports the headers it was given.
       - name: Prove the gateway routes, and no client can name its tenant
         run: node scripts/verify-compose-gateway.mjs
+
+      # What the gateway does to every request besides routing it: a request id the
+      # service also receives, CORS for the tenants' own origins only, a 1 MB body
+      # ceiling, and an access log with no Authorization, cookie or query string in
+      # it. The rate limit is asserted by its effect: the running node's count rises
+      # in Redis, and two scratch nodes on one Redis database share a single count of
+      # four, which the same node on another database does not. Token signatures are
+      # checked at the edge with Auth's own key: an expired or wrong-issuer token signed
+      # with that real key is refused by Kong, not by the service. Waits for a fresh
+      # minute, so it takes up to one.
+      - name: Prove the gateway's request ids, CORS, signatures, limits and logs
+        run: node scripts/verify-compose-gateway-edge.mjs
 
       # Re-running must be safe, because a reader will do it. The keypair
       # specifically: regenerating it would invalidate every token already
