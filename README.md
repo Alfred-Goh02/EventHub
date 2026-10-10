@@ -78,7 +78,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/auth` | Invite-only registration, argon2id, RS256 JWTs, refresh rotation with family reuse detection, password reset |
 | `services/event` | Events CRUD with a transactional outbox |
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
-| `services/ticketing` | Projection consumer, the organiser's ticket types (within the event's capacity, edited optimistically), seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
+| `services/ticketing` | Projection consumer, the organiser's ticket types (within the event's capacity, edited optimistically), seat reservation, hold sweeper, payment path, payment reconciler, provider webhook, and the buyer's own reservations, each with its latest payment attempt and a countdown on the database's clock |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |
@@ -87,7 +87,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
 | `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 92 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 93 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a

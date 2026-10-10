@@ -1590,6 +1590,16 @@ jobs:
       - name: Assert an organiser can put tickets on sale, within capacity, and edit them
         run: node scripts/verify-ticket-types.mjs
 
+      # The buyer's side of it. Nothing answered a buyer after POST /reservations and
+      # /pay -- not even after /pay said 202, "being confirmed". Asserts a reservation
+      # read through its life (held with a countdown, paid, declined twice showing the
+      # latest attempt, unanswered then settled by the webhook), that nobody else can
+      # read it (another buyer, the event's organiser, another tenant), keyset paging
+      # that neither repeats nor skips, and a countdown on Postgres's clock while the
+      # service runs an hour fast. Starts its own Ticketing on a consumer group of its own.
+      - name: Assert a buyer can see what they bought, and nobody else can
+        run: node scripts/verify-reservation-reads.mjs
+
       # The cross-service assertion, and the one that would have caught the
       # defect the Chapter 4 design review found: only /publish emitted an
       # outbox row, so Ticketing's projection was stale by construction for

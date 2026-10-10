@@ -135,7 +135,8 @@ model Reservation {
   items ReservationItem[]
 
   @@unique([tenantId, id])
-  @@index([tenantId, userId])
+  /// A buyer's reservations, in the order GET /reservations pages them.
+  @@index([tenantId, userId, createdAt, id])
   @@index([tenantId, eventId])
   /// NOTE: the sweeper's index is created as raw SQL in the migration, predicated
   /// on status rather than on time — see expiresAt above.
