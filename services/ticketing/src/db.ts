@@ -73,6 +73,29 @@ export async function withTenant<T>(
 }
 
 /**
+ * The database's clock, read inside the caller's transaction, plus `plusMs`.
+ *
+ * For every timestamp this service writes that something compares with `now()`:
+ * the sweeper reclaims a hold on `"expiresAt" <= now()`, the reconciler selects a
+ * payment on `"startedAt"` and `"nextLookupAt"` against `now()`, and the webhook
+ * and reconciler stamp settledAt and confirmedAt with `now()`. A `new Date()` is
+ * this process's clock instead -- and so is a `@default(now())`, which Prisma
+ * fills in the client. Measured with the process an hour fast: a ten-minute hold
+ * lasted seventy, and a payment's reconciler clock started an hour late. See
+ * "Timestamps come from the database" in CLAUDE.md.
+ *
+ * `now()` is when the transaction began, the value a column's DEFAULT now()
+ * would take in it. Read and passed, rather than written into the statement,
+ * because Prisma has no way to put an expression in `data` and the statements
+ * that would otherwise become raw SQL are the money path's guarded updates.
+ */
+export async function databaseNow(tx: Prisma.TransactionClient, plusMs = 0): Promise<Date> {
+  const rows = await tx.$queryRaw<Array<{ at: Date }>>`
+    SELECT now() + (${plusMs}::bigint * interval '1 millisecond') AS at`;
+  return rows[0]!.at;
+}
+
+/**
  * withTenant plus a retry for serialisation failures and deadlocks.
  *
  * Reservations contend, so these are expected rather than exceptional:

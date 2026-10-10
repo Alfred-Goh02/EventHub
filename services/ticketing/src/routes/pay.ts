@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { createLogger } from '@eventhub/logger';
-import { withTenantRetry } from '../db.js';
+import { databaseNow, withTenantRetry } from '../db.js';
 import { ah } from '@eventhub/http';
 import { requireAuth } from '../auth.js';
 import { emit } from '../outbox.js';
@@ -115,6 +115,10 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
   let intent: Intent;
   try {
     intent = await withTenantRetry(tenantId, async (tx): Promise<Intent> => {
+      // Every stamp on this path is the database's clock, the one the reconciler
+      // and the webhook compare with and stamp by. See databaseNow.
+      const now = await databaseNow(tx);
+
       /**
        * The guarded transition. `status: 'HELD'` is the mutual exclusion.
        *
@@ -137,7 +141,7 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
         where: { id: reservationId, userId, status: 'HELD' },
         data: {
           status: 'PENDING_PAYMENT',
-          paymentStartedAt: new Date(),
+          paymentStartedAt: now,
           version: { increment: 1 },
         },
       });
@@ -248,7 +252,13 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
        * ATTEMPT rather than one per reservation.
        */
       const payment = await tx.payment.create({
-        data: { tenantId, reservationId, userId, amountCents, currency: CURRENCY, status: 'PENDING' },
+        data: {
+          tenantId, reservationId, userId, amountCents, currency: CURRENCY, status: 'PENDING',
+          // Both default to now(), but Prisma fills that default from this process's
+          // clock, and the reconciler selects on both against the database's.
+          startedAt: now,
+          nextLookupAt: now,
+        },
         select: { id: true },
       });
 
@@ -375,9 +385,10 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
      * failed payment cannot be used to hold seats indefinitely by retrying.
      */
     const released = await withTenantRetry(tenantId, async (tx) => {
+      const now = await databaseNow(tx);
       const settledPayment = await tx.payment.updateMany({
         where: { id: intent.paymentId, status: 'PENDING' },
-        data: { status: 'FAILED', failureReason: outcome.reason, settledAt: new Date() },
+        data: { status: 'FAILED', failureReason: outcome.reason, settledAt: now },
       });
 
       /**
@@ -433,6 +444,8 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
 
   // Success.
   const settled = await withTenantRetry(tenantId, async (tx) => {
+    const now = await databaseNow(tx);
+
     /**
      * The rowCount here is NOT decoration, and discarding it was a bug.
      *
@@ -443,7 +456,7 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
      */
     const recorded = await tx.payment.updateMany({
       where: { id: intent.paymentId, status: 'PENDING' },
-      data: { status: 'SUCCEEDED', providerRef: outcome.providerRef, settledAt: new Date() },
+      data: { status: 'SUCCEEDED', providerRef: outcome.providerRef, settledAt: now },
     });
 
     if (recorded.count === 0) {
@@ -482,7 +495,7 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
      */
     const confirmed = await tx.reservation.updateMany({
       where: { id: reservationId, status: 'PENDING_PAYMENT' },
-      data: { status: 'CONFIRMED', confirmedAt: new Date(), version: { increment: 1 } },
+      data: { status: 'CONFIRMED', confirmedAt: now, version: { increment: 1 } },
     });
 
     if (confirmed.count === 0) {
