@@ -307,10 +307,10 @@ async function main() {
     const fine = `still café \u{1F600} ${eventId}`;
     a.ws.send(JSON.stringify({ t: 'question.create', eventId, body: fine, clientMsgId: randomUUID() }));
     await settle(1200);
-    const afterFine = b.of('question.created');
+    const intact = b.of('question.created').filter((m) => m.question?.body === fine).length;
     check(
-      afterFine.length === broadcastBefore + 1 && afterFine.at(-1)?.question?.body === fine,
-      `CONTROL: the same socket still posts, and accented text with an emoji (a surrogate PAIR) arrives intact (${afterFine.length - broadcastBefore} broadcast)`,
+      intact === 1,
+      `CONTROL: the same socket still posts, and accented text with an emoji (a surrogate PAIR) arrives intact (${intact} copy)`,
     );
 
     for (const client of [a, b, c]) client.ws.close();
