@@ -2342,6 +2342,17 @@ jobs:
       - name: Prove the stack returns an expired seat hold
         run: node scripts/verify-compose-hold-sweeper.mjs
 
+      # The reconciler had the same gap, and every reconciler verifier in the build
+      # job runs one of its own, so none could see it: compose never started one,
+      # and a charge the provider never answered stayed UNKNOWN with its seats held
+      # for good. This one pays through the gateway with two amounts the fake
+      # provider does not answer and starts nothing; the stack has to confirm one
+      # and return the other to a hold, after the API has stopped waiting, and the
+      # reconciler container's own log has to name both. It waits out compose's
+      # 20 s grace, so it takes about half a minute.
+      - name: Prove the stack settles a charge the provider never answered
+        run: node scripts/verify-compose-payment-reconciler.mjs
+
       # Chapter 9's end-to-end smoke, in the containers. Auth's token is verified by
       # Community with the jwt-public volume's key; relay-community publishes this
       # run's three outbox rows; Community's own consumer, on the real group, fans the

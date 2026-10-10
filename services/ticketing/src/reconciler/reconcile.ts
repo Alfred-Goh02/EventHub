@@ -209,6 +209,24 @@ export async function reconcileOnce(
 
         if (settled === 'confirmed') result.confirmed += 1;
         else if (settled === 'released') result.released += 1;
+
+        /**
+         * One line per payment THIS process settled, after the commit.
+         *
+         * The pass summary says how many were confirmed and released, never which.
+         * settleAttempt names a failed charge and is silent about a successful one,
+         * so "what happened to payment X" had no answer in this job's log for the
+         * case that matters most -- money that moved. It is also how
+         * scripts/verify-compose-payment-reconciler.mjs tells the compose reconciler
+         * settling a payment from anything else doing it. A noop is not logged: it
+         * means somebody else got there first, and this line claims the work.
+         */
+        if (settled !== 'noop') {
+          logger.info(
+            { paymentId: payment.id, reservationId: payment.reservationId, settled },
+            'settled an unanswered charge',
+          );
+        }
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         // One bad row must not stop the batch. It stays unsettled and is picked up
