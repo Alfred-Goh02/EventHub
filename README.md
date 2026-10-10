@@ -78,7 +78,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/auth` | Invite-only registration, argon2id, RS256 JWTs, refresh rotation with family reuse detection, password reset |
 | `services/event` | Events CRUD with a transactional outbox |
 | `services/relay` | Drains an outbox, Avro-encodes, publishes to Kafka, dead-letters poison rows |
-| `services/ticketing` | Projection consumer, the organiser's ticket types (within the event's capacity, edited optimistically), seat reservation, hold sweeper, payment path, payment reconciler, provider webhook |
+| `services/ticketing` | Projection consumer, the organiser's ticket types (within the event's capacity, edited optimistically), seat reservation, hold sweeper, payment path, payment reconciler, provider webhook, and the buyer's own reservations, each with its latest payment attempt and a countdown on the database's clock |
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |

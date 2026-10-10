@@ -1,11 +1,12 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
 import { pay } from './routes/pay.js';
+import { reservationReads } from './routes/reservation-reads.js';
 import { webhooks } from './routes/webhooks.js';
 import { ticketTypes } from './routes/ticket-types.js';
 import { createProjectionConsumer, DEFAULT_GROUP } from './consumer.js';
@@ -46,6 +47,25 @@ app.use(
     },
   }),
 );
+/**
+ * Text Postgres cannot store as sent answers 400 here, before any route. See
+ * @eventhub/http. It reads the parsed body and leaves rawBody alone, so the webhook's
+ * signature is still checked over the bytes as sent.
+ *
+ * THE WEBHOOK IS NOT EXEMPT, because its status codes are instructions to the provider
+ * and 400 is the right one. Without this, a signed body with a NUL in paymentId reached
+ * the tenant lookup, Postgres refused the parameter, and the route answered 500 -- which
+ * tells the provider to retry a body that can never succeed. 400 says "do not retry",
+ * which is what the route already answers for a body it cannot use.
+ *
+ * Two consequences, both accepted: the refusal comes before the signature check, so an
+ * unsigned body with a NUL is told 400 about its text rather than about its signature
+ * (the status, and what is read or written, are the same: nothing); and a signed body
+ * with a NUL in a field the route ignores is refused rather than settled. The reconciler
+ * settles that payment on its next pass anyway -- the webhook is an accelerator, never
+ * the only route.
+ */
+app.use(refuseUnstorableText());
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'ticketing' });
@@ -58,6 +78,8 @@ app.get('/whoami', requireAuth, (req, res) => {
 app.use('/reservations', reservations);
 // Mounted on the same base path: /reservations/:id/pay.
 app.use('/reservations', pay);
+// And the buyer's reads: GET /reservations and /reservations/:id.
+app.use('/reservations', reservationReads);
 // The inventory editor: what an organiser puts on sale. See routes/ticket-types.ts.
 app.use('/ticket-types', ticketTypes);
 // Unauthenticated by design: the caller is the payment provider, not a user.

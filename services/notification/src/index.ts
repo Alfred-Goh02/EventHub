@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
@@ -39,6 +39,10 @@ let digest: ReturnType<typeof createDigestFlusher> | null = null;
 
 const app = express();
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. See @eventhub/http.
+// The unsubscribe pages' query string too: a token with a NUL in it is no token this
+// service signed, and the answer is the same JSON 400 as for any other client error.
+app.use(refuseUnstorableText());
 
 /** Liveness: the process is up. Never a dependency, or a slow database restarts every replica. */
 app.get('/health', (_req, res) => {

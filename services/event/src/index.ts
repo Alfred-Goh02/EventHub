@@ -1,7 +1,7 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { requireAuth } from './auth.js';
 import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { events } from './routes/events.js';
@@ -11,6 +11,8 @@ const logger = createLogger('event-service');
 
 const app = express();
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. See @eventhub/http.
+app.use(refuseUnstorableText());
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'event' });

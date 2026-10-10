@@ -1,6 +1,6 @@
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { createRequireAuth, publicKeyFromEnv } from '@eventhub/auth-middleware';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
@@ -22,6 +22,8 @@ const logger = createLogger('community-service');
 
 const app = express();
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. See @eventhub/http.
+app.use(refuseUnstorableText());
 
 /** Liveness: the process is up. Never a dependency, or a slow database restarts every replica. */
 app.get('/health', (_req, res) => {
