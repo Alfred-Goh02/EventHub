@@ -710,3 +710,50 @@ hide, which change only Community's database — and `dlq:replay` put them back 
 community.feed for every consumer of it, measured. A dead-letter copy keeps its value
 only where the value is sealed; anything else keeps the headers that say what failed
 and where, and the words go when their own topic's retention takes them.
+
+## A list of what to hide misses the next thing to hide
+
+The gateway's access log removed `Authorization` and `Cookie` and kept every other
+header. Measured with a secret planted in seven places: Live's bearer token rides in
+`Sec-WebSocket-Protocol`, the unsubscribe page's own button sends its token as the
+`Referer`, and `Proxy-Authorization` and `X-Api-Key` went in too. Logged headers are an
+allowlist now. Where the question is what may leave, name what may, never what may not.
+
+## A limit that reads the body first is not a limit
+
+Kong's request-size-limiting decides on `Content-Length`. A chunked body has none, so
+it reads the whole body -- to disk -- and only then answers 413. Measured by streaming
+50 MiB: every byte was taken first. With nginx's own `client_max_body_size` at 1m the
+answer came after 2.6 MiB, which is socket buffer. A 2 MiB test passes either way; only
+a stream that is still being written when the answer arrives shows the bound.
+
+## A check that passes under the old config proves nothing about the new one
+
+`POST /config` answers 201 before every worker serves the new configuration. The
+fail-open check switched a node from a config that already passed the request to one
+meant to pass it, and so stayed green with `fault_tolerant: false`. Each such check now
+starts from a config that REFUSES the request, or tells the two apart by something only
+the new one produces (here, the count it reports in `RateLimit-Limit`). Same family as
+"a fixture has to be able to show the failure".
+
+## Plugins run by priority, not by where they are written
+
+Kong ran `jwt` (priority 1450) before `rate-limiting` (910), whatever the file's order,
+and Kong OSS cannot change it. So on a signed route a request without a valid token is
+refused with 401 and never counted, and the verifier's rate-limit probes, aimed at
+/events, read no limit at all. They go to routes without a signature check now, and the
+README says what is counted.
+
+## Count a minute on the clock that keys it
+
+Kong keys each count by its own clock, inside the Docker VM, and `docker logs --since`
+compares the daemon's. The verifier waited for "a fresh minute" by the host's clock,
+which drifts from the VM's after a sleep. It reads the time from Redis (`TIME`), on the
+same VM, for every minute window and log window.
+
+## A run cut off does not run its cleanup
+
+A verifier's cleanup lives in `finally`, which does not run when the process is killed --
+here, by the session pausing mid-run. It left two consumer groups behind, beside five
+that earlier runs had noted as "left to expire". Every per-run group carries the run's
+prefix, so a sweep by pattern finds them: list, delete one at a time, list again.
