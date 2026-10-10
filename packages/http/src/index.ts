@@ -198,6 +198,15 @@ function unstorableIn(roots: unknown[]): 'text.unstorable' | 'text.uncheckable' 
 }
 
 /**
+ * The same check for text that never passes through Express: Live's WebSocket messages,
+ * whose question bodies reach Postgres as an HTTP body's would. Null when everything in
+ * `value`, keys included, can be stored as sent; otherwise the type it is refused as.
+ */
+export function unstorableText(value: unknown): 'text.unstorable' | 'text.uncheckable' | null {
+  return unstorableIn([value]);
+}
+
+/**
  * Refuses, with 400, any text in the request body or query string that Postgres cannot
  * store as sent: a string, or an object key, containing U+0000, or one that is not
  * well-formed UTF-16 (a lone surrogate). Every HTTP service mounts it directly after its

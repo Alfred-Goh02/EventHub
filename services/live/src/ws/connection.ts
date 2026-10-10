@@ -1,5 +1,6 @@
 import type { WebSocket as WsSocket } from 'ws';
 import { createLogger } from '@eventhub/logger';
+import { unstorableText } from '@eventhub/http';
 import type { Role } from '@eventhub/types';
 import type { SocketClaims } from '../jwt.js';
 import { CLOSE, clientMessage, type ServerMessage } from './protocol.js';
@@ -96,6 +97,19 @@ export function onConnection(raw: WsSocket, claims: SocketClaims): void {
         json = JSON.parse(data.toString());
       } catch {
         ws.close(CLOSE.POLICY, 'invalid json');
+        return;
+      }
+
+      /**
+       * Text Postgres cannot store as sent is a bad message, like one that fails the
+       * schema. A socket never passes through Express, so the HTTP side's
+       * refuseUnstorableText cannot see it. Measured through the gateway before this: a
+       * NUL in a question answered 'internal' and was logged as a server error (22021),
+       * and a lone surrogate, sent as the JSON escape \ud800, was stored and broadcast
+       * to every subscriber as U+FFFD -- a question nobody asked.
+       */
+      if (unstorableText(json) !== null) {
+        send(ws, { t: 'error', code: 'bad_message' });
         return;
       }
 
