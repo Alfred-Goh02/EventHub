@@ -7,6 +7,7 @@ import { assertRuntimeRoleCannotBypassRls } from './db.js';
 import { reservations } from './routes/reservations.js';
 import { pay } from './routes/pay.js';
 import { webhooks } from './routes/webhooks.js';
+import { ticketTypes } from './routes/ticket-types.js';
 import { createProjectionConsumer, DEFAULT_GROUP } from './consumer.js';
 
 const env = loadBaseEnv();
@@ -76,6 +77,8 @@ app.get('/whoami', requireAuth, (req, res) => {
 app.use('/reservations', reservations);
 // Mounted on the same base path: /reservations/:id/pay.
 app.use('/reservations', pay);
+// The inventory editor: what an organiser puts on sale. See routes/ticket-types.ts.
+app.use('/ticket-types', ticketTypes);
 // Unauthenticated by design: the caller is the payment provider, not a user.
 // The HMAC signature is the authentication. See routes/webhooks.ts.
 app.use('/webhooks', webhooks);

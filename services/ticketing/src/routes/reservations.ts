@@ -108,7 +108,9 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     | { kind: 'unknown-event' }
     | { kind: 'not-on-sale'; status: string }
     | { kind: 'sold-out'; ticketTypeId: string; remaining?: number }
-    | { kind: 'unknown-ticket-type'; ticketTypeId: string };
+    | { kind: 'unknown-ticket-type'; ticketTypeId: string }
+    | { kind: 'over-allocated'; capacity: number; allocated: number }
+    | { kind: 'price-changed'; ticketTypeId: string };
 
   const run = async (): Promise<Outcome> => withTenantRetry(tenantId, async (tx) => {
     // -----------------------------------------------------------------------
@@ -187,7 +189,7 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     // -----------------------------------------------------------------------
     const projection = await tx.eventProjection.findFirst({
       where: { id: eventId },
-      select: { status: true, deleted: true },
+      select: { status: true, deleted: true, capacity: true },
     });
 
     /**
@@ -212,6 +214,25 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
       throw Object.assign(new Error('projection'), {
         kind: 'not-on-sale',
         status: projection.status,
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // 2a. Not on an event whose tickets add up to more than its capacity.
+    //
+    // The inventory editor keeps an event's ticket totals within its capacity
+    // when a ticket type is written -- but Event lets a DRAFT's capacity be
+    // lowered afterwards, and the per-type counters below would then sell every
+    // ticket regardless. Capacity cannot change once published, and the editor
+    // cannot raise totals past it, so a plain read is enough: refuse, and the
+    // organiser reduces a ticket type to repair it.
+    // -----------------------------------------------------------------------
+    const allocated = await tx.ticketType.aggregate({ where: { eventId }, _sum: { total: true } });
+    if ((allocated._sum.total ?? 0) > projection.capacity) {
+      throw Object.assign(new Error('projection'), {
+        kind: 'over-allocated',
+        capacity: projection.capacity,
+        allocated: allocated._sum.total,
       });
     }
 
@@ -303,16 +324,29 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     // either not enough left, or no such ticket type in this tenant.
     // -----------------------------------------------------------------------
     for (const [ticketTypeId, quantity] of ordered) {
-      const updated = await tx.ticketType.updateMany({
-        where: { id: ticketTypeId, eventId, remaining: { gte: quantity } },
-        data: {
-          remaining: { decrement: quantity },
-          held: { increment: quantity },
-          version: { increment: 1 },
-        },
-      });
+      // RETURNING the price the row has NOW, under the lock this statement holds.
+      // The price above was read without one, and the inventory editor can change
+      // it in between: a hold that waited here on an editor's lock would otherwise
+      // commit, after the edit, at the price the organiser had just replaced.
+      const updated = await tx.$queryRaw<Array<{ priceCents: number }>>`
+        UPDATE "TicketType"
+           SET remaining = remaining - ${quantity},
+               held = held + ${quantity},
+               version = version + 1,
+               "updatedAt" = now()
+         WHERE id = ${ticketTypeId}
+           AND "eventId" = ${eventId}
+           AND remaining >= ${quantity}
+        RETURNING "priceCents"`;
 
-      if (updated.count === 0) {
+      if (updated.length === 1 && updated[0]!.priceCents !== priceOf.get(ticketTypeId)) {
+        // The price changed between the read and the lock. Start again, so the hold
+        // is taken at the price in effect when it took the seats: 40001 is what
+        // withTenantRetry retries, a bounded number of times.
+        throw Object.assign(new Error('price changed while reserving'), { code: '40001', kind: 'price-changed', ticketTypeId });
+      }
+
+      if (updated.length === 0) {
         // Disambiguate INSIDE the transaction, on tx — a tenant-scoped read.
         // Using the bare client here would escape tenant context and build a
         // cross-tenant existence oracle.
@@ -377,8 +411,12 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
   try {
     outcome = await run();
   } catch (err) {
-    const e = err as { kind?: string; ticketTypeId?: string; remaining?: number; status?: string };
-    if (e.kind === 'sold-out') {
+    const e = err as { kind?: string; ticketTypeId?: string; remaining?: number; status?: string; capacity?: number; allocated?: number };
+    if (e.kind === 'over-allocated') {
+      outcome = { kind: 'over-allocated', capacity: e.capacity!, allocated: e.allocated! };
+    } else if (e.kind === 'price-changed') {
+      outcome = { kind: 'price-changed', ticketTypeId: e.ticketTypeId! };
+    } else if (e.kind === 'sold-out') {
       outcome = { kind: 'sold-out', ticketTypeId: e.ticketTypeId!, remaining: e.remaining };
     } else if (e.kind === 'unknown-ticket-type') {
       outcome = { kind: 'unknown-ticket-type', ticketTypeId: e.ticketTypeId! };
@@ -452,6 +490,14 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
         error: 'unknown ticket type for this event',
         ticketTypeId: outcome.ticketTypeId,
       });
+    case 'over-allocated':
+      return res.status(409).json({
+        error: "this event's tickets add up to more than its capacity; nothing can be sold until its organiser reduces them",
+        capacity: outcome.capacity,
+        allocated: outcome.allocated,
+      });
+    case 'price-changed':
+      return res.status(409).json({ error: 'the price changed while this was being reserved; try again', ticketTypeId: outcome.ticketTypeId });
     default:
       return res.status(500).json({ error: 'internal error' });
   }
