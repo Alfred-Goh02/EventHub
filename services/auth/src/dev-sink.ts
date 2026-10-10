@@ -1,10 +1,15 @@
 import type { Logger } from '@eventhub/logger';
 
 /**
- * How a bearer secret reaches a developer while there is no mail service.
+ * How a bearer secret reaches a developer without reading mail.
  *
- * The Notification service does not exist until Chapter 8, so an invite link or
- * a reset link has to surface somewhere or the flow cannot be exercised at all.
+ * Written before the Notification service existed, when an invite link or a reset
+ * link had to surface somewhere or the flow could not be exercised at all. Both are
+ * emailed now, sealed to Notification (see email-request.ts); this stays as a
+ * second, local-only path, and verifiers use it to learn the real secret to search
+ * for. It is NOT a delivery path: an invitation that reached only this sink was the
+ * bug that left a deployed system unable to admit anyone new.
+ *
  * Every option here is bad; this is the least bad one, and the reasoning is
  * worth keeping because the obvious alternatives are worse in ways that are not
  * obvious.

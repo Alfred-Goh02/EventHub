@@ -5,12 +5,70 @@ import { z, ZodError } from 'zod';
 import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
 import type { Logger } from '@eventhub/logger';
 import { PermanentSendError, type EmailChannel } from '../channels/types.js';
-import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest } from './open-seal.js';
+import { isOptional, type Category } from '../preferences/categories.js';
+import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest, type SealedKind } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
 import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
-import { renderPasswordReset, type RenderedEmail } from './templates.js';
+import { renderInvitation, renderPasswordReset, type RenderedEmail } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
+
+/**
+ * What each sealed kind is sent as.
+ *
+ * templateKey  part of the sent-log's idempotency key. A reset's key has none, for the
+ *              reason sent-log.ts gives; every other kind's does, so one kind's message
+ *              id can never claim another's delivery.
+ * category     the sent-log's grouping, for an operator.
+ * preference   its category in preferences/categories.ts, which must be TRANSACTIONAL:
+ *              see below.
+ */
+const SEALED: {
+  [K in SealedKind]: {
+    templateKey: string;
+    category: string;
+    preference: Category;
+    sentMessage: string;
+    render: (opened: Extract<OpenedEmailRequest, { kind: K }>) => RenderedEmail;
+  };
+} = {
+  PASSWORD_RESET: {
+    templateKey: 'password-reset',
+    category: 'account',
+    preference: 'PASSWORD_RESET',
+    sentMessage: 'password reset email sent',
+    render: (o) => renderPasswordReset({ link: o.link, expiresAt: o.expiresAt }),
+  },
+  INVITATION: {
+    templateKey: 'invitation',
+    category: 'invitation',
+    preference: 'INVITATION',
+    sentMessage: 'invitation email sent',
+    render: (o) => renderInvitation({ link: o.link, role: o.role, expiresAt: o.expiresAt }),
+  },
+};
+
+/**
+ * THE SEALED PATH ASKS NO PREFERENCE, SO IT MAY SEND ONLY WHAT CANNOT BE TURNED OFF.
+ * A reset's reader may be locked out, and an invitation's has no account to hold a
+ * choice. A kind added here under an OPTIONAL category would be sent to people who had
+ * turned it off, so the service refuses to start instead.
+ */
+for (const [kind, s] of Object.entries(SEALED)) {
+  if (isOptional(s.preference)) {
+    throw new Error(`refusing to start: sealed ${kind} emails are sent without asking a preference, but ${s.preference} can be turned off`);
+  }
+}
+
+/** One message's handling, by the kind Auth signed. */
+function prepareSealed(opened: OpenedEmailRequest): { templateKey: string; category: string; sentMessage: string; email: RenderedEmail } {
+  if (opened.kind === 'INVITATION') {
+    const s = SEALED.INVITATION;
+    return { templateKey: s.templateKey, category: s.category, sentMessage: s.sentMessage, email: s.render(opened) };
+  }
+  const s = SEALED.PASSWORD_RESET;
+  return { templateKey: s.templateKey, category: s.category, sentMessage: s.sentMessage, email: s.render(opened) };
+}
 
 const counters = {
   received: 0,
@@ -250,7 +308,11 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
       opts.logger.warn({ reason }, 'undecodable email request refused');
       return { kind: 'poison', reason };
     }
-    const ids = { messageId: envelope.messageId, tenantId: envelope.tenantId, userId: envelope.userId };
+    // Named for what the subject is: an invitation's is an Invite, never a user.
+    const ids: Record<string, string> =
+      envelope.kind === 'INVITATION'
+        ? { messageId: envelope.messageId, tenantId: envelope.tenantId, kind: envelope.kind, inviteId: envelope.userId }
+        : { messageId: envelope.messageId, tenantId: envelope.tenantId, userId: envelope.userId };
 
     if (!(Date.parse(envelope.expiresAt) > Date.now())) {
       counters.expired += 1;
@@ -275,6 +337,10 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
       return transient(err);
     }
 
+    // Steps 3 to 5 are the same for every kind: the claim, the suppression list, the
+    // send. Only the template differs, and no kind on this path asks a preference or
+    // reads a contact card -- the address is in the seal.
+    const sealed = prepareSealed(opened);
     return deliver(
       {
         key: {
@@ -282,14 +348,15 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
           sourceMessageId: envelope.messageId,
           recipientId: opened.userId,
           channel: 'email',
-          templateKey: 'password-reset',
+          templateKey: sealed.templateKey,
         },
-        category: 'account',
+        category: sealed.category,
         to: opened.email,
-        email: renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt }),
+        email: sealed.email,
+        // No List-Unsubscribe on any kind here: each is transactional.
         headers: { 'X-EventHub-Message-Id': envelope.messageId },
         ids,
-        sentMessage: 'password reset email sent',
+        sentMessage: sealed.sentMessage,
       },
       opts,
     );
@@ -429,8 +496,9 @@ export function createDispatcher(opts: {
     const reason =
       outcome.kind === 'poison' ? outcome.reason : `retries exhausted after ${failedAttempts} attempts: ${outcome.error}`;
     /**
-     * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value is ciphertext
-     * only this service can open. Anything else — a reply, carrying the reply's words and
+     * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value, and an
+     * invitation's, is ciphertext only this service can open, around a link that stops
+     * working when its reset or invitation does. Anything else — a reply, carrying the reply's words and
      * who wrote them — would outlive, in a topic kept forever, the author's delete and a
      * moderator's hide, which change only Community's database; and replaying it would
      * put those words back on the topic it came from, for every consumer of that topic.

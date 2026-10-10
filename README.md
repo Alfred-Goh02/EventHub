@@ -82,12 +82,12 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/live` | Authenticated WebSockets for live Q&A, fanned out across pods with Redis Pub/Sub |
 | `services/search` | Event search on OpenSearch: a Kafka indexer keeps one shared index current with external versioning, each tenant is confined by a filtered alias, and `GET /search` ranks, facets, and falls back to a capped Postgres query when the cluster is down |
 | `services/analytics` | ClickHouse behind two users: a raw append-only event table and materialized-view rollups for the ticket funnel and live engagement, filled by a Kafka ingest that counts each message once by its id, and read through an API that takes the tenant from the token and answers organisers and admins only. The ingest's `/metrics` shows consumer lag in offsets and part counts beside the server's limits, and every rollup rebuilds from the raw table |
-| `services/notification` | The one service that sends email. It opens each sealed reset request with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
+| `services/notification` | The one service that sends email. It opens each sealed request, a password reset or an invitation, with its own private key, acts only on what Auth's signature verifies, claims the delivery in a sent-log under row-level security before sending, and sends through Mailpit locally. A redelivered message sends nothing |
 | `contracts/` | Avro schemas, and TypeScript types generated from them |
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
 | `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 92 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 93 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -443,7 +443,7 @@ Finally, a throwaway signing keypair:
 node services/auth/scripts/generate-keys.mjs
 ```
 
-And Notification's keypair, which Auth seals password-reset emails to. It keeps an
+And Notification's keypair, which Auth seals reset and invitation emails to. It keeps an
 existing pair, copies only the public half into `services/auth/keys`, and Auth
 refuses to start without that copy:
 
@@ -531,6 +531,14 @@ Auth queues it encrypted to Notification's key and signed with its own, the rela
 publishes it, and Notification opens it, claims the delivery once and sends it. In
 compose it arrives at Mailpit, `http://localhost:8025`.
 
+An invitation travels the same way. `POST /invites` commits the invitation and its
+sealed request together, so the invitee gets one email with the link and the role
+and nothing else, and no unsubscribe: an invitation is not a subscription. Inviting
+an address again revokes the earlier link, and `POST /invites/revoke` stops an
+emailed one. Every invitation is mail the platform sends to an address an admin
+typed, so `POST /invites` is budgeted per tenant: `INVITES_PER_TENANT_PER_HOUR`
+(100) and `INVITES_PER_ADDRESS_PER_DAY` (3), and past either it answers 429.
+
 A send that fails for a reason that may pass waits in delayed retry tiers
 (`notification.retry.1` to `.3`) without holding up anyone else on its partition.
 Poison, and a send whose retries run out, go to `notification.dlq`, which is never
@@ -598,5 +606,5 @@ Known gaps, named rather than hidden:
 - Access tokens are 15-minute stateless RS256 with no revocation list, so a
   password reset kills refresh tokens immediately but cannot evict an access
   token already issued.
-- Auth has no outbox, so invite and reset links reach a developer through an
-  opt-in sink that refuses to run in production, rather than by email.
+- Notification cannot see a revocation. An invitation revoked after it was queued
+  but before it was sent still goes out, with a link `/register` refuses.

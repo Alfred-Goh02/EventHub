@@ -14,10 +14,13 @@ import { DLQ_HEADERS, DLQ_TOPIC, header, originalHeaders } from '../dispatch/ret
  *
  * SAFE TO REPEAT. The replayed message is the original, message id included, so
  * the sent-log claim sees a delivery already recorded SENT and sends nothing. An
- * expired reset is skipped as expired.
+ * expired reset or invitation is skipped as expired.
  *
- * PASSWORD RESETS ONLY. Only a sealed value is kept in the dead-letter topic; a reply's
- * copy has none, and this says so rather than replaying an empty message.
+ * SEALED REQUESTS ONLY: a password reset or an invitation. Only a sealed value is kept
+ * in the dead-letter topic; a reply's copy has none, and this says so rather than
+ * replaying an empty message. A replayed invitation that Auth has since revoked is
+ * still sent if it has not expired -- Notification cannot see a revocation -- and its
+ * link is refused by /register.
  *
  * Reads KAFKA_BROKERS and nothing else. It does not import the service's
  * configuration, which requires a database and an SMTP server this has no use for.

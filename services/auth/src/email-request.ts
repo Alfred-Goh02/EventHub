@@ -25,6 +25,13 @@ import { signEmailRequest } from './jwt.js';
  * The algorithms are fixed here, and the reader must pin them too: RSA-OAEP-256
  * rather than RSA1_5, which is open to padding-oracle attacks, and A256GCM, which
  * authenticates the ciphertext.
+ *
+ * AN INVITATION TRAVELS THE SAME WAY, since 2026-10-11. Until then POST /invites
+ * handed its link to the dev sink and nothing else, a leftover from before
+ * Notification existed: the sink is off unless configured and refuses to boot in
+ * production, so in a deployed system nobody new could ever join a tenant. An
+ * accept-invite link creates an account at the role it names, so it is as much a
+ * credential as a reset link, and gets the same two layers.
  */
 
 export const AUTH_EMAIL_TOPIC = 'auth.email-requested';
@@ -41,7 +48,7 @@ function readNotificationKey(): string {
   } catch (err) {
     throw new Error(
       `refusing to start: Notification's public key is missing at ${fileURLToPath(keyUrl)}. ` +
-        'A password reset could be issued and never delivered. Generate it with ' +
+        'A password reset or an invitation could be issued and never delivered. Generate it with ' +
         '`node services/notification/scripts/generate-keys.mjs`, which copies the public half here.',
       { cause: err },
     );
@@ -56,22 +63,37 @@ const notificationKey = await importSPKI(readNotificationKey(), KEY_ALG, { extra
  */
 export const notificationKeyId = await calculateJwkThumbprint(await exportJWK(notificationKey));
 
-export type AuthEmailKind = 'PASSWORD_RESET';
+/**
+ * Which email. Each is a credential, so each travels sealed.
+ *
+ *   PASSWORD_RESET  for an existing user; the subject is the User's id.
+ *   INVITATION      for somebody who is not a user yet, and may never become one; the
+ *                   subject is the Invite's id. Nothing on Notification's side may
+ *                   look a subject up as a user: contact cards, preferences and the
+ *                   digest are all keyed by user, and an invitee has none of them.
+ */
+export type AuthEmailKind = 'PASSWORD_RESET' | 'INVITATION';
 
 export async function sealEmailRequest(params: {
   messageId: string;
   tenantId: string;
-  userId: string;
+  /** Whom the email is about: a User for a reset, an Invite for an invitation. */
+  subject: string;
   email: string;
   link: string;
   kind: AuthEmailKind;
+  /** When the link stops working. The seal expires with it, never after it. */
   expiresAt: Date;
+  /** Anything else a kind needs signed: an invitation's role. */
+  extra?: Record<string, string>;
 }): Promise<string> {
   const signed = await signEmailRequest({
-    subject: params.userId,
+    subject: params.subject,
     jti: params.messageId,
     expiresAt: params.expiresAt,
-    claims: { tenantId: params.tenantId, email: params.email, link: params.link, kind: params.kind },
+    // The fixed claims last, so nothing in `extra` can replace the address, the link,
+    // the tenant or the kind.
+    claims: { ...params.extra, tenantId: params.tenantId, email: params.email, link: params.link, kind: params.kind },
   });
 
   return sealToNotification(signed);

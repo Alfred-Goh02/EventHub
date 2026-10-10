@@ -1,37 +1,129 @@
+import { randomUUID } from 'node:crypto';
 import type { Role } from '@eventhub/types';
-import { prisma } from './db.js';
+import { prisma, withTenant } from './db.js';
+import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
+import { emit } from './outbox.js';
 import { hashSecretToken as hashToken, newSecretToken } from './secret-token.js';
 
-const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** The advisory-lock namespace for issuing an invitation, so no other lock in this database can collide with it. */
+const INVITE_ISSUE_LOCK = 7_301;
 
 /**
- * Creates an invite and returns the raw token EXACTLY ONCE.
+ * Issues an invitation and queues the email that carries it, in ONE transaction.
  *
- * Only the hash is stored, so this string cannot be recovered afterwards. That
- * is the point: a database dump yields no usable invitations. It also means a
- * lost invite must be reissued rather than looked up.
+ * THE EMAIL IS NOT THE CALLER'S TO REMEMBER. This used to create the row and return
+ * the token, and the route handed the link to the dev sink alone: the sink is off
+ * unless configured and refuses to boot in production, so a deployed system issued
+ * invitations nobody ever received, and nobody new could join a tenant. Now the row
+ * and the sealed request commit together or not at all, as a password reset's do:
+ * there is no invitation without an email on its way, and no email for an invitation
+ * that does not exist.
+ *
+ * THE NEWEST INVITATION IS THE ONLY LIVE ONE. Inviting an address again revokes every
+ * earlier invitation to it in this tenant that is neither accepted nor revoked, before
+ * the new one is made, so the newest link works and every older one is refused. The
+ * reason is the reset's: an older link sitting in a mailbox somebody else can read
+ * would otherwise stay a way into the tenant for the rest of its week, after the
+ * admin had sent a new one precisely because something went wrong with the first.
+ * Under an advisory lock per (tenant, address), so two invitations issued at once
+ * cannot both find nothing to revoke and leave two live links.
+ *
+ * THE EXPIRY IS THE DATABASE'S, and the seal carries the same instant. Prisma 7 fills
+ * timestamps in the client, and an expiry stamped on this process's clock would end
+ * the row and the seal at whatever instant this host believed it was. The seal's exp
+ * is the row's expiresAt to the second, rounded down, so the email never outlives the
+ * link inside it.
+ *
+ * THE SUBJECT IS THE INVITE. The invitee is not a user and may never be one, so the
+ * seal's subject, the message's key and the envelope's id field are the Invite's id.
+ *
+ * The raw token leaves this function inside the link, EXACTLY ONCE, for the dev sink;
+ * only its hash is stored, so a database dump yields no usable invitations.
  */
 export async function issueInvite(params: {
   tenantId: string;
+  /** Already trimmed and lower-cased by the route's schema; lower-cased again here. */
   email: string;
   role: Role;
   invitedBy: string;
-}): Promise<{ token: string; expiresAt: Date }> {
-  const token = newSecretToken();
-  const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
+  /** Where the accept-invite page lives: PUBLIC_APP_URL. */
+  appUrl: string;
+  /** How long it stays good, INVITE_TTL_HOURS: a week unless configured. */
+  ttlHours: number;
+}): Promise<{ inviteId: string; link: string; expiresAt: Date; superseded: number }> {
+  const email = params.email.toLowerCase();
+  const { tenantId } = params;
 
-  await prisma.invite.create({
-    data: {
-      tenantId: params.tenantId,
-      email: params.email.toLowerCase(),
-      role: params.role,
-      invitedBy: params.invitedBy,
-      tokenHash: hashToken(token),
+  return withTenant(tenantId, async (tx) => {
+    // chr(31) is the unit separator: it cannot appear in an id or an address, so the
+    // concatenation is unambiguous.
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(${INVITE_ISSUE_LOCK}::int, hashtext(${tenantId} || chr(31) || ${email}))`;
+
+    // Invite is RLS-exempt, so the tenant in this WHERE is the only scope it has: an
+    // admin of one tenant must never revoke another's invitations by re-inviting.
+    const superseded = await tx.$executeRaw`
+      UPDATE "Invite" SET "revokedAt" = now() AT TIME ZONE 'UTC'
+       WHERE "tenantId" = ${tenantId} AND email = ${email}
+         AND "acceptedAt" IS NULL AND "revokedAt" IS NULL`;
+
+    const [stamp] = await tx.$queryRaw<Array<{ at: string }>>`
+      SELECT to_char((now() AT TIME ZONE 'UTC') + ${params.ttlHours} * interval '1 hour', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at`;
+    if (!stamp) throw new Error('the database returned no time to expire an invitation at');
+    const expiresAt = new Date(stamp.at);
+
+    const token = newSecretToken();
+    const invite = await tx.invite.create({
+      data: {
+        tenantId,
+        email,
+        role: params.role,
+        invitedBy: params.invitedBy,
+        tokenHash: hashToken(token),
+        expiresAt,
+      },
+      select: { id: true },
+    });
+
+    const link = `${params.appUrl}/accept-invite?token=${token}`;
+
+    // Chosen here, because the seal carries it as its jti and the seal is made before
+    // the outbox row exists.
+    const messageId = randomUUID();
+    const sealed = await sealEmailRequest({
+      messageId,
+      tenantId,
+      subject: invite.id,
+      email,
+      link,
+      kind: 'INVITATION',
       expiresAt,
-    },
-  });
+      // Signed, because the email says it: an envelope anyone can edit must not be
+      // able to tell an attendee they were made an admin.
+      extra: { role: params.role },
+    });
 
-  return { token, expiresAt };
+    // Only ciphertext and identifiers reach the outbox, and so the topic. The link,
+    // the address and the role are inside `sealed`.
+    await emit(tx, {
+      id: messageId,
+      tenantId,
+      topic: AUTH_EMAIL_TOPIC,
+      eventType: 'InvitationRequested',
+      aggregateId: invite.id,
+      payload: {
+        tenantId,
+        // The envelope's subject field, which the contract names userId because a
+        // reset came first. For an invitation it is the Invite.
+        userId: invite.id,
+        kind: 'INVITATION',
+        expiresAt: expiresAt.toISOString(),
+        sealed,
+      },
+    });
+
+    return { inviteId: invite.id, link, expiresAt, superseded };
+  });
 }
 
 export type InviteLookup =
@@ -45,16 +137,28 @@ export type InviteLookup =
  * before any tenant context exists. That is precisely why "Invite" carries no
  * RLS policy — a tenant policy would filter out the very row that tells us
  * which tenant to use.
+ *
+ * EXPIRED IS THE DATABASE'S ANSWER. The expiry was stamped from the database's clock,
+ * and the email's seal expires at the same instant; judging it on this process's clock
+ * would end the invitation at a different moment from its email. Measured with Auth an
+ * hour fast and a one-hour invitation: the link in a fresh email was refused as
+ * expired. So the comparison is made where the value came from.
  */
 export async function lookupInvite(token: string): Promise<InviteLookup> {
-  const invite = await prisma.invite.findUnique({
-    where: { tokenHash: hashToken(token) },
-  });
+  const [invite] = await prisma.$queryRaw<
+    Array<{ id: string; tenantId: string; email: string; role: Role; revoked: boolean; accepted: boolean; expired: boolean }>
+  >`
+    SELECT i.id, i."tenantId", i.email, i.role::text AS role,
+           i."revokedAt" IS NOT NULL AS revoked,
+           i."acceptedAt" IS NOT NULL AS accepted,
+           i."expiresAt" <= (now() AT TIME ZONE 'UTC') AS expired
+      FROM "Invite" i
+     WHERE i."tokenHash" = ${hashToken(token)}`;
 
   if (!invite) return { ok: false, reason: 'invalid' };
-  if (invite.revokedAt) return { ok: false, reason: 'revoked' };
-  if (invite.acceptedAt) return { ok: false, reason: 'used' };
-  if (invite.expiresAt < new Date()) return { ok: false, reason: 'expired' };
+  if (invite.revoked) return { ok: false, reason: 'revoked' };
+  if (invite.accepted) return { ok: false, reason: 'used' };
+  if (invite.expired) return { ok: false, reason: 'expired' };
 
   return {
     ok: true,

@@ -23,8 +23,8 @@ const logger = createLogger('auth-service');
 
 /**
  * Where invite and reset links point. Validated in env.ts, which refuses to start a
- * production process on anything but https: the default is localhost, and a reset
- * link is now emailed rather than printed for a developer.
+ * production process on anything but https: the default is localhost, and both links
+ * are now emailed rather than printed for a developer.
  */
 const RESET_URL_BASE = env.PUBLIC_APP_URL;
 
@@ -125,6 +125,40 @@ const inviteSchema = z.object({
   role: z.enum(['ADMIN', 'ORGANIZER', 'ATTENDEE']).default('ATTENDEE'),
 });
 
+/**
+ * Budgets for POST /invites.
+ *
+ * Every invitation is now an email, from this platform, to an address an admin typed.
+ * That makes an admin's token -- or a stolen one -- a way to point the platform's mail
+ * at anybody. What it sends is fixed (a link and a role), so it is no use for carrying
+ * a message; the harm is volume. Unwanted mail draws complaints, complaints cost the
+ * sending domain its reputation, and password resets travel on that same reputation.
+ *
+ *   per TENANT, per hour        INVITES_PER_TENANT_PER_HOUR, default 100. Nobody types
+ *                               a hundred addresses into a form in an hour, so a
+ *                               person onboarding a large team by hand never meets it;
+ *                               a script driving a stolen token is held to 2,400 a
+ *                               day per tenant instead of whatever the server can do.
+ *   per (TENANT, ADDRESS), day  INVITES_PER_ADDRESS_PER_DAY, default 3. Enough for a
+ *                               lost email, a wrong role put right and one more
+ *                               resend; it bounds what one tenant can send one
+ *                               person to three a day.
+ *
+ * BOTH KEYS LEAD WITH THE TENANT FROM THE VERIFIED TOKEN. One tenant's admins cannot
+ * spend another's budget, and a refusal says only what this tenant has already sent:
+ * whether some other tenant has invited the same address is never part of the count.
+ * The address is the schema's normalised form, trimmed and lower-cased, so
+ * "  Bob@Example.COM " spends the same budget as bob@example.com.
+ *
+ * CHECKED, THEN COUNTED. Both are asked with blockedFor() before either is hit, so a
+ * request one budget refuses spends nothing from the other.
+ *
+ * Per-process memory, like every limit in this file: see rate-limit.ts for what that
+ * costs -- two replicas give twice the budget, and a restart forgets it.
+ */
+const invitesPerTenant = createRateLimiter({ limit: env.INVITES_PER_TENANT_PER_HOUR, windowMs: 60 * 60 * 1000 });
+const invitesPerAddress = createRateLimiter({ limit: env.INVITES_PER_ADDRESS_PER_DAY, windowMs: 24 * 60 * 60 * 1000 });
+
 // Creating an invite requires being an ADMIN of the tenant you are inviting to.
 // Both facts come from the verified token: requireAuth establishes who, and
 // requireRole establishes whether they may. Neither is client-supplied.
@@ -137,23 +171,35 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
   const { email, role } = parsed.data;
   const { tenantId, userId } = req.auth!;
 
-  const { token, expiresAt } = await issueInvite({ tenantId, email, role, invitedBy: userId });
+  const tenantKey = tenantId;
+  const addressKey = `${tenantId}:${email}`;
+  const wait = Math.max(invitesPerTenant.blockedFor(tenantKey), invitesPerAddress.blockedFor(addressKey));
+  if (wait > 0) {
+    // Identifiers only: the address is personal data, and the tenant says enough.
+    logger.warn({ tenantId, invitedBy: userId }, 'invitation refused: over budget');
+    res.set('Retry-After', String(Math.ceil(wait / 1000)));
+    return res.status(429).json({ error: 'too many invitations, try again later' });
+  }
+  invitesPerTenant.hit(tenantKey);
+  invitesPerAddress.hit(addressKey);
 
-  // Until the Notification service exists (Chapter 8), the link reaches a
-  // developer through the dev sink rather than by email.
-  //
-  // This used to be an unconditional logger.warn of the raw token, with a
-  // comment saying it must never survive into production. A comment is not a
-  // control: the sink is off unless AUTH_DEV_TOKEN_SINK is set, logs below the
-  // default level, and refuses to boot under NODE_ENV=production. The logger
-  // also redacts `token` now, so the old line would have emitted "[redacted]"
-  // and quietly stopped working — see dev-sink.ts for why the field it does emit
-  // is named the way it is.
-  emitDevToken(logger, 'invite', {
-    email,
+  // The invitation and the sealed request for its email commit together; see
+  // issueInvite. An earlier invitation to the same address is revoked in the same
+  // transaction, so only the newest link works.
+  const { link, expiresAt } = await issueInvite({
     tenantId,
-    url: `${RESET_URL_BASE}/accept-invite?token=${token}`,
+    email,
+    role,
+    invitedBy: userId,
+    appUrl: RESET_URL_BASE,
+    ttlHours: env.INVITE_TTL_HOURS,
   });
+
+  // Kept for local development, as /forgot-password keeps it: the email is how the
+  // link reaches the invitee, and this is how it reaches a developer working without
+  // Mailpit. Off unless AUTH_DEV_TOKEN_SINK is set, logged below the default level,
+  // and the service refuses to boot with it on under NODE_ENV=production.
+  emitDevToken(logger, 'invite', { email, tenantId, url: link });
 
   return res.status(201).json({ email, role, expiresAt });
 }));
@@ -243,13 +289,18 @@ app.post('/register', ah(async (req, res) => {
        * that nothing ever called -- the pattern was inlined here and the
        * documentation stayed over there. A reader following lookupInvite into
        * that file found the read but not the guarded write.)
+       *
+       * Expiry is part of the guard, judged on the database's clock like the
+       * stamp it compares with: an invitation that ran out between the lookup
+       * and this statement is refused here rather than redeemed a moment late,
+       * as a revoked one is. See lookupInvite.
        */
-      const claimed = await tx.invite.updateMany({
-        where: { id: invite.id, acceptedAt: null, revokedAt: null },
-        data: { acceptedAt: new Date() },
-      });
+      const claimed = await tx.$executeRaw`
+        UPDATE "Invite" SET "acceptedAt" = now() AT TIME ZONE 'UTC'
+         WHERE id = ${invite.id} AND "acceptedAt" IS NULL AND "revokedAt" IS NULL
+           AND "expiresAt" > (now() AT TIME ZONE 'UTC')`;
 
-      if (claimed.count !== 1) {
+      if (claimed !== 1) {
         throw new Error('invite already claimed');
       }
 
@@ -665,7 +716,7 @@ app.post('/forgot-password', ah(async (req, res) => {
     const sealed = await sealEmailRequest({
       messageId,
       tenantId,
-      userId: user.id,
+      subject: user.id,
       email: user.email,
       link,
       kind: 'PASSWORD_RESET',

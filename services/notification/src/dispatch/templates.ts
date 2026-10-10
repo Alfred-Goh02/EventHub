@@ -1,8 +1,8 @@
 /**
- * What a password-reset email says.
+ * What each email says.
  *
  * Plain text and simple HTML, rendered here rather than through a template engine.
- * One email does not justify MJML, which the Field Guide proposes, and every
+ * A handful of emails does not justify MJML, which the Field Guide proposes, and every
  * dependency that renders HTML is one more place for an unescaped value.
  *
  * The link is escaped wherever it lands in HTML. It comes from a claim Auth signed,
@@ -42,6 +42,55 @@ export function renderPasswordReset(params: { link: string; expiresAt: Date }): 
   ].join('\n');
 
   return { subject: 'Reset your EventHub password', text, html };
+}
+
+/** How the email names each role an invitation can grant. A closed set, as the opener's is. */
+const ROLE_PHRASES: Record<'ADMIN' | 'ORGANIZER' | 'ATTENDEE', string> = {
+  ADMIN: 'an administrator',
+  ORGANIZER: 'an organiser',
+  ATTENDEE: 'an attendee',
+};
+
+/**
+ * You have been asked to join.
+ *
+ * THE LINK AND THE ROLE, AND NOTHING ELSE. Not who sent it and not the organisation's
+ * name: Notification knows neither, and each would be text somebody other than this
+ * platform chose, in an email that asks the reader to create an account -- the shape
+ * of every phishing message. Not the address either, which the reader already knows.
+ *
+ * No unsubscribe link and no List-Unsubscribe header: an invitation is not a
+ * subscription, and the reader has no account to hold a preference. Ignoring it is the
+ * way out, and the email says so.
+ */
+export function renderInvitation(params: {
+  link: string;
+  role: 'ADMIN' | 'ORGANIZER' | 'ATTENDEE';
+  expiresAt: Date;
+}): RenderedEmail {
+  const until = `${params.expiresAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  const as = ROLE_PHRASES[params.role];
+  const text = [
+    `You have been invited to join EventHub as ${as}.`,
+    '',
+    'To accept, open this link and choose a password:',
+    params.link,
+    '',
+    `It works once, and stops working at ${until}.`,
+    '',
+    'If you were not expecting this, you can ignore this email. No account is created unless you open the link.',
+  ].join('\n');
+
+  const link = escapeHtml(params.link);
+  const html = [
+    `<p>You have been invited to join EventHub as ${escapeHtml(as)}.</p>`,
+    `<p><a href="${link}">Accept the invitation</a></p>`,
+    `<p>It works once, and stops working at ${escapeHtml(until)}.</p>`,
+    `<p>If the button does not work, copy this address into your browser:<br>${link}</p>`,
+    '<p>If you were not expecting this, you can ignore this email. No account is created unless you open the link.</p>',
+  ].join('\n');
+
+  return { subject: 'You have been invited to EventHub', text, html };
 }
 
 /** The most of a reply an email quotes. The rest is one click away. */

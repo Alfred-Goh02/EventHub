@@ -17,6 +17,28 @@ const authEnvSchema = baseEnvSchema.extend({
    * else.
    */
   PUBLIC_APP_URL: z.string().url().default('http://localhost:3000'),
+
+  /**
+   * POST /invites' budgets. Every invitation is an email this platform sends to an
+   * address an admin typed, so an admin -- or anyone holding an admin's token -- can
+   * point the platform's mail at anybody. The content is fixed, but the complaints
+   * land on the platform's sending reputation, which is what password resets travel
+   * on. See the route for why these numbers.
+   *
+   * Validated rather than read loosely: a typo that became NaN would compare false
+   * against every count, which is "no limit" with nothing to say so.
+   */
+  INVITES_PER_TENANT_PER_HOUR: z.coerce.number().int().positive().default(100),
+  INVITES_PER_ADDRESS_PER_DAY: z.coerce.number().int().positive().default(3),
+
+  /**
+   * How long an invitation, and the sealed email that carries it, stays good. A week:
+   * it waits on a human who may not be at their desk. Configurable because the email
+   * lives as long as the link -- every sealed request on auth.email-requested can be
+   * delivered until it expires -- and a deployment, or a verifier that leaves its
+   * requests on the topic, may want them to die sooner.
+   */
+  INVITE_TTL_HOURS: z.coerce.number().int().positive().default(168),
 });
 
 export const env = loadEnv(authEnvSchema);
