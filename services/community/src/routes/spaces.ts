@@ -41,6 +41,33 @@ const memberSchema = z
     message: 'give a role, a status, or both',
   });
 
+/**
+ * Whether a raw query failed on a unique key: Postgres's 23505, and nothing else.
+ *
+ * P2010 IS NOT A DUPLICATE. It is Prisma's code for ANY raw query that failed, and the
+ * create below used to answer 409 "a space with that slug already exists" for every one
+ * of them. Measured through the gateway: a NUL in the space's name, which Postgres
+ * refuses as 22021, answered that 409 for a slug nobody had. Every other refusal of the
+ * insert would have done the same. They now reach the error handler, and answer 500.
+ *
+ * The Postgres code is where Prisma 7's pg adapter puts it, measured for a real duplicate:
+ * meta.driverAdapterError.cause.originalCode, '23505'. A NUL gave '22021' and a missing
+ * grant '42501' in the same place, both also as P2010. The old `/duplicate key/` match on
+ * the message is gone: the structured code is always there, and a message is text, not a
+ * contract. Should a Prisma upgrade move the code, the mistake is in the safe direction:
+ * a real duplicate answers 500, which the duplicate control in
+ * scripts/verify-client-errors.mjs fails on, rather than every failure answering 409.
+ *
+ * The code alone is enough, without the constraint's name: in this transaction the only
+ * unique key that can be violated is the slug's. Both primary keys are fresh UUIDs, and
+ * the membership's key includes the space id just generated.
+ */
+function isUniqueViolation(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const { code, meta } = err as { code?: unknown; meta?: { driverAdapterError?: { cause?: { originalCode?: unknown } } } };
+  return code === 'P2010' && meta?.driverAdapterError?.cause?.originalCode === '23505';
+}
+
 export function spaceRoutes(
   logger: Logger,
   limit: { middleware: (action: string, perMinute: number) => RequestHandler },
@@ -71,7 +98,7 @@ export function spaceRoutes(
           VALUES (${randomUUID()}, ${tenantId}, ${spaceId}, ${userId}, 'OWNER'::"SpaceRole", 'ACTIVE'::"MemberStatus")`;
       });
     } catch (err) {
-      if ((err as { code?: string }).code === 'P2010' || /duplicate key/.test(String(err))) {
+      if (isUniqueViolation(err)) {
         return res.status(409).json({ error: 'a space with that slug already exists' });
       }
       throw err;

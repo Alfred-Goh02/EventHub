@@ -46,7 +46,7 @@ const PROVIDER_TIMEOUT_MS = (() => {
 })();
 
 /** Not modelled per ticket type yet; the Payment column defaults to the same value. */
-const CURRENCY = 'SGD';
+export const CURRENCY = 'SGD';
 
 const provider: PaymentProvider = withTimeout(
   new FakePaymentProvider(Number(process.env['PAYMENT_FAKE_LATENCY_MS'] ?? 0)),
