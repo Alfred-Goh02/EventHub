@@ -78,6 +78,9 @@ model TicketType {
   sold      Int @default(0)
 
   version Int @default(1)
+  /// What the inventory editor's If-Match compares. Moves only when an organiser edits
+  /// the name, price or total; `version` moves with every sale and expiry too.
+  revision Int @default(1)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

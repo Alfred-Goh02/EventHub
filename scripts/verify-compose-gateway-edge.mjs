@@ -165,17 +165,22 @@ async function main() {
     send(PROXY, '/events', {
       host: TENANT_HOST,
       method: 'OPTIONS',
-      headers: { origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization,content-type,idempotency-key' },
+      headers: { origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization,content-type,idempotency-key,if-match' },
     });
+  // Every header the API requires must be allowed, or a browser cannot send it at all:
+  // If-Match was missing, and the ticket-type editor and Event's PATCH both demand it.
+  const REQUIRED_HEADERS = ['authorization', 'content-type', 'idempotency-key', 'if-match'];
   for (const origin of ['http://acme.eventhub.localhost:5173', 'https://globex.eventhub.com']) {
     const res = await preflight(origin);
+    const allowed = (res.headers['access-control-allow-headers'] ?? '').toLowerCase().split(/\s*,\s*/);
+    const missing = REQUIRED_HEADERS.filter((h) => !allowed.includes(h));
     check(
       res.status === 200 &&
         res.headers['access-control-allow-origin'] === origin &&
         res.headers['access-control-allow-credentials'] === 'true' &&
         /POST/.test(res.headers['access-control-allow-methods'] ?? '') &&
-        /authorization/i.test(res.headers['access-control-allow-headers'] ?? ''),
-      `a preflight from ${origin} is allowed, with credentials (${res.status}, allow-origin ${res.headers['access-control-allow-origin'] ?? 'none'})`,
+        missing.length === 0,
+      `a preflight from ${origin} is allowed, with credentials and every header the API requires (${res.status}, allow-origin ${res.headers['access-control-allow-origin'] ?? 'none'}${missing.length ? `; not allowed: ${missing.join(', ')}` : ''})`,
     );
   }
   for (const [origin, what] of [
