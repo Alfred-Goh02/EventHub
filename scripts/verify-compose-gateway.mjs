@@ -74,7 +74,7 @@ const FORGED = {
 const EXPECTED = {
   auth: { service: 'auth', host: 'tenant', probes: [['/auth/login', '/login'], ['/auth/me', '/me']] },
   event: { service: 'event', host: 'tenant', probes: [['/events', '/events'], ['/events/evt_1?x=1', '/events/evt_1?x=1']] },
-  ticketing: { service: 'ticketing', host: 'tenant', probes: [['/reservations', '/reservations']] },
+  ticketing: { service: 'ticketing', host: 'tenant', probes: [['/reservations', '/reservations'], ['/ticket-types?eventId=evt_1', '/ticket-types?eventId=evt_1']] },
   'ticketing-webhooks': { service: 'ticketing', host: 'api', probes: [['/webhooks/payment', '/webhooks/payment']] },
   live: { service: 'live', host: 'tenant', probes: [['/live', '/live']] },
   search: { service: 'search', host: 'tenant', probes: [['/search?q=jazz', '/search?q=jazz']] },

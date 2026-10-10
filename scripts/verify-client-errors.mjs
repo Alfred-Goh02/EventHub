@@ -82,6 +82,14 @@ const PORT_BASE = 3951;
 /** Past express.json()'s 100 kB default, and inside the gateway's 1 MB. Well-formed JSON, so only its size is wrong. */
 const LARGE_BODY = JSON.stringify({ pad: 'x'.repeat(200 * 1024) });
 const PROBE_PATH = '/health';
+/**
+ * Where a URL that does not percent-decode reaches Express's parameter decoding before
+ * any authentication. Hand-written: which routes have parameters ahead of their auth is
+ * a fact about each router. Event's /events/:id is the one measured answering 500.
+ */
+const URL_PROBES = {
+  event: { bad: '/events/%E0%A4%A', fine: '/events/evt_probe' },
+};
 
 /** The example keys that name a consumer group, and the ones that say where a new group starts. */
 const isGroupKey = (key) => /(^|_)GROUP(_|$)/.test(key);
@@ -266,6 +274,12 @@ async function sharedHandler() {
   });
   app.post('/unexposed-4xx', (_req, _res, next) => next(Object.assign(new Error('a 4xx nobody exposed'), { status: 404 })));
   app.post('/exposed-5xx', (_req, _res, next) => next(Object.assign(new Error('a 5xx marked exposed'), { status: 503, expose: true })));
+  // A route with a parameter, for Express's own URIError, and a plain unexposed 400 to
+  // show that error is let through by what it is, not by its status.
+  app.post('/item/:id', () => {
+    throw thrown;
+  });
+  app.post('/unexposed-400', (_req, _res, next) => next(Object.assign(new Error('a 400 nobody exposed'), { status: 400 })));
   app.post('/after-headers', (_req, res, next) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.write('partial');
@@ -283,6 +297,9 @@ async function sharedHandler() {
       { path: '/throw', body: '{}', status: 500, error: 'internal error', unhandled: true, what: 'a thrown Error' },
       { path: '/unexposed-4xx', body: '{}', status: 500, error: 'internal error', unhandled: true, what: 'an error with status 404 and no expose' },
       { path: '/exposed-5xx', body: '{}', status: 500, error: 'internal error', unhandled: true, what: 'an error with status 503 and expose: true' },
+      { path: '/unexposed-400', body: '{}', status: 500, error: 'internal error', unhandled: true, what: "a plain Error with status 400 and no expose (only Express's URIError is let through)" },
+      { path: '/item/%E0%A4%A', body: '{}', status: 400, error: 'malformed URL', unhandled: false, what: 'a route parameter that is not valid percent-encoding' },
+      { path: '/item/abc', body: '{}', status: 500, error: 'internal error', unhandled: true, what: 'CONTROL: the same route with a parameter that decodes, which reaches the handler' },
       { path: '/throw', body: '{', status: 400, error: 'malformed JSON body', unhandled: false, what: 'a malformed body' },
       { path: '/throw', body: LARGE_BODY, status: 413, error: 'request body too large', unhandled: false, what: 'a 200 kB body' },
       {
@@ -445,6 +462,21 @@ async function bootAndProbe(svc, port, publicKeyB64, kafka, results) {
       wellFormed.status !== undefined && ![400, 413, 500].includes(wellFormed.status),
       `CONTROL: the same path with a well-formed body answers neither 400, 413 nor 500, so the 400 is the body's doing (got ${shown(wellFormed)})`,
     );
+
+    // A URL Express cannot percent-decode, on a service whose parameter route decodes it
+    // before any authentication: measured, Event answered 500 to it with no token. The
+    // control is the same route with a parameter that decodes, which reaches requireAuth.
+    if (URL_PROBES[svc.name]) {
+      const get = (path) =>
+        fetch(`http://127.0.0.1:${port}${path}`).then(
+          async (r) => ({ status: r.status, body: await r.text() }),
+          (err) => ({ error: err.cause?.code ?? err.message }),
+        );
+      const bad = await get(URL_PROBES[svc.name].bad);
+      const fine = await get(URL_PROBES[svc.name].fine);
+      check(bad.status === 400 && errorOf(bad) === 'malformed URL', `${URL_PROBES[svc.name].bad} answers 400 "malformed URL" (got ${shown(bad)})`);
+      check(fine.status === 401, `CONTROL: ${URL_PROBES[svc.name].fine} reaches the route and its requireAuth (got ${shown(fine)})`);
+    }
 
     // The service's own lines for the two requests first, so the absence below is read
     // after the point where an "unhandled error" would have been written.
