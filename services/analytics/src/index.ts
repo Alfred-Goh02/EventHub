@@ -1,6 +1,6 @@
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { env } from './env.js';
 import { createClickHouse } from './clickhouse.js';
 import { requireAnalyst, requireAuth } from './auth.js';
@@ -18,6 +18,10 @@ const ch = createClickHouse({
 });
 
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. Analytics reads
+// ClickHouse, not Postgres, but the rule is the same in every service rather than a list
+// of exceptions to keep. See @eventhub/http.
+app.use(refuseUnstorableText());
 
 /** Liveness: the process is up. Never a dependency, or a slow ClickHouse restarts every replica. */
 app.get('/health', (_req, res) => {

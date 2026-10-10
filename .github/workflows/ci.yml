@@ -474,12 +474,21 @@ jobs:
       # all seven services measured -- and the gateway admits bodies up to 1 MB.
       # They share one handler now, in @eventhub/http, which answers 400 and 413.
       #
+      # And text Postgres cannot store: a NUL (which it refuses, 22021) or a lone
+      # surrogate (which the driver silently stores as U+FFFD), in a body or a
+      # query string. Measured through the gateway, a NUL answered 500 from Event's
+      # create and search and Ticketing's reservations, and 409 "slug already
+      # exists" from Community, which read any failed raw query as a duplicate.
+      # @eventhub/http's refuseUnstorableText answers 400 now, and Community's 409
+      # is for Postgres's 23505 only; this drives the measured routes with minted
+      # tokens, and Ticketing's webhook with real signatures.
+      #
       # Boots every service whose source calls express.json(), from its own
       # .env.example on spare ports it first proves are free, as the step above
       # does and with the same rule for Kafka: every group is this run's, starts
       # at the end, and is deleted afterwards. Here because everything it needs is
       # up and built, and nothing long-running has started yet.
-      - name: Assert a malformed or oversized body answers 4xx from every service
+      - name: Assert a malformed, oversized or unstorable request answers 4xx from every service
         run: node scripts/verify-client-errors.mjs
 
       # The check that actually matters: does the COMPILED output boot and serve?

@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, prisma, withTenant } from './db.js';
 import { closeRedis } from './redis.js';
@@ -17,6 +17,10 @@ const logger = createLogger('live-service');
 const app = express();
 
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. See @eventhub/http.
+// This is the HTTP side only: a question arrives over the WebSocket, which never passes
+// through Express.
+app.use(refuseUnstorableText());
 
 /**
  * ONE http.Server for Express and the WebSocket upgrade.
