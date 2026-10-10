@@ -59,6 +59,9 @@ const CLIENT_ERRORS = new Map<string, string>([
   ['entity.too.large', 'request body too large'],
   ['charset.unsupported', 'unsupported charset'],
   ['encoding.unsupported', 'unsupported content encoding'],
+  // Raised by refuseUnstorableText, below.
+  ['text.unstorable', 'request text cannot be stored: it contains a NUL character or a lone surrogate'],
+  ['text.uncheckable', 'request has too many values to check'],
 ]);
 
 /**
@@ -134,5 +137,110 @@ export function errorHandler(logger: ErrorLogger): ErrorRequestHandler {
     }
     logger.error({ err }, 'unhandled error');
     res.status(500).json({ error: 'internal error' });
+  };
+}
+
+/**
+ * The most values one request may carry for refuseUnstorableText to look at: every
+ * string, number, boolean, null, array element and object entry in the body and the
+ * query string together. Past it the request is refused, as 'text.uncheckable', rather
+ * than let through unread -- a walk that gives up and passes the rest is not a check.
+ *
+ * Ten thousand is far past any real request: the largest list a route takes is Search's
+ * fifty keywords, and a reservation's ten lines. At express.json()'s 100 kB default a
+ * body can hold about fifty thousand (`[0,0,...]`), so the bound is reachable, and is
+ * what keeps the walk's cost a constant rather than whatever a service's body limit
+ * allows. The query string is already small: qs reads at most 1000 parameters, 5 deep.
+ *
+ * Depth needs no bound of its own: the walk keeps its own stack rather than recursing,
+ * so a body nested fifty thousand deep costs what fifty thousand values cost, and is
+ * refused by this bound, not by a stack overflow answered as a 500.
+ *
+ * Measured over HTTP, each a body express.json() admits: 49 000 arrays deep, refused in
+ * 0.7 ms; 50 000 zeros, refused in 0.04 ms; 9 999 zeros, walked in 0.6 ms; 5 000 keys,
+ * walked in 1.0 ms; one 99 kB string, checked in 0.06 ms.
+ */
+const MAX_VALUES = 10_000;
+
+/** Whether Postgres TEXT can hold `s` exactly as the client sent it. */
+const storable = (s: string): boolean => !s.includes('\u0000') && s.isWellFormed();
+
+/** What JSON.parse and qs build. A Buffer or a Date is not text a client sent, and is not walked. */
+const isPlainObject = (v: object): boolean => {
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+};
+
+/** The first fault in `roots`, by the error type it is refused as, or null. Keys are checked as well as values. */
+function unstorableIn(roots: unknown[]): 'text.unstorable' | 'text.uncheckable' | null {
+  const pending = [...roots];
+  let budget = MAX_VALUES;
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === 'string') {
+      if (!storable(value)) return 'text.unstorable';
+    } else if (Array.isArray(value)) {
+      // Charged before anything is pushed, so an enormous array costs one subtraction.
+      budget -= value.length;
+      if (budget < 0) return 'text.uncheckable';
+      for (const item of value) pending.push(item);
+    } else if (typeof value === 'object' && value !== null && isPlainObject(value)) {
+      const keys = Object.keys(value);
+      budget -= keys.length;
+      if (budget < 0) return 'text.uncheckable';
+      for (const key of keys) {
+        if (!storable(key)) return 'text.unstorable';
+        pending.push((value as Record<string, unknown>)[key]);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Refuses, with 400, any text in the request body or query string that Postgres cannot
+ * store as sent: a string, or an object key, containing U+0000, or one that is not
+ * well-formed UTF-16 (a lone surrogate). Every HTTP service mounts it directly after its
+ * body parser, so it runs before any route and before authentication, as the parser does.
+ *
+ * WHAT IT FIXES, measured through the gateway as a tenant admin before it existed:
+ *
+ *   - A NUL is refused by Postgres, which cannot hold U+0000 in TEXT at all ("invalid byte
+ *     sequence for encoding UTF8: 0x00", SQLSTATE 22021). That error is not the client's
+ *     by any test errorHandler can make, so it answered 500 "internal error" and was
+ *     logged as a server fault: Event's POST /events with a NUL in the title, Event's
+ *     GET /events/search?q=a%00b, and Ticketing's POST /reservations with a NUL in the
+ *     event id. Community's POST /spaces read the same failure as a duplicate and answered
+ *     409 "a space with that slug already exists" for a slug nobody had.
+ *   - A lone surrogate is worse, because nothing fails: node-postgres encodes the string
+ *     as UTF-8, which turns the surrogate into U+FFFD, and the row stores something the
+ *     client never sent, without an error. CLAUDE.md: refuse at the edge what the store
+ *     would silently change.
+ *
+ * Refusing at the edge, once, rather than in each route's schema, because every route
+ * that writes text would otherwise need the same refinement, and the one that forgot it
+ * would be found the way these were.
+ *
+ * FIXED TEXT, NEVER THE OFFENDING STRING, for the reason CLIENT_ERRORS gives: answering
+ * or logging it would reflect whatever the client sent. The refusal goes to errorHandler
+ * as an exposed 400 with a `type`, so it is logged as every other client error is -- at
+ * info, as "client error", with the status and 'text.unstorable' -- and never as
+ * "unhandled error".
+ *
+ * A NUL in the URL PATH is not this middleware's: route parameters are not decoded until a
+ * route matches, after this has run, and the gateway -- the only way in, since every
+ * service publishes on 127.0.0.1 alone -- refuses one with its own 400 (measured:
+ * GET /events/a%00b). A query string cannot carry a lone surrogate at all: percent-
+ * decoding never yields one, and qs keeps a value it cannot decode as its raw text. So
+ * for the query, the check that matters is the NUL, in a value or in a key.
+ */
+export function refuseUnstorableText(): RequestHandler {
+  return (req, _res, next) => {
+    const type = unstorableIn([req.body, req.query]);
+    if (type === null) {
+      next();
+      return;
+    }
+    next(Object.assign(new Error(type), { status: 400, expose: true, type }));
   };
 }

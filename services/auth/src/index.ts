@@ -3,7 +3,7 @@ import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
-import { ah, errorHandler } from '@eventhub/http';
+import { ah, errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { env } from './env.js';
 import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
@@ -83,6 +83,8 @@ if (trustProxy) {
 }
 
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. See @eventhub/http.
+app.use(refuseUnstorableText());
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'auth' });

@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import express from 'express';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler } from '@eventhub/http';
+import { errorHandler, refuseUnstorableText } from '@eventhub/http';
 import { env } from './env.js';
 import { clusterInfo, os } from './opensearch.js';
 import { createIndexer, indexerMetrics } from './indexer/consumer.js';
@@ -12,6 +12,10 @@ const logger = createLogger('search-service');
 const app = express();
 
 app.use(express.json());
+// Text Postgres cannot store as sent answers 400 here, before any route. Search reads
+// OpenSearch, not Postgres, but the rule is the same in every service rather than a list
+// of exceptions to keep. See @eventhub/http.
+app.use(refuseUnstorableText());
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'search' });
