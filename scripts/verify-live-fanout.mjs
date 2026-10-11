@@ -276,6 +276,43 @@ async function main() {
       `CONTROL: the same vote under the question's own event counts, as its first: ${JSON.stringify(counted)}`,
     );
 
+    // -----------------------------------------------------------------------
+    console.log('');
+    console.log('  text a database would refuse or change is a bad message');
+    // -----------------------------------------------------------------------
+    /**
+     * A socket never passes through Express, so the HTTP services' refusal of text
+     * Postgres cannot store does not see it. Measured through the gateway before Live
+     * checked it: a NUL in a question answered 'internal' and was logged as a server
+     * error, and a lone surrogate was stored and broadcast to every subscriber as U+FFFD.
+     */
+    const broadcastBefore = b.of('question.created').length;
+    const errorsAtStart = a.of('error').length;
+    a.ws.send(JSON.stringify({ t: 'question.create', eventId, body: 'a\u0000b', clientMsgId: randomUUID() }));
+    // The JSON escape: the frame is valid UTF-8, and only JSON.parse makes the lone surrogate.
+    const loneFrame = `{"t":"question.create","eventId":"${eventId}","body":"lone \\ud800 here","clientMsgId":"${randomUUID()}"}`;
+    check(!JSON.parse(loneFrame).body.isWellFormed(), 'CONTROL: the second frame really parses to a lone surrogate');
+    a.ws.send(loneFrame);
+    await settle(1200);
+    const refusedText = a.of('error').slice(errorsAtStart);
+    check(
+      refusedText.length === 2 && refusedText.every((e) => e.code === 'bad_message'),
+      `a NUL and a lone surrogate in a question are both refused as bad_message (got ${JSON.stringify(refusedText)})`,
+    );
+    check(
+      b.of('question.created').length === broadcastBefore,
+      `and neither reached anyone (${b.of('question.created').length - broadcastBefore} broadcast)`,
+    );
+    check(!podA.log().includes('handler failed'), 'and the pod logged no handler failure for either');
+    const fine = `still café \u{1F600} ${eventId}`;
+    a.ws.send(JSON.stringify({ t: 'question.create', eventId, body: fine, clientMsgId: randomUUID() }));
+    await settle(1200);
+    const intact = b.of('question.created').filter((m) => m.question?.body === fine).length;
+    check(
+      intact === 1,
+      `CONTROL: the same socket still posts, and accented text with an emoji (a surrogate PAIR) arrives intact (${intact} copy)`,
+    );
+
     for (const client of [a, b, c]) client.ws.close();
     await settle(200);
   } finally {
