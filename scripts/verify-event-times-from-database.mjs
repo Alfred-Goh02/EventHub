@@ -385,7 +385,7 @@ async function eventCheck() {
 // TICKETING
 // ---------------------------------------------------------------------------
 
-async function ticketingCheck(admin, groups) {
+async function ticketingCheck(groups) {
   console.log('');
   console.log('  Ticketing: a hold taken through the API');
   const group = `verify-event-times-ticketing-${RUN}`;
@@ -627,7 +627,7 @@ async function main() {
   await admin.connect();
   const groups = [];
   try {
-    for (const run of [authCheck, eventCheck, () => ticketingCheck(admin, groups), () => liveCheck(kafka, admin, groups)]) {
+    for (const run of [authCheck, eventCheck, () => ticketingCheck(groups), () => liveCheck(kafka, admin, groups)]) {
       try {
         await run();
       } catch (err) {
