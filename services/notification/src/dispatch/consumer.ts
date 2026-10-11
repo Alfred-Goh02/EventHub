@@ -498,9 +498,10 @@ export function createDispatcher(opts: {
     /**
      * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value, and an
      * invitation's, is ciphertext only this service can open, around a link that stops
-     * working when its reset or invitation does. Anything else — a reply, carrying the reply's words and
-     * who wrote them — would outlive, in a topic kept forever, the author's delete and a
-     * moderator's hide, which change only Community's database; and replaying it would
+     * working when its reset or invitation does. Anything else — a reply, carrying the
+     * reply's words and who wrote them — would outlive, in a topic kept forever, the
+     * author's delete and a moderator's hide, which change only Community's database; and
+     * replaying it would
      * put those words back on the topic it came from, for every consumer of that topic.
      * So the dead-letter copy keeps the headers — message id, reason, where it came
      * from — and not the value: the count an operator is paged on still moves, and the
