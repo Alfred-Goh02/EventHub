@@ -675,10 +675,17 @@ async function main() {
     const suppressed = await invite(TENANT, A.suppressed);
     const pubSp = await published([suppressed.row?.id].filter(Boolean));
     check(pubSp.ok, 'CONTROL: its request is published');
-    const counted = await waitFor(async () => (await dispatch()).suppressedTotal > beforeSuppressed.suppressedTotal, 30_000);
-    check(Boolean(counted), 'CONTROL: Notification judged it: the suppressed counter moved');
-    const [spDelivery] = await deliveriesOf(TENANT, [suppressed.row?.id ?? '']);
-    check(spDelivery?.status === 'SUPPRESSED' && spDelivery.attempts === 0 && spDelivery.templateKey === 'invitation', `recorded SUPPRESSED with no attempt (${spDelivery?.status}, ${spDelivery?.attempts} attempt(s))`);
+    // Whatever it decided, it decided: a row that is no longer PENDING.
+    const settledRow = await waitFor(async () => {
+      const [d] = await deliveriesOf(TENANT, [suppressed.row?.id ?? '']);
+      return d && d.status !== 'PENDING' ? d : null;
+    }, 30_000);
+    check(Boolean(settledRow), `CONTROL: Notification read it and settled its delivery (${settledRow?.status ?? 'no settled row'})`);
+    check(
+      settledRow?.status === 'SUPPRESSED' && settledRow.attempts === 0 && settledRow.templateKey === 'invitation',
+      `recorded SUPPRESSED with no attempt (${settledRow?.status}, ${settledRow?.attempts} attempt(s))`,
+    );
+    check((await dispatch()).suppressedTotal === beforeSuppressed.suppressedTotal + 1, 'and counted suppressed');
     await sleep(2_000);
     check((await inbox(A.suppressed)).length === 0, 'and nothing reached the address');
 
