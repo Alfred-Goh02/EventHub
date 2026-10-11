@@ -787,6 +787,20 @@ async function main() {
     check(dead.size === forgedIds.length, `CONTROL: the four refused requests are on ${DLQ}, found by message id (${dead.size})`);
     const dlqText = [...dead.values()].map((m) => `${m.value?.toString('latin1') ?? ''} ${Object.entries(m.headers ?? {}).map(([k, v]) => `${k}=${v?.toString()}`).join(' ')}`).join('\n').toLowerCase();
     check(![A.victim, A.bcc].some((a) => dlqText.includes(a)) && !dlqText.includes('evil.example'), 'and their values and headers hold no address and no link in clear: the value kept is the seal');
+    /**
+     * EACH REFUSED FOR ITS OWN DEFECT, read from its dead-letter reason. Two guards can
+     * refuse one message -- an unknown role is also one the template has no words for --
+     * so a count of refusals cannot show either guard missing; the reason can.
+     */
+    const expectedReason = {
+      unsigned: "Auth's signature did not verify",
+      relabelled: 'not a kind of email this service sends',
+      role: 'the invitation names no role it could grant',
+      crlf: 'the seal carries an address that cannot be put in a header',
+    };
+    const reasons = Object.fromEntries(Object.keys(expectedReason).map((n) => [n, dead.get(cases[n])?.headers?.['dlq-reason']?.toString() ?? '']));
+    const wrong = Object.keys(expectedReason).filter((n) => !reasons[n].startsWith(expectedReason[n]));
+    check(wrong.length === 0, wrong.length === 0 ? 'each was refused for its own defect: signature, kind, role, line break' : `refused for another reason: ${wrong.map((n) => `${n} (${reasons[n] || 'none'})`).join('; ')}`);
   } catch (err) {
     const children = [['Notification', notification], ['Auth', auth]];
     const cause = err?.cause ? ` [${err.cause.code ?? err.cause.message ?? String(err.cause)}]` : '';

@@ -337,10 +337,27 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
       return transient(err);
     }
 
+    /**
+     * A message whose email cannot be rendered is the message's fault, and poison. Thrown
+     * from here it would reach kafkajs as a TypeError, which crashes the consumer for
+     * good: measured, with the opener's role check removed, an invitation naming a role
+     * the template has no words for took the whole process down, and a restart would
+     * have read the same message and gone down again.
+     */
+    let sealed: ReturnType<typeof prepareSealed>;
+    try {
+      sealed = prepareSealed(opened);
+    } catch (err) {
+      counters.poison += 1;
+      // The error's name only: its message could quote the values being rendered.
+      const reason = `the email could not be rendered (${err instanceof Error ? err.name : 'unknown'})`;
+      opts.logger.warn({ ...ids, reason }, 'email request refused');
+      return { kind: 'poison', reason };
+    }
+
     // Steps 3 to 5 are the same for every kind: the claim, the suppression list, the
     // send. Only the template differs, and no kind on this path asks a preference or
     // reads a contact card -- the address is in the seal.
-    const sealed = prepareSealed(opened);
     return deliver(
       {
         key: {
