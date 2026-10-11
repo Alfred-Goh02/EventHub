@@ -202,7 +202,12 @@ async function main() {
       `the buyer reads their hold: HELD, 2 x 2500 = 5000 SGD, no payment yet (${held.status} ${held.text.slice(0, 160)})`,
     );
     check(h?.event?.id === EVENT && h?.event?.title === `Reads ${RUN}` && typeof h?.event?.startsAt === 'string', `with the event it is for (${JSON.stringify(h?.event)})`);
-    check(Number.isInteger(h?.holdSecondsLeft) && h.holdSecondsLeft > 0, `and a countdown, while it is a hold (${h?.holdSecondsLeft} s)`);
+    // Ten minutes on the database's clock, with this service an hour fast: 4200 s while
+    // the hold's deadline was stamped from the process's clock.
+    check(
+      Number.isInteger(h?.holdSecondsLeft) && h.holdSecondsLeft > 590 && h.holdSecondsLeft <= 600,
+      `and a countdown from ten minutes, while it is a hold (${h?.holdSecondsLeft} s)`,
+    );
     const expiresInDb = await rendered('expiresAt', A);
     check(h?.holdExpiresAt === expiresInDb, `its deadline is the one stored (${h?.holdExpiresAt} = ${expiresInDb})`);
 

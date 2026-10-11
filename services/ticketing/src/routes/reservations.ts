@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { withTenantRetry } from '../db.js';
+import { databaseNow, withTenantRetry } from '../db.js';
 import { ah } from '@eventhub/http';
 import { requireAuth } from '../auth.js';
 import { emit } from '../outbox.js';
@@ -277,13 +277,19 @@ reservations.post('/', requireAuth, ah(async (req, res) => {
     // directly reduces the throughput ceiling, so all the cheap work happens
     // first.
     // -----------------------------------------------------------------------
+
+    // The deadline on the clock it is enforced by. The sweeper reclaims on
+    // `"expiresAt" <= now()`, and a deadline from this process's clock moved
+    // every hold by however far the two disagreed: an hour fast, seventy minutes.
+    const expiresAt = await databaseNow(tx, HOLD_TTL_MS);
+
     const reservation = await tx.reservation.create({
       data: {
         tenantId,
         eventId,
         userId,
         status: 'HELD',
-        expiresAt: new Date(Date.now() + HOLD_TTL_MS),
+        expiresAt,
       },
       select: { id: true, expiresAt: true, version: true },
     });

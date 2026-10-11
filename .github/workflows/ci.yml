@@ -1590,6 +1590,17 @@ jobs:
       - name: Assert an organiser can put tickets on sale, within capacity, and edit them
         run: node scripts/verify-ticket-types.mjs
 
+      # Every timestamp on a hold or a payment is on the database's clock. The sweeper
+      # reclaims on `"expiresAt" <= now()` and the reconciler selects on startedAt and
+      # nextLookupAt against now(), but the reservation route and the pay endpoint
+      # stamped those columns with `new Date()`, and Prisma fills a @default(now()) in
+      # the client the same way. Measured with Ticketing an hour fast: a ten-minute
+      # hold lasted seventy, and every payment stamp was an hour ahead. This starts its
+      # own Ticketing an hour fast -- on a machine whose clocks agree no check can see
+      # the bug -- and compares each stamp with now() in SQL.
+      - name: Assert holds and payments are stamped from the database's clock
+        run: node scripts/verify-ticketing-clock.mjs
+
       # The buyer's side of it. Nothing answered a buyer after POST /reservations and
       # /pay -- not even after /pay said 202, "being confirmed". Asserts a reservation
       # read through its life (held with a countdown, paid, declined twice showing the
