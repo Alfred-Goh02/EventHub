@@ -1601,6 +1601,16 @@ jobs:
       - name: Assert holds and payments are stamped from the database's clock
         run: node scripts/verify-ticketing-clock.mjs
 
+      # The same bug, everywhere a default stamped a row. Prisma 7 fills
+      # @default(now()) in the client, so every outbox row emit() wrote -- whose
+      # createdAt the relay publishes as occurredAt -- carried the app server's clock,
+      # and Live stamped live.interactions with new Date(). Measured an hour fast:
+      # +3600 s on each. Statically, no schema may have a @default(now()); then Auth's
+      # emit(), and Event, Ticketing and Live through their APIs, each an hour fast,
+      # with every stamp and both live.interactions times compared with now() in SQL.
+      - name: Assert row stamps and event times are the database's clock, in every service
+        run: node scripts/verify-event-times-from-database.mjs
+
       # The buyer's side of it. Nothing answered a buyer after POST /reservations and
       # /pay -- not even after /pay said 202, "being confirmed". Asserts a reservation
       # read through its life (held with a countdown, paid, declined twice showing the
