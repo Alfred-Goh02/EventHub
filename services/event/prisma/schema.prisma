@@ -7,6 +7,19 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one.
+// scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 /// Two invariants hold across every model in this file, and both exist because
 /// row-level security has blind spots:
 ///
@@ -35,7 +48,7 @@ model Venue {
   name      String
   address   String?
   capacity  Int?
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   events Event[]
@@ -74,7 +87,7 @@ model Event {
 
   venueId String?
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   venue    Venue?    @relation(fields: [tenantId, venueId], references: [tenantId, id], onDelete: Restrict)
@@ -99,7 +112,7 @@ model Session {
   speaker   String?
   startsAt  DateTime
   endsAt    DateTime
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   /// Restrict, not Cascade. A cascading delete runs as the table owner and would
@@ -146,7 +159,7 @@ model OutboxMessage {
 
   payload     Json
   publishedAt DateTime?
-  createdAt   DateTime  @default(now())
+  createdAt   DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   /// Failure handling. Without these, ONE row that cannot be serialised is
   /// re-selected by ORDER BY seq on every poll, fails, is re-selected, forever —
