@@ -415,6 +415,21 @@ async function main() {
     return { status: res.status, body: json(res.text), link, token, inviteId: inviteRow?.id ?? null, rows, row: rows[0] ?? null };
   }
 
+  /**
+   * POST /register with an emailed link. Every user it creates is remembered, whether or
+   * not this run expected one, so the cleanup withdraws that user's contact card from
+   * the compacted topic even on a run where a refusal failed.
+   */
+  async function register(link) {
+    const res = await authCall('/register', { token: tokenOf(link), password: PASSWORD });
+    const user = json(res.text);
+    if (res.status === 201 && user?.id) {
+      const [row] = (await authApp.query('SELECT "tenantId" FROM "Invite" WHERE "tokenHash" = $1', [sha256(tokenOf(link))])).rows;
+      registered.push({ tenant: row?.tenantId ?? TENANT, id: user.id });
+    }
+    return res;
+  }
+
   /** Relays, then waits until each of these outbox rows is published: the effect, whoever's pass it was. */
   async function published(rowIds) {
     const relay = await relayOnce();
@@ -590,13 +605,12 @@ async function main() {
 
     console.log('');
     console.log('  the link from the inbox registers the invitee, who can then sign in');
-    const reg1 = await authCall('/register', { token: tokenOf(textLink), password: PASSWORD });
+    const reg1 = await register(textLink);
     const user1 = json(reg1.text);
-    if (user1?.id) registered.push({ tenant: TENANT, id: user1.id });
     check(reg1.status === 201 && user1?.email === A.invitee && user1?.role === 'ATTENDEE', `the emailed link registers ${user1?.email} as ${user1?.role} (${reg1.status})`);
     const login1 = await authCall('/login', { email: A.invitee, password: PASSWORD }, { 'X-Tenant-Slug': slugOf(TENANT) });
     check(login1.status === 200, `and the new user signs in (${login1.status})`);
-    const again1 = await authCall('/register', { token: tokenOf(textLink), password: PASSWORD });
+    const again1 = await register(textLink);
     check(again1.status === 400, `the same link a second time is refused (${again1.status})`);
 
     // ---------------------------------------------------------------------------------
@@ -621,11 +635,10 @@ async function main() {
       afterRe.length === 2 && afterRe.filter((r) => !r.revoked).map((r) => r.id).join() === newer.inviteId,
       `of the address's ${afterRe.length} invitations only the newest is live (${afterRe.filter((r) => !r.revoked).length} live)`,
     );
-    const oldReg = await authCall('/register', { token: tokenOf(olderEmailed), password: PASSWORD });
+    const oldReg = await register(olderEmailed);
     check(oldReg.status === 400 && json(oldReg.text)?.error === 'invalid or expired invite', `the older emailed link is refused (${oldReg.status} ${json(oldReg.text)?.error ?? oldReg.text})`);
-    const newReg = await authCall('/register', { token: tokenOf(newerEmailed), password: PASSWORD });
+    const newReg = await register(newerEmailed);
     const user2 = json(newReg.text);
-    if (user2?.id) registered.push({ tenant: TENANT, id: user2.id });
     check(newReg.status === 201 && user2?.role === 'ORGANIZER', `the newer emailed link registers, at the newer role (${newReg.status}, ${user2?.role})`);
 
     console.log('');
@@ -660,7 +673,7 @@ async function main() {
     check(liveBefore.length === 1 && liveBefore[0].unexpired, 'CONTROL: and the invitation behind it is live');
     const revoked = await authCall('/invites/revoke', { email: `  ${A.revokee.toUpperCase()} ` }, asAdmin(TENANT));
     check(revoked.status === 200 && json(revoked.text)?.revoked === 1, `the admin revokes it, naming the address in capitals with spaces (${revoked.status}, revoked ${json(revoked.text)?.revoked})`);
-    const revokedReg = await authCall('/register', { token: tokenOf(revokeLink), password: PASSWORD });
+    const revokedReg = await register(revokeLink);
     check(revokedReg.status === 400, `the emailed link is refused (${revokedReg.status})`);
 
     console.log('');
