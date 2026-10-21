@@ -719,6 +719,15 @@ jobs:
       - name: Assert every compose service sets its own stop grace period
         run: node scripts/verify-stop-grace-periods.mjs
 
+      # A process compose never starts is a process that never runs. It happened twice:
+      # Ticketing's hold sweeper, then its payment reconciler, each its own entry point
+      # and each missing from compose, so lapsed holds kept their seats and unanswered
+      # charges stayed UNKNOWN. Every file under services/*/src that runs a main(),
+      # handles SIGTERM or listens must be a compose command, or a one-shot under
+      # src/scripts/ that does neither of the last two. Static: compose config only.
+      - name: Assert compose starts every long-running process
+        run: node scripts/verify-compose-starts-every-process.mjs
+
       # The redaction list is a backstop, and a backstop nobody exercises is a
       # list of strings. This one had three holes that reading it did not reveal:
       # `authorization` carried no `*.authorization` while all six of its

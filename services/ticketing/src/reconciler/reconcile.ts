@@ -218,8 +218,18 @@ export async function reconcileOnce(
          * so "what happened to payment X" had no answer in this job's log for the
          * case that matters most -- money that moved. It is also how
          * scripts/verify-compose-payment-reconciler.mjs tells the compose reconciler
-         * settling a payment from anything else doing it. A noop is not logged: it
-         * means somebody else got there first, and this line claims the work.
+         * settling a payment from anything else doing it.
+         *
+         * A noop is NOT logged here, and settleAttempt returns one in two cases:
+         *   - somebody else had already settled the payment, and this process wrote
+         *     nothing;
+         *   - THIS process wrote the Payment, but the reservation had already left
+         *     PENDING_PAYMENT, so nothing else moved. For a charge that succeeded
+         *     that is money taken for seats nobody was given, and settle.ts names
+         *     the payment itself, as a warning ("charge succeeded but the
+         *     reservation was no longer PENDING_PAYMENT"); a failed one it names as
+         *     "charge never happened".
+         * So every payment this process wrote is named in its log, here or there.
          */
         if (settled !== 'noop') {
           logger.info(

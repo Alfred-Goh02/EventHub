@@ -20,8 +20,12 @@
  *   3 x 1001 = 3003  ...03  no answer, and the charge never arrived
  *
  * Both are 202 and UNKNOWN at charge time; only a lookup tells them apart. Then it
- * waits, and requires:
+ * waits -- for the reconciler's own grace and interval, read from its container --
+ * and requires:
  *
+ *   - CONTROL, first: the container is running and NOT restarting, and a
+ *     `payment-reconciler` backend is connected from its address. Running alone is
+ *     what Docker reports of a container crash-looping on settings it refuses;
  *   - CONTROL, before waiting: both are UNKNOWN and unsettled, both reservations
  *     PENDING_PAYMENT, all five seats held. A payment that was never unsettled is
  *     also settled afterwards.
@@ -67,14 +71,6 @@ const RECONCILER = process.env['RECONCILER_CONTAINER'] ?? 'eventhub-ticketing-re
 const API = process.env['TICKETING_CONTAINER'] ?? 'eventhub-ticketing';
 const DATABASE = 'eventhub_ticketing';
 const APP_ROLE = 'eventhub_ticketing_app';
-
-/**
- * Compose runs the reconciler every 5 s with a 20 s grace (docker-compose.yml), so a
- * payment is due 20 s after it started and taken within one interval of that. A
- * minute is room for a pass in progress and a slow runner, without letting
- * "eventually" stand in for "never".
- */
-const DEADLINE_MS = 60_000;
 
 /** A scratch tenant per run: nothing this verifier reads or deletes can be anyone else's. */
 const RUN = randomBytes(4).toString('hex');
@@ -129,8 +125,70 @@ async function containerEnv(name) {
   return Object.fromEntries(JSON.parse(out).map((kv) => [kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1)]));
 }
 
-const running = (name) =>
-  run('docker', ['inspect', '-f', '{{.State.Running}}', name]).then((r) => r.stdout === 'true', () => false);
+/** Docker's view of a container, or null if there is no such container. */
+async function containerState(name) {
+  const state = await run('docker', ['inspect', '-f', '{{json .State}}', name]).then((r) => JSON.parse(r.stdout), () => null);
+  if (state === null) return null;
+  const restarts = await run('docker', ['inspect', '-f', '{{.RestartCount}}', name]).then((r) => Number(r.stdout), () => NaN);
+  return { running: state.Running === true, restarting: state.Restarting === true, status: state.Status, restarts };
+}
+
+/**
+ * Whether a `payment-reconciler` backend is connected FROM the reconciler container.
+ *
+ * `State.Running` is no evidence the process is up: Docker keeps it true while a
+ * crash-looping container waits to be restarted, and a reconciler that refuses its
+ * settings exits before it ever connects. So this asks Postgres, as the superuser
+ * because it sees every backend, the way verify-compose-hold-sweeper.mjs finds its
+ * sweeper: reconciler/index.ts names its pool `payment-reconciler`, and the address
+ * says which container the connection came from. A reconciler run on the host connects
+ * from the gateway's address, which is no container's.
+ *
+ * Polled for up to one interval and a margin: the pool lets an idle connection go
+ * after 30 s, so with an interval longer than that the backend exists only around
+ * each pass.
+ */
+async function reconcilerConnected(withinMs) {
+  const deadline = Date.now() + withinMs;
+  let seen = { addrs: [], ips: [] };
+  for (;;) {
+    const addrs = (
+      await asSuperuser(
+        DATABASE,
+        `SELECT DISTINCT host(client_addr) FROM pg_stat_activity WHERE application_name = 'payment-reconciler' AND client_addr IS NOT NULL`,
+      ).catch(() => '')
+    )
+      .split('\n')
+      .filter(Boolean);
+    // A container between restarts has no address, and the template prints
+    // "invalid IP" for it; only addresses are kept.
+    const ips = await run('docker', ['inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}', RECONCILER]).then(
+      (r) => r.stdout.split(/\s+/).filter((s) => /^[0-9a-f.:]+$/i.test(s) && /[.:]/.test(s)),
+      () => [],
+    );
+    seen = { addrs, ips };
+    if (addrs.some((a) => ips.includes(a)) || Date.now() >= deadline) return { ...seen, connected: addrs.some((a) => ips.includes(a)) };
+    await sleep(500);
+  }
+}
+
+/**
+ * The reconciler's grace and interval: its container's own settings, or where the
+ * container sets none, the defaults reconciler/index.ts parses them with -- read from
+ * that file, so the wait below is never sized against a hand-copied number. A raised
+ * grace would otherwise run past a fixed deadline and report "nothing asked the
+ * provider" about a reconciler that was about to.
+ */
+async function reconcilerTiming() {
+  const env = await containerEnv(RECONCILER);
+  const source = readFileSync(join(ROOT, 'services/ticketing/src/reconciler/index.ts'), 'utf8');
+  const read = (name) => {
+    if (env?.[name]) return { ms: Number(env[name]), from: `${RECONCILER}'s environment` };
+    const m = source.match(new RegExp(`${name}: z\\.coerce\\.number\\(\\)[^\\n]*\\.default\\(([\\d_]+)\\)`));
+    return m ? { ms: Number(m[1].replace(/_/g, '')), from: "reconciler/index.ts's default" } : { ms: NaN, from: 'nowhere' };
+  };
+  return { grace: read('RECONCILE_GRACE_MS'), interval: read('RECONCILE_INTERVAL_MS') };
+}
 
 /**
  * The API's provider timeout: its container's PAYMENT_TIMEOUT_MS, or when that is
@@ -272,8 +330,35 @@ async function cleanup() {
 async function main() {
   console.log(`  scratch tenant ${TENANT}, through the gateway as ${HOST}`);
 
-  const reconcilerUp = await running(RECONCILER);
-  check(reconcilerUp, `CONTROL: the ${RECONCILER} container is running`);
+  const timing = await reconcilerTiming();
+  /**
+   * Due at the grace, taken within an interval of it; three intervals and fifteen
+   * seconds more is room for a pass in progress and a slow runner. Without both
+   * numbers there is nothing to size it by, and that is a failure of its own.
+   */
+  const derived = timing.grace.ms + 3 * timing.interval.ms + 15_000;
+  check(
+    Number.isFinite(derived),
+    `the wait is sized by the reconciler's own settings: grace ${timing.grace.ms} ms (${timing.grace.from}), ` +
+      `interval ${timing.interval.ms} ms (${timing.interval.from})`,
+  );
+  const DEADLINE_MS = Number.isFinite(derived) ? derived : 120_000;
+
+  const container = await containerState(RECONCILER);
+  check(
+    container?.running === true && container?.restarting === false,
+    container === null
+      ? `CONTROL: there is no ${RECONCILER} container`
+      : `CONTROL: ${RECONCILER} is ${container.status}, running=${container.running}, restarting=${container.restarting} ` +
+          `(${container.restarts} restart(s) so far)`,
+  );
+  const connected = await reconcilerConnected(timing.interval.ms + 5_000 || 35_000);
+  check(
+    connected.connected,
+    `CONTROL: a payment-reconciler backend is connected from ${RECONCILER}'s address -- the process got as far as its ` +
+      `database, which a container restarting on settings it refuses never does (backends from ${connected.addrs.join(', ') || 'nowhere'}; ` +
+      `container at ${connected.ips.join(', ') || 'no address'})`,
+  );
   const timeout = await apiTimeoutMs();
 
   const ids = { paidRes: null, lostRes: null, paidPay: null, lostPay: null };
@@ -373,7 +458,9 @@ async function main() {
       `only the paid seats moved held -> sold, exactly once (remaining ${before.inventory?.remaining} -> ${inv.remaining}, ` +
         `held ${before.inventory?.held} -> ${inv.held}, sold ${before.inventory?.sold} -> ${inv.sold})`,
     );
-    check(inv.remaining + inv.held + inv.sold === TOTAL, `remaining + held + sold is still ${TOTAL}`);
+    // No "remaining + held + sold is still TOTAL" check: TicketType_counts_sum is a CHECK
+    // constraint, so it cannot fail here, and a double held -> sold keeps the sum. The
+    // exact counts above are the assertion.
 
     const confirmedFor = (res) => after.messages.filter((m) => m.eventType === 'reservation.confirmed' && m.reservationId === res).length;
     const purchasedFor = (pay) => after.messages.filter((m) => m.eventType === 'tickets.purchased' && m.paymentId === pay).length;
@@ -409,7 +496,9 @@ async function main() {
 
   console.log('');
   if (failures > 0) {
-    console.error(`${failures} check(s) failed. Is the ticketing-reconciler container running? docker compose ps ticketing-reconciler`);
+    console.error(
+      `${failures} check(s) failed. If a CONTROL on the reconciler failed, its own log says why: docker compose logs ticketing-reconciler`,
+    );
     return;
   }
   console.log('the compose stack settles an unanswered charge on its own, in both directions, and only after the API stopped waiting');
