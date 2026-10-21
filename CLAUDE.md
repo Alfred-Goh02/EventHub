@@ -382,6 +382,10 @@ came out +3600 s with Ticketing an hour fast. A default is
 `@default(dbgenerated("CURRENT_TIMESTAMP"))`, which Prisma leaves for Postgres to
 fill, and `verify-event-times-from-database.mjs` refuses a `now()`. `@updatedAt` has
 no such form, so it stays the process's clock and nothing may compare one.
+Introspection reads that default back as `now()`, so `prisma migrate dev` will
+offer `SET DEFAULT CURRENT_TIMESTAMP` for every such column in every migration it
+writes — measured, the same statements again after applying them — and the
+verifier refuses them: delete those lines, they change nothing.
 
 Otherwise keep it in SQL: `now()`, `now() + ($4 || ' seconds')::interval`,
 `extract(epoch from now() - ...)`. Never pass a JS `Date` into one of these

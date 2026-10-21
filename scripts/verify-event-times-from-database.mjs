@@ -5,21 +5,26 @@
  * THEY WERE NOT. Prisma 7 with @prisma/adapter-pg fills `@default(now())` IN THE
  * CLIENT, from the Node process's clock, and sends the value in the INSERT. So every
  * outbox row written by `emit()` carried the app server's time, and the relay
- * publishes an outbox row's createdAt as the event's `occurredAt`, "when the state
- * change COMMITTED". Measured with Ticketing an hour fast: OutboxMessage.createdAt and
- * Reservation.createdAt came out +3600.0 s against Postgres's now(). Live stamped its
- * live.interactions messages with `new Date()` directly, and Analytics stores that as
- * occurred_at.
+ * publishes an outbox row's createdAt as the event's `occurredAt`. Measured with
+ * Ticketing an hour fast: OutboxMessage.createdAt and Reservation.createdAt came out
+ * +3600.0 s against Postgres's now(). Live stamped its live.interactions messages with
+ * `new Date()` directly, and Analytics stores that as occurred_at.
  *
  * The fix is a default Postgres fills: `@default(dbgenerated("CURRENT_TIMESTAMP"))`.
- * Prisma then leaves the column out of the INSERT and reads it back.
+ * Prisma then leaves the column out of the INSERT and reads it back. That value is
+ * now() in the writing transaction: when it BEGAN, on the database's clock, not when
+ * it committed. A transaction that waited on a lock keeps its earlier start, so
+ * occurredAt is a time to report, never an order (see publisher.ts).
  *
  * TWO HALVES.
  *
  *   STATIC. Every services/<name>/prisma/schema.prisma, derived from the directory,
  *   comments stripped first: no `@default(now())`, and every DateTime default is
  *   dbgenerated("CURRENT_TIMESTAMP"). A rule a schema can be checked against, so a
- *   column nothing below exercises is held to it too.
+ *   column nothing below exercises is held to it too. And no migration after this
+ *   change may contain `SET DEFAULT CURRENT_TIMESTAMP`: introspection reads that
+ *   default back as now(), so `prisma migrate dev` offers the same 34 statements in
+ *   every migration it writes from now on, and they change nothing.
  *
  *   BEHAVIOURAL. Each service runs with its clock an HOUR FAST
  *   (scripts/lib/skewed-clock.mjs), because on a machine whose clocks agree a stamp
@@ -33,9 +38,12 @@
  *       QuestionVote.createdAt, and the occurredAt of both live.interactions
  *       messages, read off the topic and compared with now() and with the row.
  *     - Auth: its emit(), imported from dist into a child process with the same
- *       skew, inside a transaction that measures the row and rolls back. Auth's only
- *       outbox writer is the password reset, which seals an email for Notification;
- *       a rolled-back emit has no side effect that outlives the run.
+ *       skew, inside a transaction that measures the row and rolls back. Auth's
+ *       outbox carries sealed email requests for Notification; a rolled-back emit
+ *       has no side effect that outlives the run.
+ *     - Auth: the 90-day ceiling on a refresh family, measured from its oldest
+ *       token's createdAt -- the database's clock now, which it compared with
+ *       Date.now(). Two families aged by SQL to half an hour either side of it.
  *
  * WHY scripts/verify-relay-occurred-at.mjs NEVER SAW THIS. It inserts its outbox row
  * with raw SQL, so Postgres fills createdAt and the row is right whatever Prisma
@@ -45,13 +53,15 @@
  * @updatedAt has no database-side form in Prisma, so those columns stay on the
  * process's clock. Nothing reads one; the schemas and CLAUDE.md say nothing may.
  *
- * Starts its own Ticketing, Event and Live, on this run's consumer group and tenant.
+ * Starts its own Auth, Ticketing, Event and Live, on this run's consumer group and tenant.
  * Needs Postgres, Kafka and Redis up, and auth, event, ticketing and live built:
  *   node scripts/verify-event-times-from-database.mjs
+ * The static half alone, against this tree or a copy of one (no services needed):
+ *   node scripts/verify-event-times-from-database.mjs --static [root]
  */
 
 import { spawn } from 'node:child_process';
-import { createPrivateKey, randomBytes, randomUUID, sign } from 'node:crypto';
+import { createHash, createPrivateKey, randomBytes, randomUUID, sign } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -231,7 +241,46 @@ const DB_DEFAULT = /@default\s*\(\s*dbgenerated\s*\(\s*"CURRENT_TIMESTAMP"\s*\)\
 const DATETIME_FIELD = /^\s*(\w+)\s+DateTime[?]?\s+(.*)$/;
 const SERVICES_WITH_SCHEMAS = ['auth', 'community', 'event', 'live', 'notification', 'ticketing'];
 
-function staticCheck() {
+/**
+ * SQL with `--` and `/* *\/` comments removed, and quoted strings and identifiers kept
+ * whole. A migration that explains, in a comment, why it does NOT set a default is
+ * not one that sets it.
+ */
+function stripSqlComments(sql) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < sql.length; i += 1) {
+    const c = sql[i];
+    if (quote) {
+      out += c;
+      if (c === quote) quote = null;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      out += c;
+    } else if (c === '-' && sql[i + 1] === '-') {
+      while (i < sql.length && sql[i] !== '\n') i += 1;
+      if (sql[i] === '\n') out += '\n';
+    } else if (c === '/' && sql[i + 1] === '*') {
+      // Its newlines are kept, so a line number after it is still the file's.
+      const end = sql.indexOf('*/', i + 2);
+      const stop = end === -1 ? sql.length : end + 2;
+      out += sql.slice(i, stop).replace(/[^\n]/g, '');
+      i = stop - 1;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/**
+ * The newest migration in the repository when every schema's timestamp defaults
+ * became dbgenerated("CURRENT_TIMESTAMP"). No migration up to it sets one.
+ */
+const NOISE_AFTER = '20261010090000';
+const SET_DEFAULT_NOW = /SET\s+DEFAULT\s+CURRENT_TIMESTAMP/i;
+
+function staticCheck(root = ROOT) {
   console.log('');
   console.log('  every schema: a timestamp default is the database\'s');
 
@@ -242,8 +291,8 @@ function staticCheck() {
     `CONTROL: comments are stripped before the scan, and a "//" inside a string is kept (${JSON.stringify(sample)})`,
   );
 
-  const schemas = readdirSync(join(ROOT, 'services'), { withFileTypes: true })
-    .filter((d) => d.isDirectory() && existsSync(join(ROOT, 'services', d.name, 'prisma', 'schema.prisma')))
+  const schemas = readdirSync(join(root, 'services'), { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join(root, 'services', d.name, 'prisma', 'schema.prisma')))
     .map((d) => d.name)
     .sort();
   check(
@@ -254,7 +303,7 @@ function staticCheck() {
   const judged = {};
   let updatedAt = 0;
   for (const service of schemas) {
-    const code = stripComments(readFileSync(join(ROOT, 'services', service, 'prisma', 'schema.prisma'), 'utf8')).split(/\r?\n/);
+    const code = stripComments(readFileSync(join(root, 'services', service, 'prisma', 'schema.prisma'), 'utf8')).split(/\r?\n/);
     const nows = [];
     const defaults = [];
     const others = [];
@@ -279,6 +328,48 @@ function staticCheck() {
     `CONTROL: the scan found DateTime defaults to judge in each of the six (${Object.entries(judged).map(([s, n]) => `${s} ${n}`).join(', ')})`,
   );
   console.log(`    note  ${updatedAt} @updatedAt column(s) stay on the process's clock: Prisma has no database-side form, and nothing may compare one`);
+
+  /**
+   * THE NOISE THE FIX LEAVES BEHIND. Introspection reads DEFAULT CURRENT_TIMESTAMP
+   * back as @default(now()), so `prisma migrate diff` and `prisma migrate dev` see a
+   * difference that applying it does not remove (measured: the same statements again
+   * after running them), and offer `ALTER ... SET DEFAULT CURRENT_TIMESTAMP` for all
+   * 34 columns in every migration they write from now on. Each is a default the
+   * column already has. Refused in any migration newer than the fix.
+   */
+  console.log('');
+  console.log("  every migration since: none carries Prisma's SET DEFAULT CURRENT_TIMESTAMP noise");
+  const flagged = stripSqlComments(`-- SET DEFAULT CURRENT_TIMESTAMP\n/* SET DEFAULT\nCURRENT_TIMESTAMP */\nALTER TABLE "Q" ALTER COLUMN "createdAt" SET DEFAULT CURRENT_TIMESTAMP;\n`);
+  const found = [...flagged.matchAll(new RegExp(SET_DEFAULT_NOW, 'gi'))].map((m) => flagged.slice(0, m.index).split('\n').length);
+  check(
+    found.length === 1 && found[0] === 4,
+    `CONTROL: the detector finds the statement, on its own line, and not the same words in a -- or /* */ comment (line(s) ${found.join(', ') || 'none'})`,
+  );
+  let read = 0;
+  let newer = 0;
+  const offenders = [];
+  for (const service of readdirSync(join(root, 'services')).sort()) {
+    const dir = join(root, 'services', service, 'prisma', 'migrations');
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir).sort()) {
+      const file = join(dir, name, 'migration.sql');
+      const stamp = /^(\d{14})_/.exec(name)?.[1];
+      if (!stamp || !existsSync(file)) continue;
+      read += 1;
+      if (stamp <= NOISE_AFTER) continue;
+      newer += 1;
+      const code = stripSqlComments(readFileSync(file, 'utf8'));
+      const hits = [...code.matchAll(new RegExp(SET_DEFAULT_NOW, 'gi'))].map((m) => code.slice(0, m.index).split('\n').length);
+      if (hits.length) offenders.push(`services/${service}/prisma/migrations/${name}/migration.sql, line(s) ${hits.join(', ')}`);
+    }
+  }
+  check(read > 0, `CONTROL: ${read} migrations read from services/*/prisma/migrations, ${newer} of them newer than ${NOISE_AFTER}`);
+  check(
+    offenders.length === 0,
+    offenders.length === 0
+      ? `no migration newer than ${NOISE_AFTER} sets a timestamp default to CURRENT_TIMESTAMP`
+      : `delete the SET DEFAULT CURRENT_TIMESTAMP lines from ${offenders.join('; ')}. They are Prisma's introspection noise: the column's default is already CURRENT_TIMESTAMP, and Prisma will offer them again in every migration`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +410,87 @@ async function authCheck() {
     const left = await inTenant(db, () => db.query(`SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1`, [TENANT]));
     check(left.rows[0].n === 0, `cleanup: the probe rolled back, and ${left.rows[0].n} outbox row(s) are left in this run's tenant`);
   } finally {
+    await db.end();
+  }
+}
+
+/**
+ * The 90-day ceiling on a refresh family is measured from min("createdAt"), which is
+ * now Postgres's clock. It was compared with Date.now() in JS, so the ceiling moved by
+ * however far Auth's clock and the database's disagree. Each family is aged by SQL, on
+ * the database's clock, half an hour either side of the ceiling; Auth is an hour fast,
+ * so by its own clock both are past it.
+ */
+async function authCeilingCheck() {
+  console.log('');
+  console.log("  Auth: the 90-day ceiling on a refresh family, on the database's clock");
+  const svc = await start('auth', 3994);
+  const db = new pg.Client({ connectionString: svc.env.APP_DATABASE_URL });
+  await db.connect();
+  const families = [];
+  let successors = 0;
+  try {
+    if (!svc.up) return;
+    const post = async (path, body, headers = {}) => {
+      const res = await fetch(`http://127.0.0.1:3994${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+    // The seeded account (services/auth/prisma/seed.ts), which every run of CI seeds.
+    const login = () => post('/login', { email: 'alice@acme.com', password: 'hunter2222' }, { 'X-Tenant-Slug': 'acme' });
+    const sha256 = (t) => createHash('sha256').update(t).digest('hex');
+    /** Ages the token's whole family to 90 days plus `offset`, on the database's clock. */
+    const age = async (token, offset) => {
+      const r = await db.query(
+        `UPDATE "RefreshToken" SET "createdAt" = now() - interval '90 days' + $2::interval
+          WHERE "familyId" = (SELECT "familyId" FROM "RefreshToken" WHERE "tokenHash" = $1)`,
+        [sha256(token), offset],
+      );
+      const f = await db.query(`SELECT "familyId" FROM "RefreshToken" WHERE "tokenHash" = $1`, [sha256(token)]);
+      if (f.rows[0]) families.push(f.rows[0].familyId);
+      return r.rowCount;
+    };
+
+    const inside = await login();
+    const outside = await login();
+    check(
+      inside.status === 200 && outside.status === 200 && Boolean(inside.body?.refreshToken && outside.body?.refreshToken),
+      `CONTROL: the seeded account signs in twice, two families (${inside.status}, ${outside.status})`,
+    );
+    if (!inside.body?.refreshToken || !outside.body?.refreshToken) return;
+    const agedInside = await age(inside.body.refreshToken, '30 minutes');
+    const agedOutside = await age(outside.body.refreshToken, '-30 minutes');
+    check(agedInside === 1 && agedOutside === 1, `CONTROL: each family is aged by SQL (${agedInside}, ${agedOutside} row)`);
+
+    const kept = await post('/refresh', { refreshToken: inside.body.refreshToken });
+    if (kept.status === 200) successors += 1;
+    check(
+      kept.status === 200,
+      `a family 30 minutes short of 90 days by the database's clock still refreshes (${kept.status}; by this Auth's clock, an hour fast, it is 30 minutes past)`,
+    );
+    const refused = await post('/refresh', { refreshToken: outside.body.refreshToken });
+    if (refused.status === 200) successors += 1;
+    check(refused.status === 401, `CONTROL: one 30 minutes past 90 days is refused, so the ceiling still holds (${refused.status})`);
+  } catch (err) {
+    check(false, `Auth's ceiling stopped early: ${err instanceof Error ? err.stack : String(err)}`);
+  } finally {
+    await svc.stop();
+    // RefreshToken is read before any tenant exists, so it has no tenant policy; the
+    // two families are this run's by id.
+    const deleted = await db
+      .query(`DELETE FROM "RefreshToken" WHERE "familyId" = ANY($1)`, [families])
+      .then((r) => r.rowCount, (err) => err.message);
+    const left = await db
+      .query(`SELECT count(*)::int AS n FROM "RefreshToken" WHERE "familyId" = ANY($1)`, [families])
+      .then((r) => r.rows[0].n, () => -1);
+    if (families.length) {
+      // One per family, and a successor for each refresh that was let through.
+      const expected = families.length + successors;
+      check(deleted === expected && left === 0, `cleanup: deleted ${deleted} of ${expected} refresh token(s) of this run's ${families.length} families; ${left} left`);
+    }
     await db.end();
   }
 }
@@ -618,6 +790,16 @@ async function liveCheck(kafka, admin, groups) {
 }
 
 async function main() {
+  // `--static [root]`: the static half only, against another tree's services/ if one is
+  // named. How a planted migration is shown red without committing it.
+  if (process.argv[2] === '--static') {
+    staticCheck(process.argv[3] ? resolve(process.argv[3]) : ROOT);
+    console.log('');
+    if (failures > 0) console.error(`FAIL: ${failures} assertion(s) failed`);
+    else console.log('the static half holds');
+    return;
+  }
+
   console.log(`  run ${RUN}, tenant ${TENANT}`);
   staticCheck();
 
@@ -627,7 +809,7 @@ async function main() {
   await admin.connect();
   const groups = [];
   try {
-    for (const run of [authCheck, eventCheck, () => ticketingCheck(groups), () => liveCheck(kafka, admin, groups)]) {
+    for (const run of [authCheck, authCeilingCheck, eventCheck, () => ticketingCheck(groups), () => liveCheck(kafka, admin, groups)]) {
       try {
         await run();
       } catch (err) {
