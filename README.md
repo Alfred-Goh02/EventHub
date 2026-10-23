@@ -548,7 +548,12 @@ and nothing else, and no unsubscribe: an invitation is not a subscription. Invit
 an address again revokes the earlier link, and `POST /invites/revoke` stops an
 emailed one. Every invitation is mail the platform sends to an address an admin
 typed, so `POST /invites` is budgeted per tenant: `INVITES_PER_TENANT_PER_HOUR`
-(100) and `INVITES_PER_ADDRESS_PER_DAY` (3), and past either it answers 429.
+(100) and `INVITES_PER_ADDRESS_PER_DAY` (3), and past either it answers 429. The
+address budget counts mailboxes, not spellings: a `+tag`, and dots at Gmail, do not
+buy a fresh one. An invitation lives `INVITE_TTL_HOURS` (at most a week), and
+`auth.email-requested` keeps a request eight days, so a dispatcher outage cannot
+outlast an invitation and lose it. A dead-lettered invitation replayed after the
+sweep has ended its claim is still sent, once.
 
 A send that fails for a reason that may pass waits in delayed retry tiers
 (`notification.retry.1` to `.3`) without holding up anyone else on its partition.
@@ -619,3 +624,8 @@ Known gaps, named rather than hidden:
   token already issued.
 - Notification cannot see a revocation. An invitation revoked after it was queued
   but before it was sent still goes out, with a link `/register` refuses.
+- Invitations share the password-reset topic and its consumer, so a reset can wait
+  behind the invitations on its partition: measured at 32 ms an invitation here, a
+  reset behind sixty went out 2.1 s late. It takes about a hundred tenants spending
+  their whole hourly invitation budget at once, against a slow provider, to cost a
+  reset its half hour; past that, invitations want a topic and a route of their own.
