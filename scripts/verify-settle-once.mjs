@@ -124,10 +124,24 @@ async function seed(label) {
        VALUES ($1,$2,$3,$4,1,1000)`,
       [`${run}_${label}_item`, TENANT, ids.reservation, ids.ticketType],
     );
+    /**
+     * Started NOW, not two hours ago, and it used to be two hours ago.
+     *
+     * settleAttempt() never reads startedAt, so the age bought this test nothing --
+     * and it made the row a candidate for every reconciler running, the moment it
+     * committed. Compose runs one now (ticketing-reconciler), whose fake provider
+     * answers "succeeded" for 1000, so a pass landing between this INSERT and the
+     * race below settles the row first and both routes report noop. Measured with
+     * that window widened to 6 s, one compose interval: "the first settlement did
+     * the work, got 'noop'" -- while the seat-sold-once and one-purchase checks beside
+     * it stayed green, for the compose reconciler's work. A payment started now is
+     * inside any deployed reconciler's grace, which is more than twice the provider
+     * timeout and so over 16 s by default.
+     */
     await app.query(
       `INSERT INTO "Payment"
          (id,"tenantId","reservationId","userId","amountCents",currency,status,"startedAt","updatedAt")
-       VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now() - interval '2 hours', now())`,
+       VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now(), now())`,
       [ids.payment, TENANT, ids.reservation],
     );
   });

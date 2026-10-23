@@ -84,6 +84,15 @@ async function seed() {
 
     // Oldest first, so the poison row heads the batch — which is the whole
     // problem being fixed.
+    //
+    // SECONDS old, not hours: past these passes' 1000 ms grace and inside any
+    // deployed reconciler's, which is over twice the provider timeout -- more
+    // than 16 s by default. Ten hours old, the rows were every reconciler's on
+    // commit, and compose runs one now; its fake provider answers "succeeded"
+    // for 1000. Measured with the gap before pass 1 widened to 6 s, one compose
+    // interval: it settled all three, the poison row included, and this file
+    // reported 11 FAIL against code that was right. verify-reconciler-poison-row
+    // has the same note.
     for (const [i, label] of LABELS.entries()) {
       const reservationId = `${run}_res_${label}`;
       await app.query(
@@ -101,8 +110,8 @@ async function seed() {
       await app.query(
         `INSERT INTO "Payment"
            (id,"tenantId","reservationId","userId","amountCents",currency,status,"startedAt","updatedAt")
-         VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now() - ($4::int * interval '1 hour'), now())`,
-        [`${run}_pay_${label}`, TENANT, reservationId, 10 - i],
+         VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now() - ($4::int * interval '1 second'), now())`,
+        [`${run}_pay_${label}`, TENANT, reservationId, 4 - i],
       );
     }
   });
