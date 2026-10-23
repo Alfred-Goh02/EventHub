@@ -594,6 +594,11 @@ services:
       # Local only, and the same value the .env.example carries. A real secret
       # would come from the environment, never from a committed file.
       PAYMENT_WEBHOOK_SECRET: dev_webhook_secret
+      # How long /pay waits for the provider before recording UNKNOWN. Set here,
+      # though it is the code's default, because ticketing-reconciler below must
+      # agree with it and reads it through this anchor: its grace period is sized
+      # against THIS process's timeout, and two copies of a number drift.
+      PAYMENT_TIMEOUT_MS: &payment-timeout 8000
     volumes:
       - jwt-public:/run/eventhub/keys:ro
     working_dir: /app/services/ticketing
@@ -636,6 +641,57 @@ services:
       SWEEPER_INTERVAL_MS: 5000
     working_dir: /app/services/ticketing
     command: ["node", "dist/sweeper/index.js"]
+
+  # ---------------------------------------------------------------------------
+  # Ticketing's payment reconciler: settles every charge the provider never
+  # answered, by asking the provider what became of it.
+  #
+  # Its own process, on the sweeper's credential, for the reasons in
+  # src/reconciler/index.ts: "which payments never settled" has no tenant in it,
+  # so it works across tenants on a role bounded by grants rather than the API's;
+  # and it is the one background job that talks off-box, so it is kept out of the
+  # sweeper's loop, where a slow provider lookup would hold up every expiry.
+  #
+  # Until this was added nothing ran it, the same gap the sweeper had. The webhook
+  # is the accelerator and this is the guaranteed route, so with no reconciler a
+  # provider that never answered left the payment UNKNOWN and the reservation
+  # PENDING_PAYMENT for good. The sweeper skips PENDING_PAYMENT by design, so the
+  # seats never came back, and a charge that DID go through was never confirmed.
+  # Measured on one local stack: 8 payments UNKNOWN with settledAt NULL on
+  # PENDING_PAYMENT reservations, the oldest started 35 days before; only a
+  # verifier's own --once pass, happening to run, ever settled them.
+  #
+  # GRACE AND TIMEOUT ARE ONE DECISION. The reconciler refuses to start unless
+  # RECONCILE_GRACE_MS is more than twice PAYMENT_TIMEOUT_MS: below that it looks
+  # up charges the API is still waiting on, is told they do not exist, and
+  # releases the seats of a customer mid-checkout. That check compares the job's
+  # OWN copy of the timeout, so the copy is taken from Ticketing's environment
+  # above through the anchor, and the two containers cannot disagree. 20 s of
+  # grace rather than the example's 60 s, so an unanswered charge here is
+  # settled within half a minute and a verifier can watch it happen.
+  #
+  # It stops on SIGTERM by ending its pool and exiting: measured 0.4 s and exit 0
+  # with the anchor's 15 s grace, so the ceiling is never what ends it.
+  #
+  # scripts/verify-compose-payment-reconciler.mjs pays through the gateway with
+  # amounts the fake provider does not answer, and requires both settled -- one
+  # confirmed, one returned to a hold -- without starting a reconciler of its own.
+  # ---------------------------------------------------------------------------
+  ticketing-reconciler:
+    <<: *app
+    container_name: eventhub-ticketing-reconciler
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      SWEEPER_DATABASE_URL: postgresql://eventhub_ticketing_sweeper:eventhub_ticketing_sweeper@postgres:5432/eventhub_ticketing
+      RECONCILE_BATCH_SIZE: 50
+      RECONCILE_INTERVAL_MS: 5000
+      RECONCILE_GRACE_MS: 20000
+      PAYMENT_TIMEOUT_MS: *payment-timeout
+    working_dir: /app/services/ticketing
+    command: ["node", "dist/reconciler/index.js"]
 
   # ---------------------------------------------------------------------------
   # The Live service: the only stateful one in the fleet.

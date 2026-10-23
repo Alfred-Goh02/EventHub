@@ -75,6 +75,16 @@ async function tx(fn) {
  * HEAD of the batch. That ordering is the whole point: the query is
  * ORDER BY "startedAt", so a row that throws first is a row that blocks
  * everything behind it.
+ *
+ * SECONDS OLD, NOT HOURS. This pass takes anything over 1000 ms; any deployed
+ * reconciler waits more than twice the provider timeout, over 16 s by default.
+ * Seeded ten hours old, the rows were every reconciler's the moment they
+ * committed, and compose runs one now: its fake provider answers "succeeded"
+ * for 1000, so a pass landing before this one settled all three, the poison row
+ * included. Measured with the window widened to 6 s, one compose interval: 5
+ * FAIL, "asked the provider about 0 attempt(s)" -- and "the attempts behind it
+ * settled" green beside them, for the compose reconciler's work. Two to four
+ * seconds old is past this pass's grace and inside every deployed one's.
  */
 async function seed() {
   const eventId = `${run}_evt`;
@@ -111,8 +121,8 @@ async function seed() {
       await app.query(
         `INSERT INTO "Payment"
            (id,"tenantId","reservationId","userId","amountCents",currency,status,"startedAt","updatedAt")
-         VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now() - ($4::int * interval '1 hour'), now())`,
-        [`${run}_pay_${label}`, TENANT, reservationId, 10 - i],
+         VALUES ($1,$2,$3,'u_test',1000,'SGD','UNKNOWN', now() - ($4::int * interval '1 second'), now())`,
+        [`${run}_pay_${label}`, TENANT, reservationId, 4 - i],
       );
     }
   });

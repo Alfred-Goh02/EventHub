@@ -87,7 +87,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
 | `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 95 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 97 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -228,9 +228,20 @@ That builds one image, shared by every application service, and then:
 2. runs a `setup` container that migrates all six databases, seeds Auth,
    creates the Kafka topics, registers the Avro schemas, creates the search index,
    migrates ClickHouse, and generates a signing keypair into a volume
-3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, and the outbox relays for Event, Ticketing and Auth
+3. and only then starts Auth, Event, Ticketing, Live, Search, Analytics, its Kafka ingest, Notification, Ticketing's hold sweeper and payment reconciler, and the outbox relays for Event, Ticketing and Auth
 
 Beside them it starts the gateway, Kong, on port 8000.
+
+The sweeper and the reconciler are containers of their own with no port, because they
+work across tenants, on a credential bounded by grants rather than the API's
+tenant-scoped one. The reconciler asks the
+provider about any charge that has gone unanswered for 20 seconds, so a payment
+answered `202` here is confirmed, or its seats returned to a hold, within about half
+a minute; `node scripts/verify-compose-payment-reconciler.mjs` pays twice through the
+gateway and watches both happen. Both were once processes compose never started, so
+`scripts/verify-compose-starts-every-process.mjs` now fails the build on any file under
+`services/*/src` that runs a `main()`, handles SIGTERM or listens, unless a compose
+service runs it or it is a one-shot under `src/scripts/`.
 
 `--wait` returns when every container is **healthy**, so a zero exit status means
 the system is up rather than merely that the containers were created.
