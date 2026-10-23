@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { withTenant } from '../db.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import { env } from '../env.js';
+import { ABANDONED } from '../sweeper/sweep.js';
 import { addressHash } from './suppression.js';
 
 /**
@@ -26,9 +27,18 @@ export type Claim =
   /**
    * Someone claimed it first. PENDING means an earlier attempt claimed it and never
    * recorded an outcome — it crashed, or the send failed transiently — so it is
-   * still ours to try. Any other status is final.
+   * still ours to try. Any other status is final, with one exception: `abandoned`.
    */
-  | { claimed: false; status: DeliveryStatus };
+  | {
+      claimed: false;
+      status: DeliveryStatus;
+      /**
+       * FAILED by the sweeper, not by an outcome: claimed, never completed, and ended
+       * an hour later so that PENDING keeps meaning "in flight". Nothing was refused
+       * and nothing was sent, so it is not settled. See reopenAbandoned.
+       */
+      abandoned: boolean;
+    };
 
 export interface DeliveryKey {
   tenantId: string;
@@ -74,13 +84,36 @@ export async function claimDelivery(k: DeliveryKey & { category: string }): Prom
   return withTenant(k.tenantId, async (tx) => {
     if (await insertClaim(tx, k)) return { claimed: true };
 
-    const rows = await tx.$queryRaw<Array<{ status: DeliveryStatus }>>`
-      SELECT d.status::text AS status FROM "NotificationDelivery" d
+    const rows = await tx.$queryRaw<Array<{ status: DeliveryStatus; lastError: string | null }>>`
+      SELECT d.status::text AS status, d."lastError" FROM "NotificationDelivery" d
        WHERE d."tenantId" = ${k.tenantId} AND d."idempotencyKey" = ${key}`;
-    const status = rows[0]?.status;
-    if (!status) throw new Error(`claim conflicted but no delivery row is visible for ${key}`);
-    return { claimed: false, status };
+    const row = rows[0];
+    if (!row) throw new Error(`claim conflicted but no delivery row is visible for ${key}`);
+    return { claimed: false, status: row.status, abandoned: row.status === 'FAILED' && row.lastError === ABANDONED };
   });
+}
+
+/**
+ * Takes an abandoned claim back, so this attempt may finish what the first one did not.
+ *
+ * AN ENDED CLAIM IS NOT A SENT ONE. The sweeper ends a claim left PENDING for an hour,
+ * and until invitations nothing could arrive after that: a reset's seal is dead in
+ * thirty minutes. An invitation's lives for days, so `dlq:replay` of one that was
+ * dead-lettered more than an hour ago meets its own claim FAILED as abandoned. Read as
+ * final, that replay sent nothing and the script still printed "replayed".
+ *
+ * Only a row the SWEEPER ended moves, and only back to PENDING, in one statement, so
+ * of two attempts that read it abandoned at once only one gets it back; the other
+ * then finds it PENDING, which is the usual resume. A FAILED row with any other
+ * reason — a refusal, a decline — stays final.
+ */
+export async function reopenAbandoned(k: DeliveryKey): Promise<boolean> {
+  const key = idempotencyKey(k);
+  const moved = await withTenant(k.tenantId, (tx) => tx.$executeRaw`
+    UPDATE "NotificationDelivery" SET status = 'PENDING', "failedAt" = NULL, "lastError" = NULL
+     WHERE "tenantId" = ${k.tenantId} AND "idempotencyKey" = ${key}
+       AND status = 'FAILED' AND "lastError" = ${ABANDONED}`);
+  return moved === 1;
 }
 
 /** Only a PENDING row moves, so a late duplicate can never overwrite a final outcome. */

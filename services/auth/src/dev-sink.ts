@@ -75,6 +75,7 @@ export function emitDevToken(
       tenantId: fields.tenantId,
       devOnlyResetUrl: fields.url,
     },
-    'DEV TOKEN SINK — this would be emailed; never enable in production',
+    // True of both kinds: each link is emailed through Notification as well.
+    'DEV TOKEN SINK — a copy of a link that is also emailed; never enable in production',
   );
 }

@@ -88,12 +88,19 @@ const TOPICS = [
     topic: 'auth.email-requested',
     numPartitions: 3,
     replicationFactor: 1,
-    // A day, not the broker's week. What travels here is sealed, so retention is not
-    // what protects the link. But the link inside dies thirty minutes after it is
-    // issued, so a day-old request can only ever be dropped, and keeping ciphertext
-    // of dead credentials longer buys nothing.
-    configEntries: [{ name: 'retention.ms', value: '86400000' }],
-    note: 'Sealed email requests from Auth, for Notification. Keyed by user id.',
+    // EIGHT DAYS: longer than the longest seal on it. An invitation's seal lives as
+    // long as the invitation, up to INVITE_TTL_HOURS, which Auth refuses above 168. At
+    // a day, a dispatcher down for more than a day lost the invitations queued behind
+    // it with no sent-log row, no dead-letter copy and no record anywhere, while their
+    // links still worked. Retention counts from when the relay published, which is
+    // after the seal's clock started, so a week would do; the eighth day is margin,
+    // and keeps the value off the broker's own default of exactly a week.
+    //
+    // Keeping resets longer costs nothing. What travels here is sealed, so retention is
+    // not what protects a link, and a reset's seal is dead thirty minutes after issue:
+    // the extra week holds only ciphertext that can no longer be acted on.
+    configEntries: [{ name: 'retention.ms', value: '691200000' }],
+    note: 'Sealed email requests from Auth, for Notification: resets and invitations. Keyed by the subject, a user or an invitation.',
   },
   {
     topic: 'auth.user-contact',

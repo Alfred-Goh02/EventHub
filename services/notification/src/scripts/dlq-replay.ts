@@ -12,9 +12,15 @@ import { DLQ_HEADERS, DLQ_TOPIC, header, originalHeaders } from '../dispatch/ret
  * usual reason a message is there is a bug that has to be fixed first, and an
  * automatic replay of a message that fails for a reason nobody fixed is a loop.
  *
- * SAFE TO REPEAT. The replayed message is the original, message id included, so
- * the sent-log claim sees a delivery already recorded SENT and sends nothing. An
- * expired reset or invitation is skipped as expired.
+ * SAFE TO REPEAT. The replayed message is the original, message id included, so the
+ * sent-log claim sees a delivery already recorded SENT and sends nothing. An expired
+ * reset or invitation is skipped as expired.
+ *
+ * "REPLAYED" MEANS PUT BACK ON THE TOPIC, NOT SENT. Whether it is sent is the
+ * dispatcher's decision, read from the sent-log. A claim the sweeper ended as abandoned
+ * -- every dead-lettered delivery's, an hour after it was claimed -- is taken back and
+ * sent once; until invitations that could not happen, because a reset's link is dead by
+ * then, and a replay more than an hour late printed "replayed" and sent nothing.
  *
  * SEALED REQUESTS ONLY: a password reset or an invitation. Only a sealed value is kept
  * in the dead-letter topic; a reply's copy has none, and this says so rather than

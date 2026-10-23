@@ -10,7 +10,8 @@ import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
 import { requireAuth, requireRole } from './middleware/auth.js';
 import { issueRefreshToken, rotateRefreshToken, revokeFamily } from './tokens.js';
-import { issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
+import { ROLES } from '@eventhub/types';
+import { budgetAddress, issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
 import { issueResetToken, lookupResetToken } from './password-reset.js';
 import { emitDevToken } from './dev-sink.js';
 import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
@@ -117,12 +118,17 @@ const emailField = z
   // "  alice@acme.com  " with a 400 -- and a pasted address carrying a trailing
   // space is a copy-paste artefact, not a malformed address.
   .trim()
+  // RFC 5321's limit on a path, 254 once the angle brackets are taken off. Nothing
+  // longer can be delivered, and nothing longer becomes a rate-limit key: /invites
+  // keeps its key for a day, and /login and /forgot-password key on the address too.
+  .max(254)
   .email()
   .transform((e) => e.toLowerCase());
 
 const inviteSchema = z.object({
   email: emailField,
-  role: z.enum(['ADMIN', 'ORGANIZER', 'ATTENDEE']).default('ATTENDEE'),
+  // The shared list, not a copy: @eventhub/types is checked against Auth's Role enum.
+  role: z.enum(ROLES).default('ATTENDEE'),
 });
 
 /**
@@ -148,7 +154,9 @@ const inviteSchema = z.object({
  * spend another's budget, and a refusal says only what this tenant has already sent:
  * whether some other tenant has invited the same address is never part of the count.
  * The address is the schema's normalised form, trimmed and lower-cased, so
- * "  Bob@Example.COM " spends the same budget as bob@example.com.
+ * "  Bob@Example.COM " spends the same budget as bob@example.com -- and then reduced to
+ * the mailbox it reaches (budgetAddress in invites.ts), so bob+1@example.com and, at
+ * Gmail, b.o.b@gmail.com spend it too.
  *
  * CHECKED, THEN COUNTED. Both are asked with blockedFor() before either is hit, so a
  * request one budget refuses spends nothing from the other.
@@ -172,7 +180,7 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
   const { tenantId, userId } = req.auth!;
 
   const tenantKey = tenantId;
-  const addressKey = `${tenantId}:${email}`;
+  const addressKey = `${tenantId}:${budgetAddress(email)}`;
   const wait = Math.max(invitesPerTenant.blockedFor(tenantKey), invitesPerAddress.blockedFor(addressKey));
   if (wait > 0) {
     // Identifiers only: the address is personal data, and the tenant says enough.

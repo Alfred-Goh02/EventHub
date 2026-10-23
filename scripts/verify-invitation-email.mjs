@@ -34,9 +34,23 @@
  *     and reach no sent-log row. A seal this run makes the same way, correctly, IS
  *     delivered, so the four refusals are their defects and not a broken fixture.
  *   - An expired invitation, by its envelope or by its signed exp, sends nothing.
- *   - The budget refuses past its limit and not below it, on the normalised address,
- *     per tenant: a refusal in one tenant leaves another's admin free to invite the
- *     same address, so a 429 says nothing about anyone else's invitations.
+ *   - The budget refuses past its limit and not below it, per MAILBOX: the address in
+ *     capitals, with a +tag, and at Gmail with dots, all spend one budget, while dots
+ *     outside Gmail name different mailboxes and are not merged. Per tenant: a refusal
+ *     in one tenant leaves another's admin free to invite the same address, so a 429
+ *     says nothing about anyone else's invitations.
+ *   - Inviting an address in one tenant leaves another tenant's live invitation to it
+ *     alone. Invite has no row security, so the tenant in the supersede is all there is.
+ *   - Only an ADMIN may invite: an attendee's token is refused, and writes nothing.
+ *   - An address longer than SMTP can carry (255 characters) is refused; 254 is not.
+ *   - Auth refuses to start with invitations longer than a week, and the topic keeps a
+ *     request longer than that, set on the topic rather than inherited: an outage of
+ *     the dispatcher cannot outlive an invitation's seal and lose it without a trace.
+ *   - A dead-lettered invitation replayed after the sweeper ended its claim is sent,
+ *     once. The first attempt is staged as the dispatcher leaves it -- a claim PENDING
+ *     for two hours, a dead-letter copy written the way forward() writes one -- because
+ *     Mailpit cannot be made to fail; the sweep and the replay are the documented
+ *     commands, run through pnpm. A second replay sends nothing.
  *   - No token, link or address in Notification's output, in Auth's outside the dev
  *     sink's own lines, or in the dead-letter copies of the refused requests.
  *
@@ -45,9 +59,11 @@
  * end of the topic before it starts, and an expired canary is sent to EVERY partition
  * and counted before anything real is sent.
  *
- * Scoped to three tenants, consumer groups and addresses made for this run; the rows,
- * the inbox messages, the groups and the contact cards registration published are
- * removed at the end.
+ * Scoped to three tenants, consumer groups and addresses made for this run. The Auth
+ * rows, the inbox messages, the groups and the contact cards registration published are
+ * removed at the end. The settled sent-log and suppression rows are KEPT: the run's
+ * sealed requests stay deliverable on the topic for an hour, and a Notification started
+ * in that hour must find them already sent, suppressed or refused, not mail them again.
  *
  * Run (with Postgres, Kafka, the Schema Registry and Mailpit up, the schemas registered;
  * Auth, the relay and Notification built; both keypairs generated; compose's
@@ -60,7 +76,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { Kafka, logLevel } from 'kafkajs';
+import kafkajs, { Kafka, logLevel } from 'kafkajs';
 import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
 import { CompactEncrypt, SignJWT, compactDecrypt, importPKCS8, importSPKI, jwtVerify, calculateJwkThumbprint, exportJWK } from 'jose';
 import { serviceEnv } from './lib/service-env.mjs';
@@ -71,6 +87,13 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const key = (dir, file) => readFileSync(join(ROOT, 'services', dir, 'keys', file), 'utf8');
 // The service's own hash, imported rather than rewritten: a copy here would only agree with itself.
 const { addressHash } = await import(pathToFileURL(join(ROOT, 'services', 'notification', 'dist', 'dispatch', 'suppression.js')).href);
+// The headers forward() writes on a dead-letter copy, and the reason the sweeper writes,
+// read from the service for the same reason.
+const { DLQ_HEADERS } = await import(pathToFileURL(join(ROOT, 'services', 'notification', 'dist', 'dispatch', 'retry.js')).href);
+const { ABANDONED } = await import(pathToFileURL(join(ROOT, 'services', 'notification', 'dist', 'sweeper', 'sweep.js')).href);
+
+// Not a named export of kafkajs's CommonJS build; verify-topic-configs reads it the same way.
+const { ConfigResourceTypes } = kafkajs;
 
 const TOPIC = 'auth.email-requested';
 const DLQ = 'notification.dlq';
@@ -96,29 +119,43 @@ const TENANTS = [TENANT, BUDGET_TENANT, OTHER_TENANT];
 const slugOf = (tenant) => tenant.replace(/_/g, '-');
 const ADMIN_ID = `user_inviteadmin_${RUN}`;
 const at = (name) => `${name}-${RUN}@mailcheck.example`;
+/** A Gmail local part, so dots can be shown to count for nothing there. Only ever delivered to Mailpit. */
+const G = `budgetg${RUN}`;
+/** A domain made of 63-character labels, for an address exactly as long as asked. */
+const longAddress = (length) => {
+  const local = `long-${RUN}`;
+  const tail = length - local.length - 1 - 3 * 64 - '.example'.length;
+  return `${local}@${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(tail)}.example`;
+};
 const A = {
   invitee: at('invitee'),
   reinvitee: at('reinvitee'),
   race: at('race'),
   revokee: at('revokee'),
   suppressed: at('suppressed'),
+  replay: at('replay'),
   victim: at('victim'),
   bcc: at('bcc'),
   control: at('sealcontrol'),
   expired: at('expired'),
+  notAdmin: at('notadmin'),
   x: at('budget-x'),
-  y: at('budget-y'),
+  xTagged: `budget-x-${RUN}+tag@mailcheck.example`,
+  gmail: [`${G}@gmail.com`, `${G.slice(0, 3)}.${G.slice(3)}+promo@googlemail.com`, `${G[0]}.${G.slice(1)}@gmail.com`],
+  dotted: [`budget.dot-${RUN}@mailcheck.example`, `budgetdot-${RUN}@mailcheck.example`, `bud.get.dot-${RUN}@mailcheck.example`],
   w: at('budget-w'),
-  fill: [1, 2, 3, 4, 5].map((i) => at(`budget-fill${i}`)),
+  fill: [1, 2, 3].map((i) => at(`budget-fill${i}`)),
+  long254: longAddress(254),
+  long255: longAddress(255),
 };
 const ALL_ADDRESSES = [...Object.values(A).flat()];
 const PASSWORD = `invited-password-${RUN}`;
 
 /**
- * Small budgets, so the run can reach them. The main tenant makes seven invitations; the
- * budget tenant makes exactly eight and is then refused.
+ * Small budgets, so the run can reach them. The main tenant makes eight invitations; the
+ * budget tenant makes exactly ten and is then refused.
  */
-const PER_TENANT = 8;
+const PER_TENANT = 10;
 const PER_ADDRESS = 2;
 
 const GROUP = `verify-invitation-email-${RUN}`;
@@ -255,10 +292,16 @@ async function headersById(id) {
   const res = await fetch(`${MAILPIT}/api/v1/message/${encodeURIComponent(id)}/headers`);
   return res.ok ? res.json() : null;
 }
+/**
+ * The messages to exactly this address. Mailpit's to: search can match a part of an
+ * address, and this run's addresses contain each other (invitee-, reinvitee-), so the
+ * results are filtered on the whole recipient.
+ */
 async function inbox(address) {
   const res = await fetch(`${MAILPIT}/api/v1/search?query=${encodeURIComponent(`to:${address}`)}`);
   if (!res.ok) throw new Error(`Mailpit search answered ${res.status}`);
-  return (await res.json()).messages ?? [];
+  const wanted = address.trim().toLowerCase();
+  return ((await res.json()).messages ?? []).filter((m) => (m.To ?? []).some((t) => (t.Address ?? '').toLowerCase() === wanted));
 }
 /** Waits for `want` emails to an address, then gives one more the chance to arrive. Newest first. */
 async function mailTo(address, want) {
@@ -341,6 +384,15 @@ async function main() {
   const tokens = {};
   for (const t of TENANTS) tokens[t] = await adminToken(t);
   const asAdmin = (tenant) => ({ Authorization: `Bearer ${tokens[tenant]}`, 'X-Tenant-Slug': slugOf(tenant) });
+  // The same token with the role an invitation most often grants, for the check that it cannot invite.
+  const attendeeToken = await new SignJWT({ tenantId: TENANT, tenantSlug: slugOf(TENANT), role: 'ATTENDEE' })
+    .setProtectedHeader({ alg: 'RS256' })
+    .setSubject(`user_inviteattendee_${RUN}`)
+    .setIssuer(authEnv.JWT_ISSUER)
+    .setAudience(authEnv.JWT_AUDIENCE)
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(Date.now() / 1000) + 3 * 3600)
+    .sign(authSigning);
 
   /** A sealed request made the way Auth makes one, with whatever each case needs wrong. */
   async function seal({ messageId, subject, tenant = TENANT, claims, signingKey = authSigning, exp }) {
@@ -412,7 +464,7 @@ async function main() {
     const inviteRow = token ? (await authApp.query(`SELECT i.id FROM "Invite" i WHERE i."tokenHash" = $1`, [sha256(token)])).rows[0] : undefined;
     const rows = inviteRow ? await outboxRow(inviteRow.id) : [];
     if (link) secrets.push(link, token);
-    return { status: res.status, body: json(res.text), link, token, inviteId: inviteRow?.id ?? null, rows, row: rows[0] ?? null };
+    return { status: res.status, body: json(res.text), link, token, inviteId: inviteRow?.id ?? null, rows, row: rows[0] ?? null, sinkMessage: entry?.msg ?? '' };
   }
 
   /**
@@ -470,21 +522,29 @@ async function main() {
     for (const tenant of TENANTS) {
       await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Invitations ${tenant}`, slugOf(tenant)]);
     }
-    // Before Notification starts: its dispatch group begins exactly at the topic's end,
-    // and the scans read only what this run writes.
-    await commitAtEnd(admin, GROUP, [TOPIC]);
+    // The scans read only what this run writes.
     await commitAtEnd(admin, SCAN_TOPIC_GROUP, [TOPIC]);
     await commitAtEnd(admin, SCAN_DLQ_GROUP, [DLQ]);
-    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
-    notification = start('notification', ['dist/index.js'], notificationEnv);
 
-    const [ready, authUp] = await Promise.all([
-      waitFor(async () => (await fetch(`http://127.0.0.1:${NOTIFICATION_PORT}/ready`)).ok, 60_000, 500),
-      waitFor(async () => (await fetch(`http://127.0.0.1:${AUTH_PORT}/health`)).ok, 60_000, 500),
-    ]);
-    check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${NOTIFICATION_PORT} (database, consumer and SMTP)` : `Notification never became ready:\n${excerpt(notification.log())}`);
+    const authUp = await waitFor(async () => (await fetch(`http://127.0.0.1:${AUTH_PORT}/health`)).ok, 60_000, 500);
     check(Boolean(authUp), authUp ? `CONTROL: a private Auth with the dev sink on is listening on :${AUTH_PORT}` : `Auth never came up:\n${excerpt(auth.log())}`);
     check(auth.log().includes('clock skewed by +3600s'), "CONTROL: Auth's clock is an hour fast, so an expiry stamped by it cannot pass for the database's");
+    if (failures > 0) return;
+
+    // The invitation the replay section dead-letters. Published BEFORE the dispatch group
+    // is committed at the topic's end, so this run's Notification never reads it: the
+    // only first attempt it gets is the one staged below.
+    const staged = await invite(TENANT, A.replay);
+    const stagedPub = staged.row ? await published([staged.row.id]) : { ok: false };
+    check(staged.status === 201 && stagedPub.ok, `CONTROL: an invitation to dead-letter later is issued and published before Notification reads the topic (${staged.status})`);
+    if (failures > 0) return;
+
+    // Before Notification starts: its dispatch group begins exactly at the topic's end.
+    await commitAtEnd(admin, GROUP, [TOPIC]);
+    const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
+    notification = start('notification', ['dist/index.js'], notificationEnv);
+    const ready = await waitFor(async () => (await fetch(`http://127.0.0.1:${NOTIFICATION_PORT}/ready`)).ok, 60_000, 500);
+    check(Boolean(ready), ready ? `CONTROL: a private Notification is ready on :${NOTIFICATION_PORT} (database, consumer and SMTP)` : `Notification never became ready:\n${excerpt(notification.log())}`);
     if (failures > 0) return;
 
     const joined = await waitFor(async () => {
@@ -593,6 +653,12 @@ async function main() {
     check(textLink === first.link, `its text carries exactly the link Auth issued${textLink === first.link ? '' : textLink ? ' (it carries a different one)' : ' (it carries none)'}`);
     check(hrefIn(email1?.HTML) === first.link, 'and so does its HTML link');
     check(/as an attendee\./.test(email1?.Text ?? ''), 'it names the role it grants');
+    // Two invitations to one address can arrive in either order: each is keyed by its own id.
+    check(/replaces any earlier invitation/.test(email1?.Text ?? '') && /replaces any earlier invitation/.test(email1?.HTML ?? ''), 'it says it replaces any earlier invitation, which may arrive after it');
+    check(
+      /also emailed/.test(first.sinkMessage) && !/would be emailed/.test(first.sinkMessage),
+      `the dev sink's own line says the link is also emailed, not that it would be ("${first.sinkMessage}")`,
+    );
     const told = [['the tenant id', TENANT], ['the tenant slug', slugOf(TENANT)], ['the inviting admin', ADMIN_ID], ['the invite id', first.inviteId]].filter(([, s]) => `${email1?.Text}\n${email1?.HTML}`.includes(s));
     check(told.length === 0, told.length === 0 ? 'and nothing the invitee did not need: no tenant, no inviter, no internal id' : `it also tells the reader ${told.map(([n]) => n).join(', ')}`);
     check(header(headers1, 'X-EventHub-Message-Id')?.[0] === row.id, 'CONTROL: its headers were read: X-EventHub-Message-Id is the outbox message id');
@@ -705,7 +771,9 @@ async function main() {
     // ---------------------------------------------------------------------------------
     console.log('');
     console.log('  a seal Auth did not sign, a relabelled reset, a role outside the set and a line break in the address send nothing');
-    const soon = new Date(Date.now() + 10 * 60_000);
+    // Minutes, not the hour Auth's own requests get: a forged request still unexpired when
+    // the next verifier's Notification reads the topic would be dead-lettered again there.
+    const soon = new Date(Date.now() + 3 * 60_000);
     const cases = {};
     const mk = async (name, { claims, signingKey, kind = 'INVITATION' }) => {
       const messageId = randomUUID();
@@ -751,25 +819,144 @@ async function main() {
 
     // ---------------------------------------------------------------------------------
     console.log('');
-    console.log(`  the budget: ${PER_ADDRESS} a day per address and ${PER_TENANT} an hour per tenant, keyed by tenant`);
+    console.log('  a dead-lettered invitation, replayed after the sweeper ended its claim, is sent once');
+    const stagedId = staged.row.id;
+    const original = (await scan(TOPIC, SCAN_TOPIC_GROUP, [stagedId])).get(stagedId);
+    check(Boolean(original), 'CONTROL: the invitation issued before Notification read the topic is on it');
+    check((await deliveriesOf(TENANT, [stagedId])).length === 0, 'CONTROL: and Notification never saw it: no delivery row');
+    if (!original) return;
+    // The first attempt, as the dispatcher leaves one whose sends all failed: a claim
+    // PENDING since two hours ago, attempts counted, and the message on notification.dlq
+    // with the headers forward() writes.
+    await inTenant(
+      notifyApp,
+      TENANT,
+      `INSERT INTO "NotificationDelivery" (id, "tenantId", "recipientId", channel, category, "templateKey", "idempotencyKey", "sourceMessageId", attempts, "lastError", "createdAt")
+       VALUES ($1, $2, $3, 'email', 'invitation', 'invitation', $4, $5, 4, 'connect ECONNREFUSED', now() - interval '2 hours')`,
+      [randomUUID(), TENANT, staged.inviteId, `invitation:${stagedId}:email:${staged.inviteId}`, stagedId],
+    );
+    const plain = Object.fromEntries(Object.entries(original.headers ?? {}).map(([k, v]) => [k, v?.toString() ?? '']));
+    await producer.send({
+      topic: DLQ,
+      messages: [
+        {
+          key: original.key,
+          value: original.value,
+          headers: {
+            ...plain,
+            [DLQ_HEADERS.reason]: 'retries exhausted after 4 attempts: connect ECONNREFUSED',
+            [DLQ_HEADERS.consumerGroup]: `${GROUP}-retry`,
+            [DLQ_HEADERS.originalTopic]: TOPIC,
+            [DLQ_HEADERS.sourceTopic]: 'notification.retry.3',
+            [DLQ_HEADERS.sourcePartition]: '0',
+            [DLQ_HEADERS.sourceOffset]: '0',
+            [DLQ_HEADERS.attempts]: '4',
+            [DLQ_HEADERS.firstFailedAt]: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+          },
+        },
+      ],
+    });
+    /** One of Notification's scripts, run the way its usage line documents: through pnpm, which hands it a `--`. */
+    const pnpmRun = (script, args = '') =>
+      new Promise((done) => {
+        const child = spawn(`pnpm --filter @eventhub/notification run ${script}${args ? ` -- ${args}` : ''}`, {
+          cwd: ROOT,
+          env: { ...process.env, ...notificationEnv },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          shell: true,
+        });
+        let log = '';
+        child.stdout.on('data', (d) => (log += d));
+        child.stderr.on('data', (d) => (log += d));
+        child.on('exit', (code) => done({ code, log }));
+      });
+    const swept = await pnpmRun('sweep:once');
+    const [ended] = await inTenant(notifyApp, TENANT, `SELECT d.status::text AS status, d."lastError" FROM "NotificationDelivery" d WHERE d."tenantId" = $1 AND d."sourceMessageId" = $2`, [TENANT, stagedId]).then((r) => r.rows);
+    check(swept.code === 0 && ended?.status === 'FAILED' && ended.lastError === ABANDONED, `CONTROL: sweep:once ended the two-hour-old claim as abandoned (exit ${swept.code}; ${ended?.status}, "${ended?.lastError}")`);
+    const beforeReplay = await dispatch();
+    const replayed = await pnpmRun('dlq:replay', stagedId);
+    check(replayed.code === 0 && replayed.log.includes(`replayed ${stagedId}`), `dlq:replay put it back on ${TOPIC} (exit ${replayed.code})`);
+    const replayMail = await mailTo(A.replay, 1);
+    check(replayMail.count === 1, `exactly one email reached the address (${replayMail.count})`);
+    check(inviteLinkIn((await messageById(replayMail.messages[0]?.ID))?.Text) === staged.link, 'carrying the link Auth issued');
+    const [resent] = await deliveriesOf(TENANT, [stagedId]);
+    check(resent?.status === 'SENT', `the abandoned claim was taken back and recorded SENT (${resent?.status})`);
+    check((await dispatch()).reopenedTotal === beforeReplay.reopenedTotal + 1, 'and counted as taken back');
+    const beforeSecond = await dispatch();
+    const again = await pnpmRun('dlq:replay', stagedId);
+    const reread = await waitFor(async () => {
+      const m = await dispatch();
+      return m.duplicatesSkippedTotal > beforeSecond.duplicatesSkippedTotal ? m : null;
+    }, 45_000, 500);
+    check(again.code === 0 && Boolean(reread), `CONTROL: a second replay was read, and skipped as already sent (exit ${again.code})`);
+    await sleep(2_000);
+    check((await inbox(A.replay)).length === 1, 'and the inbox still holds one email');
+
+    // ---------------------------------------------------------------------------------
+    console.log('');
+    console.log(`  the budget: ${PER_ADDRESS} a day per mailbox and ${PER_TENANT} an hour per tenant, keyed by tenant`);
     const x1 = await invite(BUDGET_TENANT, A.x);
     const x2 = await invite(BUDGET_TENANT, A.x);
     check(x1.status === 201 && x2.status === 201, `CONTROL: up to the address's limit is not refused (${x1.status}, ${x2.status})`);
     const variant = await invite(BUDGET_TENANT, `  ${A.x.toUpperCase()}  `);
     check(variant.status === 429 && Number(variant.retryAfter) > 0, `the same address in capitals with spaces is refused past it (${variant.status}, Retry-After ${variant.retryAfter})`);
-    const y = await invite(BUDGET_TENANT, A.y);
-    check(y.status === 201, `another address in the same tenant is not (${y.status})`);
+    const tagged = await invite(BUDGET_TENANT, A.xTagged);
+    check(tagged.status === 429, `and so is the same mailbox with a +tag, which is one person, not a new budget (${tagged.status})`);
+    const gmail = [];
+    for (const address of A.gmail) gmail.push(await invite(BUDGET_TENANT, address));
+    check(gmail[0].status === 201 && gmail[1].status === 201, `CONTROL: at Gmail, two spellings of one mailbox are let through up to its limit (${gmail[0].status}, ${gmail[1].status})`);
+    check(gmail[2].status === 429, `and a third, with the dots moved, is refused: Gmail ignores dots (${gmail[2].status})`);
+    const dotted = [];
+    for (const address of A.dotted) dotted.push((await invite(BUDGET_TENANT, address)).status);
+    check(dotted.every((s) => s === 201), `outside Gmail, three spellings that differ only in dots are three mailboxes, and none is refused (${dotted.join(', ')})`);
     const fills = [];
     for (const address of A.fill) fills.push((await invite(BUDGET_TENANT, address)).status);
     check(fills.every((s) => s === 201), `CONTROL: up to the tenant's limit is not refused (${fills.join(', ')})`);
     const w = await invite(BUDGET_TENANT, A.w);
     check(w.status === 429 && Number(w.retryAfter) > 0, `past the tenant's limit a fresh address is refused (${w.status})`);
     check(JSON.stringify(variant.body) === JSON.stringify(w.body), `with the same body either way (${JSON.stringify(w.body)})`);
+    const budgetXLive = (await liveInvites(BUDGET_TENANT, A.x)).length;
     const wOther = await invite(OTHER_TENANT, A.w);
     const xOther = await invite(OTHER_TENANT, A.x);
     check(wOther.status === 201 && xOther.status === 201, `another tenant's admin may still invite both addresses: one tenant spends only its own budget, and a refusal says nothing about anyone else's (${wOther.status}, ${xOther.status})`);
     const refusedRows = [...(await inviteRows(BUDGET_TENANT, A.w)), ...(await inviteRows(BUDGET_TENANT, A.x))];
     check(refusedRows.length === 2, `a refusal makes no invitation: the budget tenant holds ${refusedRows.length} for the two addresses (2 for x, 0 for w)`);
+
+    console.log('');
+    console.log("  inviting an address in one tenant leaves another tenant's invitation to it alone");
+    // Invite has no row security, so the tenant in the supersede's WHERE is its only scope.
+    const budgetXAfter = (await liveInvites(BUDGET_TENANT, A.x)).length;
+    check(budgetXLive === 1, `CONTROL: the budget tenant held one live invitation to the address before (${budgetXLive})`);
+    check(budgetXAfter === 1, `and still holds it after the other tenant invited the same address (${budgetXAfter} live)`);
+
+    console.log('');
+    console.log('  only an ADMIN may invite');
+    const outboxCount = async () => (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" o WHERE o."tenantId" = $1', [TENANT])).rows[0].n;
+    const outboxBefore = await outboxCount();
+    const asAttendee = await authCall('/invites', { email: A.notAdmin, role: 'ADMIN' }, { Authorization: `Bearer ${attendeeToken}`, 'X-Tenant-Slug': slugOf(TENANT) });
+    check(asAttendee.status === 403, `an attendee's token is refused (${asAttendee.status})`);
+    check((await inviteRows(TENANT, A.notAdmin)).length === 0 && (await outboxCount()) === outboxBefore, 'and writes no invitation and queues no email');
+
+    console.log('');
+    console.log('  an address longer than SMTP can carry is refused');
+    check(A.long254.length === 254 && A.long255.length === 255, `CONTROL: the two addresses are ${A.long254.length} and ${A.long255.length} characters`);
+    const tooLong = await invite(OTHER_TENANT, A.long255);
+    check(tooLong.status === 400 && (await inviteRows(OTHER_TENANT, A.long255)).length === 0, `255 characters is a 400, and no invitation (${tooLong.status})`);
+    const longest = await invite(OTHER_TENANT, A.long254);
+    check(longest.status === 201, `CONTROL: 254 characters, the most SMTP carries, is accepted, so the refusal is the length (${longest.status})`);
+
+    console.log('');
+    console.log('  no invitation outlives the topic that carries it');
+    const tooLongLived = start('auth', ['dist/index.js'], { ...authEnv, PORT: String(AUTH_PORT + 1), INVITE_TTL_HOURS: '169' });
+    const exited = await waitFor(async () => (tooLongLived.child.exitCode !== null ? { code: tooLongLived.child.exitCode } : null), 30_000, 250);
+    if (!exited) tooLongLived.child.kill();
+    check(Boolean(exited) && exited.code !== 0 && tooLongLived.log().includes('INVITE_TTL_HOURS'), `Auth refuses to start with invitations longer than a week (${exited ? `exit ${exited.code}` : 'still running'})`);
+    const [described] = (await admin.describeConfigs({ includeSynonyms: false, resources: [{ type: ConfigResourceTypes.TOPIC, name: TOPIC }] })).resources;
+    const retention = described?.configEntries.find((c) => c.configName === 'retention.ms');
+    check(
+      retention?.isDefault === false && Number(retention.configValue) > 168 * 3_600_000,
+      `${TOPIC} keeps a request longer than the longest invitation, set on the topic and not inherited (${retention?.configValue} ms, ${retention?.isDefault ? 'the broker default' : 'set on the topic'})`,
+    );
 
     // ---------------------------------------------------------------------------------
     console.log('');
@@ -826,31 +1013,51 @@ async function main() {
     const contactKeys = registered.map((u) => `${u.tenant}:${u.id}`);
     const tombstoned = contactKeys.length === 0 ? 0 : await producer.send({ topic: CONTACT_TOPIC, messages: contactKeys.map((k) => ({ key: k, value: null })) }).then(() => contactKeys.length, () => 0);
 
+    /**
+     * THE SETTLED SENT-LOG AND SUPPRESSION ROWS ARE KEPT. This run's sealed requests stay
+     * on the topic, deliverable until they expire an hour from now. Deleting the rows that
+     * say they were sent, suppressed or refused would hand every one of them to the next
+     * Notification that reads the topic in that hour -- the suppressed address included --
+     * which is #142 the other way round. Only a claim still PENDING, which no outcome
+     * settled, is removed. Each row is a hash, ids and a status: no address.
+     */
+    const settledCount = async () => {
+      const n = { deliveries: 0, suppressions: 0 };
+      for (const tenant of TENANTS) {
+        n.deliveries += (await inTenant(notifyOwner, tenant, `SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1 AND status <> 'PENDING'`, [tenant]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n;
+        n.suppressions += (await inTenant(notifyOwner, tenant, 'SELECT count(*)::int AS n FROM "EmailSuppression" WHERE "tenantId" = $1', [tenant]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n;
+      }
+      return n;
+    };
+    const settledBefore = await settledCount();
     let deleted = 0;
     for (const tenant of TENANTS) {
       deleted += (await relayDb.query('DELETE FROM "OutboxMessage" WHERE "tenantId" = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
-      for (const table of ['NotificationDelivery', 'EmailSuppression']) {
-        deleted += (await inTenant(notifyOwner, tenant, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
-      }
+      deleted += (await inTenant(notifyOwner, tenant, `DELETE FROM "NotificationDelivery" WHERE "tenantId" = $1 AND status = 'PENDING'`, [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
       deleted += (await inTenant(notifyApp, tenant, 'DELETE FROM "ContactCard" WHERE "tenantId" = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
       for (const table of ['RefreshToken', 'Invite', 'User']) {
         deleted += (await inTenant(authApp, tenant, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
       }
       deleted += (await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
     }
-    const left = { outbox: 0, invites: 0, deliveries: 0, suppressions: 0, inbox: 0 };
+    const left = { outbox: 0, invites: 0, pending: 0, inbox: 0 };
     for (const tenant of TENANTS) {
       left.outbox += (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [tenant])).rows[0].n;
       left.invites += (await authApp.query('SELECT count(*)::int AS n FROM "Invite" WHERE "tenantId" = $1', [tenant])).rows[0].n;
-      left.deliveries += (await inTenant(notifyOwner, tenant, 'SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1', [tenant])).rows[0].n;
-      left.suppressions += (await inTenant(notifyOwner, tenant, 'SELECT count(*)::int AS n FROM "EmailSuppression" WHERE "tenantId" = $1', [tenant])).rows[0].n;
+      left.pending += (await inTenant(notifyOwner, tenant, `SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1 AND status = 'PENDING'`, [tenant])).rows[0].n;
     }
+    const kept = await settledCount();
     for (const address of ALL_ADDRESSES) left.inbox += (await inbox(address).catch(() => [])).length;
     const groupsLeft = await deleteGroupsWhenEmpty(admin, [...GROUPS.all, SCAN_TOPIC_GROUP, SCAN_DLQ_GROUP]);
     check(
       deleted > 0 && mailDeleted && tombstoned === contactKeys.length && Object.values(left).every((n) => n === 0),
       `cleanup: ${deleted} rows and ${mailIds.length} emails deleted, ${tombstoned} contact card(s) withdrawn, and nothing left (${JSON.stringify(left)}); ` +
         `consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`,
+    );
+    check(
+      settledBefore.deliveries > 0 && settledBefore.suppressions > 0 && kept.deliveries === settledBefore.deliveries && kept.suppressions === settledBefore.suppressions,
+      `cleanup KEPT every settled row while the run's requests can still be delivered: ${kept.deliveries} of ${settledBefore.deliveries} deliveries ` +
+        `and ${kept.suppressions} of ${settledBefore.suppressions} suppression(s), for the run's three tenants`,
     );
     await producer.disconnect().catch(() => {});
     await admin.disconnect().catch(() => {});

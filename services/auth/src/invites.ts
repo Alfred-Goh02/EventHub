@@ -126,6 +126,36 @@ export async function issueInvite(params: {
   });
 }
 
+/**
+ * The mailbox an address reaches, for the per-address invitation budget, and for
+ * nothing else.
+ *
+ * Keyed on the address as typed, the budget was one per spelling, not one per person.
+ * Measured: victim+0@gmail.com to victim+99@gmail.com, and v.ictim@gmail.com, each had
+ * a budget of their own, so the real limit on what one tenant could send one person was
+ * the tenant's whole hundred an hour. Two rules collapse spellings that land in the
+ * same mailbox:
+ *   - a +tag in the local part, for every domain: subaddressing is near-universal, and
+ *     where a provider does not support it, merging two addresses into one budget only
+ *     makes the limit stricter;
+ *   - dots in the local part, for Gmail only, where they are ignored; googlemail.com is
+ *     the same mailboxes. Anywhere else, a.b and ab may be two people.
+ *
+ * NEVER STORED, NEVER SENT TO. The invitation keeps the address the admin typed, and
+ * the email goes there: a +tag is how a person routes their own mail.
+ */
+export function budgetAddress(email: string): string {
+  const at = email.lastIndexOf('@');
+  if (at < 1) return email;
+  let local = email.slice(0, at);
+  let domain = email.slice(at + 1);
+  const plus = local.indexOf('+');
+  if (plus > 0) local = local.slice(0, plus);
+  if (domain === 'googlemail.com') domain = 'gmail.com';
+  if (domain === 'gmail.com') local = local.replace(/\./g, '');
+  return `${local}@${domain}`;
+}
+
 export type InviteLookup =
   | { ok: true; id: string; tenantId: string; email: string; role: Role }
   | { ok: false; reason: 'invalid' | 'used' | 'revoked' | 'expired' };

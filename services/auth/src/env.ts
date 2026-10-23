@@ -37,8 +37,14 @@ const authEnvSchema = baseEnvSchema.extend({
    * lives as long as the link -- every sealed request on auth.email-requested can be
    * delivered until it expires -- and a deployment, or a verifier that leaves its
    * requests on the topic, may want them to die sooner.
+   *
+   * NEVER LONGER THAN A WEEK. auth.email-requested keeps a request eight days
+   * (scripts/create-topics.mjs). An invitation that outlived the topic would be lost
+   * in any dispatcher outage longer than the topic's retention, with nothing in the
+   * sent-log or the dead-letter topic to say it was ever asked for. Raising this means
+   * raising that first.
    */
-  INVITE_TTL_HOURS: z.coerce.number().int().positive().default(168),
+  INVITE_TTL_HOURS: z.coerce.number().int().positive().max(168).default(168),
 });
 
 export const env = loadEnv(authEnvSchema);

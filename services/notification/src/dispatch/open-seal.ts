@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compactDecrypt, errors, importPKCS8, jwtVerify, type CryptoKey } from 'jose';
+import { isRole, type Role } from '@eventhub/types';
 
 /**
  * Opens a sealed email request from Auth: decrypt with Notification's private key,
@@ -48,10 +49,13 @@ export const SEALED_KINDS = ['PASSWORD_RESET', 'INVITATION'] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 const isSealedKind = (value: unknown): value is SealedKind => SEALED_KINDS.includes(value as SealedKind);
 
-/** The roles an invitation can grant, as Auth defines them. The role is printed in the email, so it is a closed set too. */
-export const INVITATION_ROLES = ['ADMIN', 'ORGANIZER', 'ATTENDEE'] as const;
-export type InvitationRole = (typeof INVITATION_ROLES)[number];
-const isInvitationRole = (value: unknown): value is InvitationRole => INVITATION_ROLES.includes(value as InvitationRole);
+/**
+ * The roles an invitation can grant: @eventhub/types' list, which verify-shared-types
+ * holds to Auth's own Role enum, rather than a copy here that nothing compared with
+ * it. The role is printed in the email, so it is a closed set too.
+ */
+export type InvitationRole = Role;
+const isInvitationRole = isRole;
 
 /**
  * Control characters, CR and LF among them. An address is written into a header, so

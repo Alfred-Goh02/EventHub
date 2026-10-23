@@ -10,6 +10,8 @@
  * each future field, whether it can be trusted.
  */
 
+import type { Role } from '@eventhub/types';
+
 export interface RenderedEmail {
   subject: string;
   text: string;
@@ -44,8 +46,15 @@ export function renderPasswordReset(params: { link: string; expiresAt: Date }): 
   return { subject: 'Reset your EventHub password', text, html };
 }
 
-/** How the email names each role an invitation can grant. A closed set, as the opener's is. */
-const ROLE_PHRASES: Record<'ADMIN' | 'ORGANIZER' | 'ATTENDEE', string> = {
+/**
+ * How the email names each role an invitation can grant.
+ *
+ * Keyed by @eventhub/types' Role, the list every service checks a token's role against
+ * and verify-shared-types holds to Auth's own enum. A Record over that type must name
+ * every member, so a role added there does not build here until it has words: the
+ * alternative was a hand-copied list nothing compared with anything.
+ */
+const ROLE_PHRASES: Record<Role, string> = {
   ADMIN: 'an administrator',
   ORGANIZER: 'an organiser',
   ATTENDEE: 'an attendee',
@@ -65,18 +74,22 @@ const ROLE_PHRASES: Record<'ADMIN' | 'ORGANIZER' | 'ATTENDEE', string> = {
  */
 export function renderInvitation(params: {
   link: string;
-  role: 'ADMIN' | 'ORGANIZER' | 'ATTENDEE';
+  role: Role;
   expiresAt: Date;
 }): RenderedEmail {
   const until = `${params.expiresAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
   const as = ROLE_PHRASES[params.role];
+  // Two invitations to one address travel on different partitions and can arrive in
+  // either order. Only the newest link works, so the email says so rather than leave
+  // the reader to try the one that happened to arrive last.
+  const replaces = 'It replaces any earlier invitation sent to this address: only the newest link works.';
   const text = [
     `You have been invited to join EventHub as ${as}.`,
     '',
     'To accept, open this link and choose a password:',
     params.link,
     '',
-    `It works once, and stops working at ${until}.`,
+    `It works once, and stops working at ${until}. ${replaces}`,
     '',
     'If you were not expecting this, you can ignore this email. No account is created unless you open the link.',
   ].join('\n');
@@ -85,7 +98,7 @@ export function renderInvitation(params: {
   const html = [
     `<p>You have been invited to join EventHub as ${escapeHtml(as)}.</p>`,
     `<p><a href="${link}">Accept the invitation</a></p>`,
-    `<p>It works once, and stops working at ${escapeHtml(until)}.</p>`,
+    `<p>It works once, and stops working at ${escapeHtml(until)}. ${escapeHtml(replaces)}</p>`,
     `<p>If the button does not work, copy this address into your browser:<br>${link}</p>`,
     '<p>If you were not expecting this, you can ignore this email. No account is created unless you open the link.</p>',
   ].join('\n');

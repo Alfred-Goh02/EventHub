@@ -8,7 +8,7 @@ import { PermanentSendError, type EmailChannel } from '../channels/types.js';
 import { isOptional, type Category } from '../preferences/categories.js';
 import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest, type SealedKind } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
-import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
+import { claimDelivery, markFailed, markSent, recordAttempt, reopenAbandoned, suppressIfListed, type DeliveryKey } from './sent-log.js';
 import { renderInvitation, renderPasswordReset, type RenderedEmail } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
@@ -83,6 +83,7 @@ const counters = {
   retried: 0,
   deadLettered: 0,
   crashes: 0,
+  reopened: 0,
 };
 
 /**
@@ -110,6 +111,8 @@ export function dispatchMetrics(): Record<string, number> {
     /** Sent to notification.dlq. Its depth is the number an operator should be paged on. */
     deadLetteredTotal: counters.deadLettered,
     crashesTotal: counters.crashes,
+    /** Claims the sweeper had ended as abandoned, taken back by a later attempt. */
+    reopenedTotal: counters.reopened,
   };
 }
 
@@ -211,7 +214,24 @@ export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel
   } catch (err) {
     return transient(err);
   }
-  if (!claim.claimed && claim.status !== 'PENDING') {
+  /**
+   * A claim the sweeper ended is not a settled one: it was never sent, suppressed or
+   * refused. Take it back and carry on, as a PENDING claim is carried on. See
+   * reopenAbandoned for why only an invitation's seal lives long enough to meet one.
+   */
+  let reopened = false;
+  if (!claim.claimed && claim.abandoned) {
+    try {
+      reopened = await reopenAbandoned(p.key);
+    } catch (err) {
+      return transient(err);
+    }
+    if (reopened) {
+      counters.reopened += 1;
+      opts.logger.warn(p.ids, 'the sweeper had abandoned this claim; taken back and tried again');
+    }
+  }
+  if (!claim.claimed && claim.status !== 'PENDING' && !reopened) {
     counters.duplicates += 1;
     opts.logger.info({ ...p.ids, status: claim.status }, 'already delivered; skipped');
     return { kind: 'duplicate' };
@@ -274,7 +294,8 @@ export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel
  *   3. CLAIM the delivery, with one INSERT ... ON CONFLICT DO NOTHING. A final status
  *      means this message was already handled, so it is a duplicate and nothing is
  *      sent. PENDING means an earlier attempt never finished, so it is tried again,
- *      which is how a retry tier resumes a delivery the main topic started.
+ *      which is how a retry tier resumes a delivery the main topic started. FAILED as
+ *      abandoned is the sweeper's word, not an outcome, and is taken back the same way.
  *   4. An address on the tenant's suppression list is recorded SUPPRESSED, and nothing
  *      is sent.
  *   5. Send, then record SENT. A permanent refusal is recorded as FAILED, and when it
@@ -388,7 +409,16 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
  * finish: a backlog of replies after an outage — each a few database round trips, an
  * unseal and an SMTP connection — would sit in front of every password reset published
  * behind it, long enough for the reset's thirty-minute link to die unsent. Before
- * replies, a reset only ever queued behind other resets, and that is kept.
+ * replies, a reset only ever queued behind other resets, and that is kept for replies.
+ *
+ * INVITATIONS ARE THE EXCEPTION, AND IT IS MEASURED, NOT ASSUMED AWAY. They travel on
+ * the reset topic, so a reset can wait behind the invitations on its partition. One
+ * invitation costs about 32 ms here (Mailpit, plain SMTP, a connection per message):
+ * a reset queued behind sixty on one partition went out 2.1 s later. Against a provider
+ * at ~500 ms a send, a reset's half hour is lost only behind ~3,600 invitations on its
+ * partition, and the budget on POST /invites allows a hundred a tenant an hour, a third
+ * of them per partition: about a hundred tenants spending a whole hour's budget at once.
+ * Past that, invitations want a topic and a route of their own, as replies have.
  *
  * ITS RETRIES ARE ITS OWN TOO. The retry tiers are shared topics, but each tier is read
  * by the reset path's retry group AND by one retry group per route,
