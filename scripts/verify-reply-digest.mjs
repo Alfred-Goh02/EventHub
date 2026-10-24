@@ -536,6 +536,9 @@ async function main() {
         !urlsIn(nsDigest).some((u) => u.includes('/posts/')) && nsHosts.length === 1 && nsHosts[0] === unsubscribeHost && (await gone(NS)),
       `one digest, with its count and no post link, the only host in it the unsubscribe one (${nsHosts.join(', ') || 'no links'}), and the held reply settled`,
     );
+    // Every other card in that pass names its tenant's subdomain, so exactly one.
+    const unlinked = Number(pass.out.match(/(\d+) built without links/)?.[1] ?? -1);
+    check(unlinked === 1, `and the pass says so: digest:once counts one digest built without links (${unlinked === -1 ? 'no such count' : unlinked})`);
     const dDigestRows = await deliveries(D, 'community-digest');
     check(
       (await gone(D)) && dDigestRows.length === 1 && dDigestRows[0].status === 'SENT',

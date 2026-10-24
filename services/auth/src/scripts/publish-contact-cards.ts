@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   const only = (args[0] === '--' ? args.slice(1) : args).filter((a) => a.length > 0);
   const tenants = await prisma.tenant.findMany({
     where: only.length > 0 ? { id: { in: only } } : undefined,
-    select: { id: true, slug: true },
+    select: { id: true },
     orderBy: { id: 'asc' },
   });
   const unknown = only.filter((id) => !tenants.some((t) => t.id === id));
@@ -53,13 +53,18 @@ async function main(): Promise<void> {
   }
   let queued = 0;
   let withoutSlug = 0;
-  for (const { id: tenantId, slug } of tenants) {
+  for (const { id: tenantId } of tenants) {
     for (;;) {
       const n = await withTenant(tenantId, async (tx) => {
+        // The tenant's slug as it is now, read in the same statement as the users, not
+        // once before the loop: a rename during a run would otherwise leave every card
+        // just stamped with the new slug "distinct" from the old one read here, and
+        // the loop would pick the same users again until it was stopped.
         const users = await tx.$queryRaw<Array<{ id: string; email: string }>>`
           SELECT u.id, u.email FROM "User" u
            WHERE u."tenantId" = ${tenantId}
-             AND (u."contactPublishedAt" IS NULL OR u."contactSlug" IS DISTINCT FROM ${slug})
+             AND (u."contactPublishedAt" IS NULL
+                  OR u."contactSlug" IS DISTINCT FROM (SELECT t.slug FROM "Tenant" t WHERE t.id = u."tenantId"))
            ORDER BY u.id
            LIMIT ${BATCH}
            FOR UPDATE SKIP LOCKED`;
