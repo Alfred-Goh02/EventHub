@@ -42,3 +42,7 @@ services/*/src/generated
 .git
 .github
 *.log
+
+# The web app is built and served on its own (apps/web has its own lockfile and CI job);
+# nothing in the backend image runs it.
+apps
