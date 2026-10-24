@@ -199,13 +199,14 @@ async function main() {
     const initial = await api('/preferences', { bearer: token(TENANT, U) });
     const byCategory = Object.fromEntries((initial.body?.preferences ?? []).map((p) => [p.category, p]));
     check(
-      initial.status === 200 && Object.keys(byCategory).sort().join() === 'COMMUNITY_REPLY,PASSWORD_RESET',
-      `a user sees exactly the two categories (${Object.keys(byCategory).join(', ')})`,
+      initial.status === 200 && Object.keys(byCategory).sort().join() === 'COMMUNITY_REPLY,INVITATION,PASSWORD_RESET',
+      `a user sees exactly the three categories (${Object.keys(byCategory).join(', ')})`,
     );
     check(
       byCategory.COMMUNITY_REPLY?.enabled === true && byCategory.COMMUNITY_REPLY?.canTurnOff === true &&
-        byCategory.PASSWORD_RESET?.enabled === true && byCategory.PASSWORD_RESET?.canTurnOff === false,
-      'replies are on by default and can be turned off; password resets are on and cannot',
+        byCategory.PASSWORD_RESET?.enabled === true && byCategory.PASSWORD_RESET?.canTurnOff === false &&
+        byCategory.INVITATION?.enabled === true && byCategory.INVITATION?.canTurnOff === false,
+      'replies are on by default and can be turned off; password resets and invitations are on and cannot',
     );
 
     const off = await api('/preferences', { method: 'PATCH', bearer: token(TENANT, U), body: { category: 'COMMUNITY_REPLY', enabled: false } });
@@ -222,6 +223,11 @@ async function main() {
     await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'PASSWORD_RESET', 'EMAIL', false)`, [TENANT, W]);
     const planted = ((await api('/preferences', { bearer: token(TENANT, W) })).body?.preferences ?? []).find((p) => p.category === 'PASSWORD_RESET');
     check(planted?.enabled === true, 'a row planted to say it is off is ignored: password resets still read as on');
+
+    console.log('');
+    console.log('  nor can an invitation, which has no account behind it to hold a choice');
+    const inviteOff = await api('/preferences', { method: 'PATCH', bearer: token(TENANT, U), body: { category: 'INVITATION', enabled: false } });
+    check(inviteOff.status === 409 && !(await rows(TENANT, U)).some((r) => r.category === 'INVITATION'), `refused, and no row written (${inviteOff.status})`);
 
     console.log('');
     console.log('  the categories are a closed set');
@@ -262,6 +268,7 @@ async function main() {
       ['another user under the original signature', `v1.${swappedBody}.${goodMac}`],
       ['a changed signature', `v1.${goodBody}.${Buffer.from(randomBytes(32)).toString('base64url')}`],
       ['a correctly signed token for a password reset', unsubscribeToken({ tenantId: TENANT, userId: W, category: 'PASSWORD_RESET' })],
+      ['a correctly signed token for an invitation', unsubscribeToken({ tenantId: TENANT, userId: W, category: 'INVITATION' })],
       ['a token signed with a different secret', unsubscribeToken({ tenantId: TENANT, userId: W, category: 'COMMUNITY_REPLY' }, `${SECRET}-not-it`)],
       ['garbage', 'not-a-token'],
     ];

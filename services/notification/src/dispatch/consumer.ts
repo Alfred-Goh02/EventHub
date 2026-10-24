@@ -5,12 +5,70 @@ import { z, ZodError } from 'zod';
 import { consumerLag, type ConsumerLag } from '@eventhub/kafka';
 import type { Logger } from '@eventhub/logger';
 import { PermanentSendError, type EmailChannel } from '../channels/types.js';
-import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest } from './open-seal.js';
+import { isOptional, type Category } from '../preferences/categories.js';
+import { ExpiredRequest, PoisonMessage, type EmailRequestEnvelope, type OpenedEmailRequest, type SealedKind } from './open-seal.js';
 import { DLQ_HEADERS, DLQ_TOPIC, RETRY_HEADERS, header, jittered, originalHeaders, retryTiers } from './retry.js';
-import { claimDelivery, markFailed, markSent, recordAttempt, suppressIfListed, type DeliveryKey } from './sent-log.js';
-import { renderPasswordReset, type RenderedEmail } from './templates.js';
+import { claimDelivery, markFailed, markSent, recordAttempt, reopenAbandoned, suppressIfListed, type DeliveryKey } from './sent-log.js';
+import { renderInvitation, renderPasswordReset, type RenderedEmail } from './templates.js';
 
 export const DISPATCH_TOPIC = 'auth.email-requested';
+
+/**
+ * What each sealed kind is sent as.
+ *
+ * templateKey  part of the sent-log's idempotency key. A reset's key has none, for the
+ *              reason sent-log.ts gives; every other kind's does, so one kind's message
+ *              id can never claim another's delivery.
+ * category     the sent-log's grouping, for an operator.
+ * preference   its category in preferences/categories.ts, which must be TRANSACTIONAL:
+ *              see below.
+ */
+const SEALED: {
+  [K in SealedKind]: {
+    templateKey: string;
+    category: string;
+    preference: Category;
+    sentMessage: string;
+    render: (opened: Extract<OpenedEmailRequest, { kind: K }>) => RenderedEmail;
+  };
+} = {
+  PASSWORD_RESET: {
+    templateKey: 'password-reset',
+    category: 'account',
+    preference: 'PASSWORD_RESET',
+    sentMessage: 'password reset email sent',
+    render: (o) => renderPasswordReset({ link: o.link, expiresAt: o.expiresAt }),
+  },
+  INVITATION: {
+    templateKey: 'invitation',
+    category: 'invitation',
+    preference: 'INVITATION',
+    sentMessage: 'invitation email sent',
+    render: (o) => renderInvitation({ link: o.link, role: o.role, expiresAt: o.expiresAt }),
+  },
+};
+
+/**
+ * THE SEALED PATH ASKS NO PREFERENCE, SO IT MAY SEND ONLY WHAT CANNOT BE TURNED OFF.
+ * A reset's reader may be locked out, and an invitation's has no account to hold a
+ * choice. A kind added here under an OPTIONAL category would be sent to people who had
+ * turned it off, so the service refuses to start instead.
+ */
+for (const [kind, s] of Object.entries(SEALED)) {
+  if (isOptional(s.preference)) {
+    throw new Error(`refusing to start: sealed ${kind} emails are sent without asking a preference, but ${s.preference} can be turned off`);
+  }
+}
+
+/** One message's handling, by the kind Auth signed. */
+function prepareSealed(opened: OpenedEmailRequest): { templateKey: string; category: string; sentMessage: string; email: RenderedEmail } {
+  if (opened.kind === 'INVITATION') {
+    const s = SEALED.INVITATION;
+    return { templateKey: s.templateKey, category: s.category, sentMessage: s.sentMessage, email: s.render(opened) };
+  }
+  const s = SEALED.PASSWORD_RESET;
+  return { templateKey: s.templateKey, category: s.category, sentMessage: s.sentMessage, email: s.render(opened) };
+}
 
 const counters = {
   received: 0,
@@ -25,6 +83,7 @@ const counters = {
   retried: 0,
   deadLettered: 0,
   crashes: 0,
+  reopened: 0,
 };
 
 /**
@@ -52,6 +111,8 @@ export function dispatchMetrics(): Record<string, number> {
     /** Sent to notification.dlq. Its depth is the number an operator should be paged on. */
     deadLetteredTotal: counters.deadLettered,
     crashesTotal: counters.crashes,
+    /** Claims the sweeper had ended as abandoned, taken back by a later attempt. */
+    reopenedTotal: counters.reopened,
   };
 }
 
@@ -153,7 +214,24 @@ export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel
   } catch (err) {
     return transient(err);
   }
-  if (!claim.claimed && claim.status !== 'PENDING') {
+  /**
+   * A claim the sweeper ended is not a settled one: it was never sent, suppressed or
+   * refused. Take it back and carry on, as a PENDING claim is carried on. See
+   * reopenAbandoned for why only an invitation's seal lives long enough to meet one.
+   */
+  let reopened = false;
+  if (!claim.claimed && claim.abandoned) {
+    try {
+      reopened = await reopenAbandoned(p.key);
+    } catch (err) {
+      return transient(err);
+    }
+    if (reopened) {
+      counters.reopened += 1;
+      opts.logger.warn(p.ids, 'the sweeper had abandoned this claim; taken back and tried again');
+    }
+  }
+  if (!claim.claimed && claim.status !== 'PENDING' && !reopened) {
     counters.duplicates += 1;
     opts.logger.info({ ...p.ids, status: claim.status }, 'already delivered; skipped');
     return { kind: 'duplicate' };
@@ -216,7 +294,8 @@ export async function deliver(p: PreparedDelivery, opts: { channel: EmailChannel
  *   3. CLAIM the delivery, with one INSERT ... ON CONFLICT DO NOTHING. A final status
  *      means this message was already handled, so it is a duplicate and nothing is
  *      sent. PENDING means an earlier attempt never finished, so it is tried again,
- *      which is how a retry tier resumes a delivery the main topic started.
+ *      which is how a retry tier resumes a delivery the main topic started. FAILED as
+ *      abandoned is the sweeper's word, not an outcome, and is taken back the same way.
  *   4. An address on the tenant's suppression list is recorded SUPPRESSED, and nothing
  *      is sent.
  *   5. Send, then record SENT. A permanent refusal is recorded as FAILED, and when it
@@ -250,7 +329,11 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
       opts.logger.warn({ reason }, 'undecodable email request refused');
       return { kind: 'poison', reason };
     }
-    const ids = { messageId: envelope.messageId, tenantId: envelope.tenantId, userId: envelope.userId };
+    // Named for what the subject is: an invitation's is an Invite, never a user.
+    const ids: Record<string, string> =
+      envelope.kind === 'INVITATION'
+        ? { messageId: envelope.messageId, tenantId: envelope.tenantId, kind: envelope.kind, inviteId: envelope.userId }
+        : { messageId: envelope.messageId, tenantId: envelope.tenantId, userId: envelope.userId };
 
     if (!(Date.parse(envelope.expiresAt) > Date.now())) {
       counters.expired += 1;
@@ -275,6 +358,27 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
       return transient(err);
     }
 
+    /**
+     * A message whose email cannot be rendered is the message's fault, and poison. Thrown
+     * from here it would reach kafkajs as a TypeError, which crashes the consumer for
+     * good: measured, with the opener's role check removed, an invitation naming a role
+     * the template has no words for took the whole process down, and a restart would
+     * have read the same message and gone down again.
+     */
+    let sealed: ReturnType<typeof prepareSealed>;
+    try {
+      sealed = prepareSealed(opened);
+    } catch (err) {
+      counters.poison += 1;
+      // The error's name only: its message could quote the values being rendered.
+      const reason = `the email could not be rendered (${err instanceof Error ? err.name : 'unknown'})`;
+      opts.logger.warn({ ...ids, reason }, 'email request refused');
+      return { kind: 'poison', reason };
+    }
+
+    // Steps 3 to 5 are the same for every kind: the claim, the suppression list, the
+    // send. Only the template differs, and no kind on this path asks a preference or
+    // reads a contact card -- the address is in the seal.
     return deliver(
       {
         key: {
@@ -282,14 +386,15 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
           sourceMessageId: envelope.messageId,
           recipientId: opened.userId,
           channel: 'email',
-          templateKey: 'password-reset',
+          templateKey: sealed.templateKey,
         },
-        category: 'account',
+        category: sealed.category,
         to: opened.email,
-        email: renderPasswordReset({ link: opened.link, expiresAt: opened.expiresAt }),
+        email: sealed.email,
+        // No List-Unsubscribe on any kind here: each is transactional.
         headers: { 'X-EventHub-Message-Id': envelope.messageId },
         ids,
-        sentMessage: 'password reset email sent',
+        sentMessage: sealed.sentMessage,
       },
       opts,
     );
@@ -304,7 +409,16 @@ export function createMessageHandler(opts: MessageHandlerOptions): MessageHandle
  * finish: a backlog of replies after an outage — each a few database round trips, an
  * unseal and an SMTP connection — would sit in front of every password reset published
  * behind it, long enough for the reset's thirty-minute link to die unsent. Before
- * replies, a reset only ever queued behind other resets, and that is kept.
+ * replies, a reset only ever queued behind other resets, and that is kept for replies.
+ *
+ * INVITATIONS ARE THE EXCEPTION, AND IT IS MEASURED, NOT ASSUMED AWAY. They travel on
+ * the reset topic, so a reset can wait behind the invitations on its partition. One
+ * invitation costs about 32 ms here (Mailpit, plain SMTP, a connection per message):
+ * a reset queued behind sixty on one partition went out 2.1 s later. Against a provider
+ * at ~500 ms a send, a reset's half hour is lost only behind ~3,600 invitations on its
+ * partition, and the budget on POST /invites allows a hundred a tenant an hour, a third
+ * of them per partition: about a hundred tenants spending a whole hour's budget at once.
+ * Past that, invitations want a topic and a route of their own, as replies have.
  *
  * ITS RETRIES ARE ITS OWN TOO. The retry tiers are shared topics, but each tier is read
  * by the reset path's retry group AND by one retry group per route,
@@ -429,10 +543,12 @@ export function createDispatcher(opts: {
     const reason =
       outcome.kind === 'poison' ? outcome.reason : `retries exhausted after ${failedAttempts} attempts: ${outcome.error}`;
     /**
-     * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value is ciphertext
-     * only this service can open. Anything else — a reply, carrying the reply's words and
-     * who wrote them — would outlive, in a topic kept forever, the author's delete and a
-     * moderator's hide, which change only Community's database; and replaying it would
+     * THE VALUE IS KEPT ONLY WHERE IT IS SEALED. A password reset's value, and an
+     * invitation's, is ciphertext only this service can open, around a link that stops
+     * working when its reset or invitation does. Anything else — a reply, carrying the
+     * reply's words and who wrote them — would outlive, in a topic kept forever, the
+     * author's delete and a moderator's hide, which change only Community's database; and
+     * replaying it would
      * put those words back on the topic it came from, for every consumer of that topic.
      * So the dead-letter copy keeps the headers — message id, reason, where it came
      * from — and not the value: the count an operator is paged on still moves, and the

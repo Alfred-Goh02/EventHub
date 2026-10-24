@@ -12,9 +12,15 @@ import { withClient } from '../pool.js';
  * topic retention passed while they waited.
  *
  * IT DOES NOT RESEND, AND COULD NOT. The row holds no sealed request — the seal is
- * opened in memory and never stored — and a reset link is dead within the hour
- * anyway. What it can do is make the row say what became of it, so that PENDING means
- * "in flight" and a count of PENDING rows is worth alerting on.
+ * opened in memory and never stored. What it can do is make the row say what became of
+ * it, so that PENDING means "in flight" and a count of PENDING rows is worth alerting on.
+ *
+ * ENDED IS NOT SETTLED. A reset's link is dead within the hour, so nothing ever came
+ * back for a claim this ended. An invitation's lives for days, and `dlq:replay` can
+ * bring one back long after this pass: the dispatcher then takes the abandoned claim
+ * back (reopenAbandoned in dispatch/sent-log.ts) and sends it once. The reason written
+ * here is how it knows the difference, so ABANDONED is matched exactly, by the digest
+ * as well.
  *
  * ACROSS TENANTS, on the sweeper's own credential, which may write nothing but these
  * three columns and may leave a row in no state but FAILED. See the migration.

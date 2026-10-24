@@ -12,9 +12,16 @@
  *
  * Decided 2026-09-26: community replies are ON by default, with a one-click
  * unsubscribe in every one.
+ *
+ * An INVITATION is transactional for a reason of its own: its reader has no account,
+ * so there is nobody whose preference could be asked, and an invitation is not a
+ * subscription to leave. It carries no unsubscribe link and no List-Unsubscribe
+ * header; an unwanted one is answered by the budget on POST /invites in Auth and by
+ * ignoring it.
  */
 export const CATEGORIES = {
   PASSWORD_RESET: { kind: 'TRANSACTIONAL', defaultEnabled: true, label: 'Password resets' },
+  INVITATION: { kind: 'TRANSACTIONAL', defaultEnabled: true, label: 'Invitations to join' },
   COMMUNITY_REPLY: { kind: 'OPTIONAL', defaultEnabled: true, label: 'Replies to your posts and comments' },
 } as const;
 

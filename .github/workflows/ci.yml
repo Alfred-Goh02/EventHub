@@ -1063,8 +1063,21 @@ jobs:
       - name: Assert an address that does not exist is suppressed, and only such an address
         run: node scripts/verify-email-suppression.mjs
 
+      # Invitations. POST /invites handed its link to the dev sink alone, so a deployed
+      # system emailed nobody and no one new could join a tenant. Now the invitation and
+      # its sealed request commit together: one email at the invited address, whose link
+      # registers the invitee, with the token and address nowhere in clear in the outbox
+      # or on the topic; the seal expires with the invitation at the database's instant,
+      # proved with Auth an hour fast; a re-invite's older link and a revoked one are
+      # refused, and two invitations raced on a table lock leave one live; a seal Auth
+      # did not sign, a relabelled reset, an unknown role, a line break in the address,
+      # an expired request and a suppressed address send nothing; and the budget on
+      # POST /invites refuses past its limit, per tenant, on the normalised address.
+      - name: Assert an invitation reaches the person invited, once, and nothing forged does
+        run: node scripts/verify-invitation-email.mjs
+
       # Preferences and the unsubscribe link. A user changes only their own choices, in
-      # their own tenant; a password reset cannot be turned off, and a row planted to
+      # their own tenant; a password reset or an invitation cannot be turned off, and a row planted to
       # say it is off is ignored; the categories are a closed set. Following an
       # unsubscribe link changes nothing — read after a pause, because the first
       # version read at once and missed an unsubscribe fired from GET and not awaited —

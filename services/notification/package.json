@@ -19,6 +19,7 @@
     "@eventhub/http": "workspace:*",
     "@eventhub/kafka": "workspace:*",
     "@eventhub/logger": "workspace:*",
+    "@eventhub/types": "workspace:*",
     "@kafkajs/confluent-schema-registry": "^4.1.0",
     "@prisma/adapter-pg": "^7.9.0",
     "@prisma/client": "^7.9.0",

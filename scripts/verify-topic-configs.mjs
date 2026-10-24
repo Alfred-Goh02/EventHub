@@ -55,8 +55,8 @@ const EXPECTED = [
   {
     topic: 'auth.email-requested',
     name: 'retention.ms',
-    value: '86400000',
-    why: 'a sealed link is dead thirty minutes after issue, so a day covers any outage worth waiting out',
+    value: '691200000',
+    why: "an invitation's seal lives up to a week, so a request must outlast it, or an outage loses invitations without a trace",
   },
   {
     topic: 'notification.dlq',

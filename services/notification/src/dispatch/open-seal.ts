@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compactDecrypt, errors, importPKCS8, jwtVerify, type CryptoKey } from 'jose';
+import { isRole, type Role } from '@eventhub/types';
 
 /**
  * Opens a sealed email request from Auth: decrypt with Notification's private key,
@@ -35,14 +36,46 @@ export interface EmailRequestEnvelope {
   sealed: string;
 }
 
-export interface OpenedEmailRequest {
+/**
+ * The kinds of sealed email this service sends: a CLOSED SET, checked against what Auth
+ * signed. Anything else is poison, not a default.
+ *
+ *   PASSWORD_RESET  the subject is a User.
+ *   INVITATION      the subject is an Invite. Its recipient is NOT a user, so nothing
+ *                   that is keyed by user -- a contact card, a preference, the digest --
+ *                   may be looked up for it.
+ */
+export const SEALED_KINDS = ['PASSWORD_RESET', 'INVITATION'] as const;
+export type SealedKind = (typeof SEALED_KINDS)[number];
+const isSealedKind = (value: unknown): value is SealedKind => SEALED_KINDS.includes(value as SealedKind);
+
+/**
+ * The roles an invitation can grant: @eventhub/types' list, which verify-shared-types
+ * holds to Auth's own Role enum, rather than a copy here that nothing compared with
+ * it. The role is printed in the email, so it is a closed set too.
+ */
+export type InvitationRole = Role;
+const isInvitationRole = isRole;
+
+/**
+ * Control characters, CR and LF among them. An address is written into a header, so
+ * one carrying a line break is a header injection, however it got signed. Auth's
+ * schema refuses them on the way in; this refuses them on the way out as well.
+ */
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
+interface OpenedCommon {
   tenantId: string;
+  /** The subject: a User for a reset, an Invite for an invitation. Named for the envelope's field. */
   userId: string;
-  kind: 'PASSWORD_RESET';
   email: string;
   link: string;
   expiresAt: Date;
 }
+
+export type OpenedEmailRequest =
+  | (OpenedCommon & { kind: 'PASSWORD_RESET' })
+  | (OpenedCommon & { kind: 'INVITATION'; role: InvitationRole });
 
 export const EMAIL_REQUEST_AUDIENCE = 'eventhub-notification';
 export const EMAIL_REQUEST_TYPE = 'auth-email+jwt';
@@ -112,21 +145,32 @@ export function createSealOpener(opts: { privateKey: CryptoKey; authPublicKey: C
     if (claims.sub !== envelope.userId || claims.tenantId !== envelope.tenantId) {
       throw new PoisonMessage('the seal names a different user or tenant than its envelope');
     }
-    if (claims.kind !== 'PASSWORD_RESET' || envelope.kind !== 'PASSWORD_RESET') {
+    // The kind Auth signed, and the envelope's must be the same one: a genuine reset's
+    // seal relabelled as an invitation in the plaintext would otherwise be sent with
+    // another template, and the reverse.
+    if (!isSealedKind(claims.kind) || claims.kind !== envelope.kind) {
       throw new PoisonMessage('not a kind of email this service sends');
     }
     if (typeof claims.email !== 'string' || typeof claims.link !== 'string' || typeof claims.tenantId !== 'string') {
       throw new PoisonMessage('the seal carries no address, no link or no tenant');
     }
+    if (claims.email.length === 0 || CONTROL.test(claims.email)) {
+      throw new PoisonMessage('the seal carries an address that cannot be put in a header');
+    }
 
-    return {
+    const common: OpenedCommon = {
       tenantId: claims.tenantId,
       userId: claims.sub as string,
-      kind: 'PASSWORD_RESET',
       email: claims.email,
       link: claims.link,
       expiresAt: new Date((claims.exp as number) * 1000),
     };
+    if (claims.kind === 'PASSWORD_RESET') return { ...common, kind: 'PASSWORD_RESET' };
+
+    if (!isInvitationRole(claims.role)) {
+      throw new PoisonMessage('the invitation names no role it could grant');
+    }
+    return { ...common, kind: 'INVITATION', role: claims.role };
   };
 }
 

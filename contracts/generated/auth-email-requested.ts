@@ -3,15 +3,16 @@
 // Regenerate: node scripts/generate-avro-types.mjs
 
 export type AuthEmailKind =
-  | 'PASSWORD_RESET';
+  | 'PASSWORD_RESET'
+  | 'INVITATION';
 
 /**
  * Auth asks Notification to send an email that carries a credential.
  * Everything that could take over an account, or say whose account it is, is
  * inside `sealed`: encrypted to Notification's public key, so Kafka, Auth's
  * outbox table and any log hold only ciphertext. Not compacted: every request
- * is its own event, and Auth revokes a user's earlier link when it issues a
- * newer one.
+ * is its own event, and Auth revokes the earlier link when it issues a newer
+ * one, a user's reset or an address's invitation.
  */
 export interface AuthEmailRequested {
   /**
@@ -32,13 +33,17 @@ export interface AuthEmailRequested {
    */
   tenantId: string;
   /**
-   * The User the email is for. Also the Kafka message key, so one user's
-   * requests stay in order and a newer request arrives after the one it
-   * supersedes.
+   * Whom the email is about, and the sub claim inside the seal: the User for a
+   * PASSWORD_RESET, the Invite for an INVITATION, whose recipient is not a user
+   * yet. Named userId because resets came first; a consumer must not look it up
+   * as a user for every kind. Also the Kafka message key, so one subject's
+   * requests stay in order.
    */
   userId: string;
   /**
-   * Which email. One symbol today. Adding a symbol later is BACKWARD-compatible.
+   * Which email. Adding a symbol is BACKWARD-compatible, and INVITATION was
+   * added that way. Repeated inside the seal, which is the copy a consumer
+   * trusts; the two must agree.
    */
   kind: AuthEmailKind;
   /**
