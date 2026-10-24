@@ -12,11 +12,24 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one.
+// scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 model Tenant {
   id        String   @id @default(cuid())
   name      String
   slug      String   @unique
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   users User[]
@@ -34,7 +47,7 @@ model User {
   email        String
   passwordHash String
   role         Role     @default(ATTENDEE)
-  createdAt    DateTime @default(now())
+  createdAt    DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt    DateTime @updatedAt
   /// When this user's contact card was queued for Notification; NULL if it never
   /// was. See migration 20260926000000.
@@ -67,7 +80,7 @@ model Invite {
   expiresAt  DateTime
   acceptedAt DateTime?
   revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
+  createdAt  DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@index([tenantId])
   @@index([tenantId, email])
@@ -82,7 +95,7 @@ model RefreshToken {
   expiresAt DateTime
   usedAt    DateTime?
   revokedAt DateTime?
-  createdAt DateTime  @default(now())
+  createdAt DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -126,7 +139,7 @@ model PasswordResetToken {
   /// so at most one is ever live per user.
   revokedAt DateTime?
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -160,7 +173,7 @@ model OutboxMessage {
 
   payload     Json
   publishedAt DateTime?
-  createdAt   DateTime  @default(now())
+  createdAt   DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   attempts       Int       @default(0)
   lastError      String?

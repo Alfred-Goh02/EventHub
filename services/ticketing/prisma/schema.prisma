@@ -7,6 +7,19 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one.
+// scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 /// Same two invariants as the Event service, for the same reasons:
 ///
 ///   1. Every parent carries @@unique([tenantId, id]) and children reference the
@@ -82,7 +95,7 @@ model TicketType {
   /// the name, price or total; `version` moves with every sale and expiry too.
   revision Int @default(1)
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   event EventProjection  @relation(fields: [tenantId, eventId], references: [tenantId, id], onDelete: Restrict)
@@ -129,7 +142,7 @@ model Reservation {
 
   version Int @default(1)
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   items ReservationItem[]
@@ -206,7 +219,7 @@ model IdempotencyKey {
   responseBody   Json?
 
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   /// Scoped by tenant AND user. Keyed on `key` alone, tenant B replaying tenant
@@ -227,7 +240,7 @@ model ProcessedMessage {
   tenantId      String
   consumerGroup String
   messageId     String
-  processedAt   DateTime @default(now())
+  processedAt   DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@unique([tenantId, consumerGroup, messageId])
   @@index([processedAt])
@@ -287,7 +300,7 @@ model OutboxMessage {
 
   payload     Json
   publishedAt DateTime?
-  createdAt   DateTime  @default(now())
+  createdAt   DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   attempts       Int       @default(0)
   lastError      String?
@@ -364,7 +377,7 @@ model Payment {
 
   /// Set when the provider call starts and when it settles. The gap between
   /// them is the window in which a crash leaves an UNKNOWN.
-  startedAt DateTime  @default(now())
+  startedAt DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
   settledAt DateTime?
 
   /// How many times the reconciler has ASKED the provider about this attempt
@@ -385,9 +398,9 @@ model Payment {
   /// a Sort over every unsettled payment before the LIMIT could take a page.
   /// Without the OR the index serves the ORDER BY too and the LIMIT stops the
   /// scan.
-  nextLookupAt DateTime @default(now())
+  nextLookupAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt DateTime @updatedAt
 
   /// Scoped by tenant, like every unique index in this database — unique

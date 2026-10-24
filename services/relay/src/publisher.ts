@@ -155,9 +155,16 @@ export function createPublisher(opts: {
        * cannot serve as a dedup key, because a redelivered message gets a new
        * offset.
        *
-       * occurredAt is createdAt, i.e. when the state change COMMITTED — not when
-       * it was published, which after a backlog can be much later. A consumer
-       * ordering by publish time would see history in the wrong order.
+       * occurredAt is createdAt: the database's now() in the transaction that
+       * made the state change, which is when that transaction BEGAN (the column's
+       * DEFAULT CURRENT_TIMESTAMP; it was the app server's clock until the schemas
+       * said dbgenerated). Not when it was published, which after a backlog can be
+       * much later. Not when it COMMITTED either: a transaction that waited on a
+       * lock keeps its earlier start, so two rows of one aggregate can carry
+       * occurredAt in the opposite order to their seq. It is a time to report, not
+       * an order -- consumers order by the partition and, for events.activity, the
+       * snapshot's version. A payload's own occurredAt (Community's, a contact
+       * card's) is spread over this one.
        *
        * It arrives as text Postgres rendered, and is passed through untouched.
        * It was `row.createdAt.toISOString()`, on a Date pg had parsed as local

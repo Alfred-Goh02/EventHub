@@ -374,10 +374,22 @@ the millisecond, on a correct service. It would have failed here and passed on
 CI. The comparison happens in SQL now; Postgres comparing its own column to its
 own rendering has no timezone to get wrong.
 
-The rest of the repository is already safe because it does all of this in SQL:
-`now()`, `now() + ($4 || ' seconds')::interval`, `extract(epoch from now() - ...)`.
-Keep it that way — never pass a JS `Date` into one of these columns, and never
-compare one in JS.
+This section then said the rest of the repository did all of this in SQL. It did
+not: a default the ORM fills is the process's clock too. Prisma 7 fills
+`@default(now())` and `@updatedAt` in the client and sends them in the INSERT, so
+every outbox row from `emit()` — whose createdAt the relay publishes as occurredAt —
+came out +3600 s with Ticketing an hour fast. A default is
+`@default(dbgenerated("CURRENT_TIMESTAMP"))`, which Prisma leaves for Postgres to
+fill, and `verify-event-times-from-database.mjs` refuses a `now()`. `@updatedAt` has
+no such form, so it stays the process's clock and nothing may compare one.
+Introspection reads that default back as `now()`, so `prisma migrate dev` will
+offer `SET DEFAULT CURRENT_TIMESTAMP` for every such column in every migration it
+writes — measured, the same statements again after applying them — and the
+verifier refuses them: delete those lines, they change nothing.
+
+Otherwise keep it in SQL: `now()`, `now() + ($4 || ' seconds')::interval`,
+`extract(epoch from now() - ...)`. Never pass a JS `Date` into one of these
+columns, and never compare one in JS.
 
 ## The right value for the wrong reason is not a passing test
 

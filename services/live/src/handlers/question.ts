@@ -87,13 +87,18 @@ async function onCreate(
   );
 
   // 3. Kafka last and unawaited. See kafka.ts for why this one is not an outbox.
+  //
+  //    occurredAt is the row's createdAt, which Postgres filled. It was `new Date()`,
+  //    this process's clock, and Analytics stores it as occurred_at: measured with
+  //    Live an hour fast, +3600 s from the database's now(). See CLAUDE.md,
+  //    "Timestamps come from the database".
   emitInteraction({
     kind: 'question.created',
     tenantId: ws.tenantId,
     eventId: msg.eventId,
     userId: ws.userId,
     questionId: question.id,
-    occurredAt: new Date().toISOString(),
+    occurredAt: question.createdAt.toISOString(),
   });
 }
 
@@ -124,15 +129,18 @@ async function onUpvote(
      * in scripts/verify-live-fanout.mjs). With the event in the WHERE, a question
      * that is not in that event is P2025, which rolls the vote row back with it.
      */
-    const updated = await withTenant(ws.tenantId, async (tx) => {
-      await tx.questionVote.create({
+    const { vote, updated } = await withTenant(ws.tenantId, async (tx) => {
+      // The vote's createdAt is Postgres's, and is the interaction's occurredAt below.
+      const vote = await tx.questionVote.create({
         data: { questionId: msg.questionId, userId: ws.userId, tenantId: ws.tenantId },
+        select: { createdAt: true },
       });
-      return tx.question.update({
+      const updated = await tx.question.update({
         where: { id: msg.questionId, eventId: msg.eventId },
         data: { voteCount: { increment: 1 } },
         select: { id: true, voteCount: true },
       });
+      return { vote, updated };
     });
 
     await publisher.publish(
@@ -146,7 +154,7 @@ async function onUpvote(
       eventId: msg.eventId,
       userId: ws.userId,
       questionId: msg.questionId,
-      occurredAt: new Date().toISOString(),
+      occurredAt: vote.createdAt.toISOString(),
     });
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError) {

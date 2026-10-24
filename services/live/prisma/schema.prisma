@@ -7,6 +7,19 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one.
+// scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 /// A question asked during a live event.
 ///
 /// The socket is a delivery channel, not a store. Everything a client can see
@@ -29,7 +42,7 @@ model Question {
   /// It is maintained in the same transaction as the vote, so it cannot drift.
   voteCount Int      @default(0)
 
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   votes     QuestionVote[]
 
   /// tenantId leads because every query is tenant-scoped by RLS, and the rest
@@ -43,7 +56,7 @@ model QuestionVote {
   questionId String
   userId     String
   tenantId   String
-  createdAt  DateTime @default(now())
+  createdAt  DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
   question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
 
   /// THE COMPOSITE PRIMARY KEY IS THE CONCURRENCY CONTROL.

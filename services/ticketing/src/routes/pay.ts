@@ -254,8 +254,9 @@ pay.post('/:id/pay', requireAuth, ah(async (req, res) => {
       const payment = await tx.payment.create({
         data: {
           tenantId, reservationId, userId, amountCents, currency: CURRENCY, status: 'PENDING',
-          // Both default to now(), but Prisma fills that default from this process's
-          // clock, and the reconciler selects on both against the database's.
+          // The database's clock, which the reconciler selects on both by. Their
+          // defaults are Postgres's too now (dbgenerated, see the schema); passed
+          // anyway so the attempt's stamps are the one value this transaction read.
           startedAt: now,
           nextLookupAt: now,
         },

@@ -7,6 +7,20 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one. This service
+// writes its timestamps in SQL anyway; the rule holds here so a check can hold it
+// everywhere. scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 /// A space is where posts live: one per event, or standing spaces a tenant keeps.
 ///
 /// memberCount is denormalised and moved in SQL by the statement that joins or leaves,
@@ -22,7 +36,7 @@ model CommunitySpace {
   name        String
   visibility  Visibility @default(PUBLIC)
   memberCount Int        @default(0)
-  createdAt   DateTime   @default(now())
+  createdAt   DateTime   @default(dbgenerated("CURRENT_TIMESTAMP"))
   updatedAt   DateTime   @updatedAt
 
   @@unique([tenantId, slug])
@@ -39,7 +53,7 @@ model Membership {
   userId   String
   role     SpaceRole    @default(MEMBER)
   status   MemberStatus @default(ACTIVE)
-  joinedAt DateTime     @default(now())
+  joinedAt DateTime     @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   /// The tenant leads every unique key in this database: a unique index is not
   /// filtered by policy, so a key that omitted it would let one tenant's insert
@@ -61,7 +75,7 @@ model Post {
   /// it. A decay score has to be recomputed for every row before it can be ordered,
   /// which is the opposite of what an index is for.
   rankScore     Float         @default(0)
-  createdAt     DateTime      @default(now())
+  createdAt     DateTime      @default(dbgenerated("CURRENT_TIMESTAMP"))
   editedAt      DateTime?
   /// Which half of the feed this post belongs to, decided once, by the consumer, in the
   /// same transaction as the fan-out. False means the read path queries it directly.
@@ -90,7 +104,7 @@ model Comment {
   body          String
   status        ContentStatus        @default(VISIBLE)
   reactionCount Int                  @default(0)
-  createdAt     DateTime             @default(now())
+  createdAt     DateTime             @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@index([tenantId, postId])
 }
@@ -104,7 +118,7 @@ model Reaction {
   targetId   String
   userId     String
   kind       String
-  createdAt  DateTime   @default(now())
+  createdAt  DateTime   @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@unique([tenantId, targetType, targetId, userId, kind])
   @@index([tenantId, targetId])
@@ -120,7 +134,7 @@ model Report {
   reason     ReportReason
   note       String?
   status     ReportStatus @default(OPEN)
-  createdAt  DateTime     @default(now())
+  createdAt  DateTime     @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@unique([tenantId, targetType, targetId, reporterId])
   @@index([tenantId, status])
@@ -142,7 +156,7 @@ model ModerationAction {
   action     ModAction
   reason     String?
   reportId   String?
-  createdAt  DateTime   @default(now())
+  createdAt  DateTime   @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@index([tenantId, targetId])
 }
@@ -160,7 +174,7 @@ model FeedEntry {
   /// the feed is ordered by when things happened rather than by consumer lag. Immutable,
   /// which is what makes it safe to page on. There is no score here: the feed ranks by
   /// the post's own, read at query time. See migration 20260925120000.
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@unique([tenantId, userId, postId])
   /// The keyset the feed pages on. See migration 20260924000000 for why it is not
@@ -185,7 +199,7 @@ model OutboxMessage {
 
   payload     Json
   publishedAt DateTime?
-  createdAt   DateTime  @default(now())
+  createdAt   DateTime  @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   attempts       Int       @default(0)
   lastError      String?
