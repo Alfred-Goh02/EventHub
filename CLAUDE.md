@@ -560,6 +560,11 @@ reports nothing, and main then holds 82 verifiers under a README that says 81. O
 `verify-readme-setup.mjs` notices, on the next run. Recount after every merge of main,
 rather than trusting a merge that went quietly.
 
+It happened twice more in October, and the second time the fix itself was lost. A merge
+with no conflict commits on its own, so the `git commit --no-edit` meant to finish it
+aborted with "empty commit message", and the push carried the merge without the corrected
+count. Check what was pushed -- `git show HEAD:README.md` -- not what was edited.
+
 ## A check the clocks agree on cannot tell which clock was used
 
 The contact-card verifier asserted that a card's time came from Postgres. It stayed
@@ -769,3 +774,37 @@ A verifier's cleanup lives in `finally`, which does not run when the process is 
 here, by the session pausing mid-run. It left two consumer groups behind, beside five
 that earlier runs had noted as "left to expire". Every per-run group carries the run's
 prefix, so a sweep by pattern finds them: list, delete one at a time, list again.
+
+## A process the code describes is not a process that runs
+
+The hold sweeper and then the payment reconciler were each written as a long-running
+process with its own `main()`, and compose started neither. Their verifiers ran them with
+`--once` or imported the function, so every check stayed green. Measured on the stack: a
+hold still HELD six days past its expiry, its seats out of inventory; then 8 payments
+UNKNOWN on PENDING_PAYMENT reservations, the oldest 35 days, seats held and a charge that
+went through never confirmed. A verifier that runs its own copy proves the code works,
+not that anything runs it. `verify-compose-starts-every-process.mjs` now derives every
+top-level `main()` under `services/*/src` and requires a compose `command:` for each,
+unless it is a one-shot under `src/scripts/` or listed with the reason it runs alone.
+
+## A check on one way in does not guard the others
+
+`refuseUnstorableText` refuses a NUL or a lone surrogate in every HTTP body and query
+string. Live's questions arrive over the WebSocket, which never passes through Express.
+Measured through the gateway: a NUL answered `internal` and was logged as a server error
+(22021), and `\ud800` -- valid UTF-8 on the wire, a lone surrogate only after `JSON.parse`
+-- was stored and broadcast to every subscriber as U+FFFD. When a rule lives in
+middleware, list every way data gets in (HTTP, socket, consumer, script) and ask which of
+them the middleware is on.
+
+## Some rows a verifier may not delete
+
+Nobody may delete a payment: the app role has no DELETE grant, and the owner matches no
+policy (each tenant policy names a role), so under FORCE it sees nothing to delete. A
+payment verifier leaves what it bought behind, and must leave it settled and consistent or
+it disturbs the next one. An UNKNOWN attempt left behind is settled by a reconciler pass in
+some other verifier, and every ticket type's counters must still agree with their
+reservations, which `verify-inventory-reconciliation.mjs` asks of every tenant. Settle
+through the provider's webhook, assert nothing is unsettled and the counters agree, and
+delete only the money-free rows made by SQL, counted. `verify-reservation-reads.mjs` is the
+model.
