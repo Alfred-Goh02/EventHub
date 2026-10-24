@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
+import type { AppUrlTemplate } from '@eventhub/config';
 import type { Logger } from '@eventhub/logger';
 import type { EmailChannel } from '../channels/types.js';
 import { withTenant } from '../db.js';
@@ -48,6 +49,10 @@ import { ABANDONED } from '../sweeper/sweep.js';
  * that opens, the same. The suppression list is deliver()'s, as for any email. A held
  * reply more than a day old is dropped as stale — a count of old replies is not news,
  * and it bounds what can pile up while the digest is not running.
+ *
+ * EACH LINK OPENS ON THE RECIPIENT'S TENANT'S SUBDOMAIN, from the slug on their card,
+ * as a reply's does; with no slug the gateway would route, the digest goes with its
+ * counts and no links, for the reasons dispatch/replies.ts gives.
  */
 
 export const DIGEST_CATEGORY = 'COMMUNITY_REPLY';
@@ -66,12 +71,16 @@ export interface FlushDeps {
   channel: EmailChannel;
   logger: Logger;
   unsubscribeSecret: string;
+  /** Where /unsubscribe answers: one host for every tenant. */
   publicUrl: string;
-  appUrl: string;
+  /** APP_URL_TEMPLATE, filled with the recipient's tenant's slug. */
+  appUrl: AppUrlTemplate;
 }
 
 export interface FlushCounts {
   digestsSent: number;
+  /** Digests built with no links, because the recipient's card names no subdomain the gateway routes. */
+  withoutLinks: number;
   /** Held items removed, for any reason: sent, suppressed, refused, dropped or stale. */
   itemsSettled: number;
   droppedOptedOut: number;
@@ -82,7 +91,7 @@ export interface FlushCounts {
   deferred: number;
 }
 
-const zero = (): FlushCounts => ({ digestsSent: 0, itemsSettled: 0, droppedOptedOut: 0, droppedNoAddress: 0, droppedStale: 0, deferred: 0 });
+const zero = (): FlushCounts => ({ digestsSent: 0, withoutLinks: 0, itemsSettled: 0, droppedOptedOut: 0, droppedNoAddress: 0, droppedStale: 0, deferred: 0 });
 
 const digestKey = (tenantId: string, userId: string, digestId: string): DeliveryKey => ({
   tenantId,
@@ -261,13 +270,21 @@ async function settle(tenantId: string, userId: string, digestId: string, deps: 
   const unsubscribeUrl = `${deps.publicUrl}/unsubscribe?token=${encodeURIComponent(
     signUnsubscribe(deps.unsubscribeSecret, { tenantId, userId, category: DIGEST_CATEGORY }),
   )}`;
+  const origin = deps.appUrl.originFor(opened.tenantSlug);
+  if (!origin) {
+    counts.withoutLinks += 1;
+    deps.logger.warn(
+      { ...ids, reason: opened.tenantSlug === null ? 'the card carries no slug' : 'the card\'s slug is not a subdomain the gateway routes' },
+      'the recipient\'s contact card names no subdomain to link to; the digest goes without its links',
+    );
+  }
   const outcome = await deliver(
     {
       key,
       category: 'community',
       to: opened.email,
       email: renderReplyDigest({
-        groups: groups.map((g) => ({ postUrl: `${deps.appUrl}/posts/${encodeURIComponent(g.postId)}`, toComment: g.toComment, count: g.n })),
+        groups: groups.map((g) => ({ postUrl: origin ? `${origin}/posts/${encodeURIComponent(g.postId)}` : null, toComment: g.toComment, count: g.n })),
         unsubscribeUrl,
       }),
       headers: {

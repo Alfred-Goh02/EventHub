@@ -9,7 +9,9 @@
  *
  * EACH PROPERTY, AND WHAT WOULD LOOK THE SAME WITHOUT IT:
  *   - One email with the live link. The link read back from the inbox resets the
- *     password; a delivered but wrong link would look like success otherwise.
+ *     password; a delivered but wrong link would look like success otherwise. And it
+ *     opens on the tenant's own subdomain: the token works from any host, so a reset
+ *     on the shared localhost:3000 that served no tenant passed every check here.
  *   - A redelivery sends nothing. The same outbox row is published again, and
  *     Notification's received counter must move. "Still one email" is also what a
  *     consumer that never saw the redelivery would produce.
@@ -362,6 +364,13 @@ async function main() {
     check(textLink === link1, `its text carries exactly the link Auth issued${textLink === link1 ? '' : textLink ? ' (it carries a different one)' : ' (it carries none)'}`);
     const htmlLink = hrefIn(mail?.HTML);
     check(htmlLink === link1, `and so does its HTML link${htmlLink === link1 ? '' : htmlLink ? ' (it points somewhere else)' : ' (there is none)'}`);
+    // Read off the email, not the dev sink: the sink's link is the same string, so a
+    // check against it alone would agree with any host Auth chose.
+    const origin = textLink ? new URL(textLink).origin : null;
+    check(
+      origin === `http://${TENANT_SLUG}.eventhub.localhost:5173`,
+      `the link opens on this tenant's own subdomain, where its users sign in (${origin ?? 'no link'})`,
+    );
     check(mailHeaders['X-Eventhub-Message-Id']?.[0] === row1.id || mailHeaders['X-EventHub-Message-Id']?.[0] === row1.id, 'its X-EventHub-Message-Id header is the outbox message id');
 
     const [delivery] = await deliveries();

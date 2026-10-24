@@ -87,7 +87,7 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `services/community` | Spaces, posts, threaded comments on a Postgres `ltree` path, reactions and moderation. Every table is tenant-scoped under forced row-level security, the moderation trail is append-only at the privilege level, and posts leave through the same outbox and relay the other services use. Space roles are read per request and cached in Redis for a minute, dropped by whatever changes them, so a promotion or a ban takes effect on the next call; writes pass a per-user, per-tenant token bucket evaluated atomically inside Redis. A feed consumer reads `community.feed` back and fans a post out to the members of small spaces, leaving large ones to be read at query time; which half a post is in is decided once and recorded on it. The feed pages on when a post was made, so a moving score can never skip or repeat one, and ranks each page by the post's own score, read at query time — a fanned-out row is written once and never changed |
 | `infra/kong/` | The gateway: Kong OSS, DB-less, one declarative file. Routes each path to the service that owns it, clears every tenant header a client sends, and takes the tenant from the subdomain instead |
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
-| `scripts/verify-*.mjs` | 98 executable proofs of the invariants above |
+| `scripts/verify-*.mjs` | 99 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a
@@ -555,6 +555,29 @@ buy a fresh one. An invitation lives `INVITE_TTL_HOURS` (at most a week), and
 outlast an invitation and lose it. A dead-lettered invitation replayed after the
 sweep has ended its claim is still sent, once.
 
+Every emailed link opens on the tenant's own subdomain, because that is where the
+tenant's pages are: Kong takes the tenant from the host, and a session is bound to it.
+The base is `APP_URL_TEMPLATE`, with `{tenant}` where the slug goes —
+`http://{tenant}.eventhub.localhost:5173` in compose, the web app's dev server, and
+`https://{tenant}.eventhub.com` in production. A reset asked for on
+`acme.eventhub.localhost` links to `http://acme.eventhub.localhost:5173/reset-password?token=…`,
+and the same address on `globex` gets a globex link; an invitation opens on the
+inviting tenant's host, which is where `/register`'s new user has to be signed in.
+Reply and digest links (`/posts/<id>`) open on the recipient's tenant's host, from
+the slug Auth signs into each user's contact card. Auth and Notification both refuse to
+start without the template, or with `{tenant}` anywhere but the first label of the
+host, and only a slug the gateway would route is ever put into it. It replaces
+`PUBLIC_APP_URL`, which was one host for every tenant and served none. The unsubscribe
+link is the exception, on purpose: it stays on `NOTIFICATION_PUBLIC_URL`, one host
+with no tenant, since its signed token names the tenant.
+
+A contact card made before cards carried the slug has none, and that user's replies
+and digests go out without the post links — never with a link to the wrong host —
+until the card is made again. `setup` does that on every `up`: its
+`contact-cards:publish` queues a card for every user who never had one and every user
+whose card was not made under their tenant's current slug, and a second run queues
+nothing.
+
 A send that fails for a reason that may pass waits in delayed retry tiers
 (`notification.retry.1` to `.3`) without holding up anyone else on its partition.
 Poison, and a send whose retries run out, go to `notification.dlq`, which is never
@@ -590,11 +613,12 @@ pnpm --filter @eventhub/notification run sweep:once
 ```
 
 The whole chain is proved in the compose stack itself, not only against natively run
-services: `node scripts/verify-compose-password-reset.mjs` adds a user to the seeded
-tenant, asks for a reset, reads the mail out of Mailpit, and checks that the link
-works, that the old password stops working and that the session issued before the
-reset is revoked — then removes what it made. Locally the mail arrives about a second
-after the request.
+services: `node scripts/verify-compose-password-reset.mjs` adds one address to both
+seeded tenants, asks for a reset in each, reads the mail out of Mailpit, and checks
+that each link opens its own tenant's subdomain and resets only that tenant's account,
+that the old password stops working and that the session issued before the reset is
+revoked — then removes what it made. Locally the mail arrives about a second after the
+request.
 
 Replies are the second email, and the first anyone can turn off. When someone
 answers your comment or post in Community, Notification emails you — never about

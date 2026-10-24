@@ -23,11 +23,19 @@ import { resolveTenantSlug, slugOfTenant } from './tenant-slug.js';
 const logger = createLogger('auth-service');
 
 /**
- * Where invite and reset links point. Validated in env.ts, which refuses to start a
- * production process on anything but https: the default is localhost, and both links
- * are now emailed rather than printed for a developer.
+ * Where invite and reset links point: the web app on the tenant's own subdomain,
+ * APP_URL_TEMPLATE filled with that tenant's slug. Validated in env.ts, which refuses
+ * a template without {tenant} in the host, and a production process on anything but
+ * https.
+ *
+ * ONE ORIGIN PER TENANT, because a tenant is its subdomain: Kong takes the tenant from
+ * the Host, and a session is bound to it. A link on one shared host -- what
+ * PUBLIC_APP_URL was -- opened a page that could not serve the reader's tenant. A slug
+ * Kong would not route gets no origin at all (originFor answers null), and then no
+ * link is built: a reset is not issued and an invitation is refused, rather than
+ * either going out pointing somewhere else.
  */
-const RESET_URL_BASE = env.PUBLIC_APP_URL;
+const appUrls = env.APP_URL_TEMPLATE;
 
 const app = express();
 
@@ -179,6 +187,22 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
   const { email, role } = parsed.data;
   const { tenantId, userId } = req.auth!;
 
+  /**
+   * The link opens on this tenant's own subdomain: the slug as the database holds it
+   * now, not the token's, which names a renamed tenant's old subdomain for the rest of
+   * its life. Asked before the budgets, so a refusal spends nothing.
+   *
+   * A slug Kong would not route -- reserved, or not one DNS label -- is no host for a
+   * link, and the tenant's own users could not sign in through the gateway either. So
+   * nothing is issued and the operator is told why; the admin, who can do nothing
+   * about it, gets the same 500 as any other fault of the server's.
+   */
+  const origin = appUrls.originFor(await slugOfTenant(tenantId));
+  if (!origin) {
+    logger.error({ tenantId }, 'invitation refused: the tenant has no subdomain an invitation link can point at');
+    return res.status(500).json({ error: 'internal error' });
+  }
+
   const tenantKey = tenantId;
   const addressKey = `${tenantId}:${budgetAddress(email)}`;
   const wait = Math.max(invitesPerTenant.blockedFor(tenantKey), invitesPerAddress.blockedFor(addressKey));
@@ -199,7 +223,7 @@ app.post('/invites', requireAuth, requireRole('ADMIN'), ah(async (req, res) => {
     email,
     role,
     invitedBy: userId,
-    appUrl: RESET_URL_BASE,
+    appUrl: origin,
     ttlHours: env.INVITE_TTL_HOURS,
   });
 
@@ -698,6 +722,20 @@ app.post('/forgot-password', ah(async (req, res) => {
   if (!tenantId) {
     return res.status(202).json(accepted);
   }
+
+  /**
+   * The link opens on the subdomain the request came in on, which is this tenant's:
+   * the slug just resolved to it. Checked against Kong's rule before it goes anywhere
+   * near a link, because the header is input -- resolveTenantSlug takes any one DNS
+   * label, a reserved name included, and only the gateway refuses those. One that
+   * fails gets no reset at all: a link that cannot open is a reset that cannot work,
+   * and the same 202.
+   */
+  const origin = appUrls.originFor(slug);
+  if (!origin) {
+    logger.error({ tenantId }, 'password reset not issued: the tenant has no subdomain a reset link can point at');
+    return res.status(202).json(accepted);
+  }
   if (!resetPerAccount.hit(`${tenantId}:${email}`)) {
     logger.warn({ tenantId, ip }, 'password reset rate limited');
     return res.status(202).json(accepted);
@@ -716,7 +754,7 @@ app.post('/forgot-password', ah(async (req, res) => {
     // this transaction. A crash cannot leave two live resets, or none, or a live
     // token that nobody was ever sent.
     const reset = await issueResetToken(tx, { userId: user.id, tenantId });
-    const link = `${RESET_URL_BASE}/reset-password?token=${reset.token}`;
+    const link = `${origin}/reset-password?token=${reset.token}`;
 
     // The id is chosen here rather than by the database, because the seal carries
     // it as its jti and the seal is made before the row exists.

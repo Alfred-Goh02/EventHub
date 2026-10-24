@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { baseEnvSchema, loadEnv } from '@eventhub/config';
+import { appUrlTemplateSchema, baseEnvSchema, loadEnv } from '@eventhub/config';
 
 /**
  * The HTTP service's configuration: the shared base, plus what only the server needs.
@@ -12,11 +12,13 @@ import { baseEnvSchema, loadEnv } from '@eventhub/config';
  */
 const authEnvSchema = baseEnvSchema.extend({
   /**
-   * Where an accept-invite or password-reset link points: the web app a reader opens
-   * the link in. The localhost default is right on a laptop and wrong everywhere
-   * else.
+   * Where an accept-invite or password-reset link points: the web app, on the
+   * subdomain of the tenant the link is for, with {tenant} where that goes. A link on
+   * any other host lands on a page that cannot serve the tenant, because Kong takes
+   * the tenant from the Host. Required, and checked here: see @eventhub/config's
+   * app-url.ts for what is refused and why.
    */
-  PUBLIC_APP_URL: z.string().url().default('http://localhost:3000'),
+  APP_URL_TEMPLATE: appUrlTemplateSchema,
 
   /**
    * POST /invites' budgets. Every invitation is an email this platform sends to an
@@ -50,11 +52,12 @@ const authEnvSchema = baseEnvSchema.extend({
 export const env = loadEnv(authEnvSchema);
 
 /**
- * A production process that forgot PUBLIC_APP_URL would build every reset link on
- * http://localhost:3000, the reader's own machine. Nothing fails: the link is made,
- * sealed and emailed, and password reset is simply broken for everyone, silently. A
- * reset token also belongs on nothing but https. So production requires https.
+ * A production process given the laptop's template would build every reset link on
+ * http://<tenant>.eventhub.localhost:5173, the reader's own machine. Nothing fails: the
+ * link is made, sealed and emailed, and password reset is simply broken for everyone,
+ * silently. A reset token also belongs on nothing but https. So production requires
+ * https.
  */
-if (env.NODE_ENV === 'production' && new URL(env.PUBLIC_APP_URL).protocol !== 'https:') {
-  throw new Error('refusing to start: PUBLIC_APP_URL must be https in production (the default points at localhost)');
+if (env.NODE_ENV === 'production' && env.APP_URL_TEMPLATE.protocol !== 'https:') {
+  throw new Error('refusing to start: APP_URL_TEMPLATE must be https in production (the example points at localhost)');
 }

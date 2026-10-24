@@ -217,7 +217,7 @@ async function main(): Promise<void> {
             logger,
             unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
             publicUrl: env.NOTIFICATION_PUBLIC_URL,
-            appUrl: env.PUBLIC_APP_URL,
+            appUrl: env.APP_URL_TEMPLATE,
             maxAgeMs: env.REPLY_MAX_AGE_MS,
             perHour: env.REPLY_HOURLY_LIMIT,
           }),
@@ -254,7 +254,7 @@ async function main(): Promise<void> {
     logger,
     unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
     publicUrl: env.NOTIFICATION_PUBLIC_URL,
-    appUrl: env.PUBLIC_APP_URL,
+    appUrl: env.APP_URL_TEMPLATE,
   });
 
   app.listen(env.PORT, () => {

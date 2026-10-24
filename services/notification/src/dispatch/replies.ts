@@ -1,4 +1,5 @@
 import { z, ZodError } from 'zod';
+import type { AppUrlTemplate } from '@eventhub/config';
 import type { Logger } from '@eventhub/logger';
 import type { EmailChannel } from '../channels/types.js';
 import { prisma, withTenant } from '../db.js';
@@ -54,6 +55,23 @@ const COMMENT_CREATED_EVENT = 'community.comment_created';
  * and the same link in the body. Decided 2026-09-26: replies are on by default, and a
  * default that is on must be easy to turn off.
  *
+ * THE POST LINK OPENS ON THE RECIPIENT'S TENANT'S SUBDOMAIN, APP_URL_TEMPLATE filled
+ * with the slug Auth signed into their contact card; the unsubscribe link stays on
+ * NOTIFICATION_PUBLIC_URL, one host for every tenant. A card with no slug the gateway
+ * would route -- one from before cards carried it, not yet republished -- gets the email
+ * WITHOUT the post link, counted and logged, rather than held or dropped:
+ *   - the link is the only part that needs the slug. The news that someone replied and
+ *     the way to stop these emails do not, and they are what the email is for;
+ *   - a link to the wrong host is worse than none. It looks like a working link, and on
+ *     a platform where every tenant is a subdomain of one domain it can open another
+ *     organisation's sign-in page;
+ *   - holding it waits on a republish that may never be run, and a reply past
+ *     REPLY_MAX_AGE_MS is not sent at all, so a hold would become a drop;
+ *   - it is transient: setup's contact-cards:publish republishes every card made under
+ *     a slug other than the tenant's current one, and the next reply carries the link.
+ *
+ * Nothing logged here carries an address or the reply's words: ids only.
+ *
  * WHAT THIS TRUSTS. community.feed is not signed, as auth.email-requested is, so a
  * process that can produce to it can have a reply email carry any words to anyone with a
  * card. That is accepted, and bounded: the words are what any member can already send an
@@ -61,8 +79,6 @@ const COMMENT_CREATED_EVENT = 'community.comment_created';
  * credential. What an unsigned message must never do is touch a credential email, which
  * is why the sent-log key includes the template (sent-log.ts). Deciding who may produce
  * at all is the broker's job — ACLs — and arrives with the deployment chapters.
- *
- * Nothing logged here carries an address or the reply's words: ids only.
  */
 
 const envelopeSchema = z.object({
@@ -79,7 +95,7 @@ const envelopeSchema = z.object({
   recipientId: z.string().nullable().optional(),
 });
 
-const counters = { received: 0, notAReply: 0, nobodyToTell: 0, toSelf: 0, tooOld: 0, optedOut: 0, noAddress: 0, held: 0, poison: 0, handedOn: 0 };
+const counters = { received: 0, notAReply: 0, nobodyToTell: 0, toSelf: 0, tooOld: 0, optedOut: 0, noAddress: 0, held: 0, poison: 0, handedOn: 0, withoutLink: 0 };
 
 export function replyMetrics(): Record<string, number> {
   return {
@@ -100,6 +116,12 @@ export function replyMetrics(): Record<string, number> {
     poisonTotal: counters.poison,
     /** Went on to claim, suppression and send; see dispatch's counters for what became of them. */
     handedOnTotal: counters.handedOn,
+    /**
+     * Of those, how many went without the link to the post: the recipient's card names
+     * no subdomain the gateway routes, so there was no host to put it on. Above zero
+     * after a deploy means cards still to republish (contact-cards:publish).
+     */
+    withoutLinkTotal: counters.withoutLink,
   };
 }
 
@@ -128,10 +150,10 @@ export function createReplyHandler(opts: {
   channel: EmailChannel;
   logger: Logger;
   unsubscribeSecret: string;
-  /** Where this service answers /unsubscribe, as a reader's mail client reaches it. */
+  /** Where this service answers /unsubscribe, as a reader's mail client reaches it. One host for every tenant. */
   publicUrl: string;
-  /** Where the web app shows a post. */
-  appUrl: string;
+  /** Where the web app shows a post: APP_URL_TEMPLATE, filled with the recipient's tenant's slug. */
+  appUrl: AppUrlTemplate;
   /** Past this age a reply is not sent. See the note at the top of this file. */
   maxAgeMs: number;
   /** Reply emails per recipient per hour; the rest are held for the digest. See digest/hold.ts. */
@@ -279,6 +301,15 @@ export function createReplyHandler(opts: {
     const unsubscribeUrl = `${opts.publicUrl}/unsubscribe?token=${encodeURIComponent(
       signUnsubscribe(opts.unsubscribeSecret, { tenantId: e.tenantId, userId: e.recipientId, category: 'COMMUNITY_REPLY' }),
     )}`;
+    // The recipient's tenant's own host, or none: see the note at the top of this file.
+    const origin = opts.appUrl.originFor(opened.tenantSlug);
+    if (!origin) {
+      counters.withoutLink += 1;
+      opts.logger.warn(
+        { ...ids, reason: opened.tenantSlug === null ? 'the card carries no slug' : 'the card\'s slug is not a subdomain the gateway routes' },
+        'the recipient\'s contact card names no subdomain to link to; the reply goes without its link',
+      );
+    }
     counters.handedOn += 1;
     return deliver(
       {
@@ -288,7 +319,7 @@ export function createReplyHandler(opts: {
         email: renderCommunityReply({
           toComment: Boolean(e.parentCommentId),
           body: e.body ?? '',
-          postUrl: `${opts.appUrl}/posts/${encodeURIComponent(e.postId)}`,
+          postUrl: origin ? `${origin}/posts/${encodeURIComponent(e.postId)}` : null,
           unsubscribeUrl,
         }),
         headers: {

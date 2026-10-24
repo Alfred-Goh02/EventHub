@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isTenantSlug } from '@eventhub/config';
 import type { Prisma } from './generated/prisma/client.js';
 import { sealToNotification } from './email-request.js';
 import { signContactCard } from './jwt.js';
@@ -18,6 +19,22 @@ import { emit } from './outbox.js';
  * so the key decides which card survives. A key of the user id alone would let one
  * tenant's card erase another's under a colliding id — Auth mints ids per tenant, and
  * CLAUDE.md records that failure for a dedupe key and a cache key already.
+ *
+ * THE CARD NAMES THE TENANT'S SUBDOMAIN, `tenantSlug`, signed with the rest. A reply
+ * email links to a post on the recipient's tenant's own host, and Notification has no
+ * other way to know what that is: nothing else it reads carries a slug. Inside the
+ * seal, not in the Avro envelope beside it, because the envelope is plaintext anyone
+ * who can produce to the topic can edit, and the slug decides which host a link opens:
+ * a genuine card with a rewritten envelope must not move a user's links to another
+ * tenant's subdomain. Notification opens every card before storing it, and again
+ * before sending, so a copy outside the seal would buy nothing it could trust.
+ *
+ * Only a slug Kong would route is put on a card. Anything else is left off, and the
+ * card is still published — the address in it is good — so Notification sends that
+ * user's replies without a link rather than with one to a host nobody can open. Cards
+ * from before the claim existed carry none either, until `contact-cards:publish`
+ * republishes them: it picks out every user whose card was not made under their
+ * tenant's current slug, from the contactSlug this stamps.
  */
 export const AUTH_CONTACT_TOPIC = 'auth.user-contact';
 
@@ -29,12 +46,16 @@ export const contactKey = (tenantId: string, userId: string) => `${tenantId}:${u
  * transaction. The card and the marker commit with the change that caused them or not
  * at all, so a user can never be marked published with no card on its way.
  *
- * contactPublishedAt IS the current card's occurredAt: one value, stamped once.
+ * contactPublishedAt IS the current card's occurredAt: one value, stamped once. And
+ * contactSlug is the tenant's slug the card was made under, read in the same
+ * statement, so the slug on the card is the tenant's as of the instant that orders it.
+ *
+ * Returns the slug the card carries, or null when it carries none.
  */
 export async function queueContactCard(
   tx: Prisma.TransactionClient,
   user: { tenantId: string; userId: string; email: string },
-): Promise<void> {
+): Promise<{ tenantSlug: string | null }> {
   // Chosen here, because the seal carries it as its jti and the seal is made before
   // the outbox row exists.
   const messageId = randomUUID();
@@ -60,18 +81,20 @@ export async function queueContactCard(
    * otherwise re-send an old genuine card with a far-future occurredAt in its
    * plaintext envelope, and pin that user to an old address for good.
    */
-  const stamped = await tx.$queryRaw<Array<{ at: string }>>`
-    UPDATE "User" SET "contactPublishedAt" = clock_timestamp() AT TIME ZONE 'UTC'
-     WHERE id = ${user.userId}
-    RETURNING to_char("contactPublishedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at`;
+  const stamped = await tx.$queryRaw<Array<{ at: string; slug: string }>>`
+    UPDATE "User" u
+       SET "contactPublishedAt" = clock_timestamp() AT TIME ZONE 'UTC', "contactSlug" = t.slug
+      FROM "Tenant" t
+     WHERE u.id = ${user.userId} AND u."tenantId" = ${user.tenantId} AND t.id = u."tenantId"
+    RETURNING to_char(u."contactPublishedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at, t.slug AS slug`;
   const at = stamped[0]?.at;
   if (!at) throw new Error(`no user ${user.userId} to queue a contact card for`);
+  const slug = stamped[0]?.slug;
+  const tenantSlug = isTenantSlug(slug) ? slug : null;
 
-  const signed = await signContactCard({
-    subject: user.userId,
-    jti: messageId,
-    claims: { tenantId: user.tenantId, email: user.email, occurredAt: at },
-  });
+  const claims: Record<string, string> = { tenantId: user.tenantId, email: user.email, occurredAt: at };
+  if (tenantSlug) claims['tenantSlug'] = tenantSlug;
+  const signed = await signContactCard({ subject: user.userId, jti: messageId, claims });
 
   await emit(tx, {
     id: messageId,
@@ -82,4 +105,5 @@ export async function queueContactCard(
     // Only identifiers, the ordering instant and ciphertext: the address is inside `sealed`.
     payload: { occurredAt: at, tenantId: user.tenantId, userId: user.userId, sealed: await sealToNotification(signed) },
   });
+  return { tenantSlug };
 }
