@@ -7,6 +7,20 @@ datasource db {
   provider = "postgresql"
 }
 
+// A TIMESTAMP DEFAULT IS dbgenerated("CURRENT_TIMESTAMP"), NEVER now().
+//
+// Prisma 7 fills @default(now()) in the client, from this process's clock, and sends
+// it in the INSERT. With Ticketing an hour fast, an outbox row's createdAt -- the
+// event's occurredAt once the relay publishes it -- came out +3600 s from Postgres's
+// now(). dbgenerated leaves the column out of the INSERT, and Postgres fills it.
+// The DEFAULT in the database was CURRENT_TIMESTAMP all along, so there is no
+// migration; `prisma migrate diff` offers a SET DEFAULT CURRENT_TIMESTAMP per column
+// for ever, because introspection reads it back as now() (measured: the same
+// statements again after applying them). Leave them out. @updatedAt has no such
+// option, so it is the process's clock and nothing may compare one. This service
+// writes its timestamps in SQL anyway; the rule holds here so a check can hold it
+// everywhere. scripts/verify-event-times-from-database.mjs refuses a now() here.
+
 enum DeliveryStatus {
   /// Claimed: the row exists, so no other consumer will send this, and nothing
   /// has been handed to a provider yet. A row stuck here means a consumer died
@@ -54,7 +68,7 @@ model NotificationDelivery {
   attempts          Int            @default(0)
   providerMessageId String?
   lastError         String?
-  createdAt         DateTime       @default(now())
+  createdAt         DateTime       @default(dbgenerated("CURRENT_TIMESTAMP"))
   sentAt            DateTime?
   failedAt          DateTime?
 
@@ -89,7 +103,7 @@ model EmailSuppression {
   expiresAt        DateTime
   /// How many hard bounces this address has produced.
   bounces          Int      @default(1)
-  createdAt        DateTime @default(now())
+  createdAt        DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@unique([tenantId, addressHash])
 }
@@ -103,7 +117,7 @@ model NotificationPreference {
   category  String
   channel   String
   enabled   Boolean
-  updatedAt DateTime @default(now())
+  updatedAt DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@id([tenantId, userId, category, channel])
 }
@@ -119,7 +133,7 @@ model ContactCard {
   messageId  String
   /// When Auth queued the card. An older card never replaces a newer one.
   occurredAt DateTime
-  updatedAt  DateTime @default(now())
+  updatedAt  DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@id([tenantId, userId])
 }
@@ -136,7 +150,7 @@ model DigestItem {
   toComment       Boolean
   /// Set when a flush takes the item into a digest; that digest's sent-log identity.
   digestId        String?
-  createdAt       DateTime @default(now())
+  createdAt       DateTime @default(dbgenerated("CURRENT_TIMESTAMP"))
 
   @@id([tenantId, userId, category, sourceMessageId])
   @@index([createdAt])

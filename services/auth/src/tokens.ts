@@ -78,12 +78,19 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
    * The family is revoked rather than merely refused, so the outstanding
    * successor cannot be presented either: reaching the ceiling ends the session,
    * it does not pause it.
+   *
+   * ASKED OF POSTGRES, because createdAt is Postgres's clock. It is filled by the
+   * column's DEFAULT (see the schema), and this compared it with `Date.now()`, so
+   * the ceiling moved by however far this process's clock and the database's
+   * disagree: with Auth an hour fast, a family 90 days less 30 minutes old was
+   * refused. See "Timestamps come from the database" in CLAUDE.md.
    */
-  const [family] = await prisma.$queryRaw<Array<{ startedAt: Date | null }>>`
-    SELECT min("createdAt") AS "startedAt" FROM "RefreshToken" WHERE "familyId" = ${record.familyId}
+  const [family] = await prisma.$queryRaw<Array<{ pastCeiling: boolean | null }>>`
+    SELECT min("createdAt") < now() - (${ABSOLUTE_SESSION_MS}::bigint * interval '1 millisecond') AS "pastCeiling"
+      FROM "RefreshToken" WHERE "familyId" = ${record.familyId}
   `;
 
-  if (family?.startedAt && Date.now() - family.startedAt.getTime() > ABSOLUTE_SESSION_MS) {
+  if (family?.pastCeiling === true) {
     await revokeFamilyById(record.familyId);
     return { ok: false, reason: 'expired' };
   }
