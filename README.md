@@ -567,7 +567,9 @@ Reply and digest links (`/posts/<id>`) open on the recipient's tenant's host, fr
 the slug Auth signs into each user's contact card. Auth and Notification both refuse to
 start without the template, or with `{tenant}` anywhere but the first label of the
 host, and only a slug the gateway would route is ever put into it. It replaces
-`PUBLIC_APP_URL`, which was one host for every tenant and served none. The unsubscribe
+`PUBLIC_APP_URL`, which was one host for every tenant and served none, so a `.env`
+copied from an older example has no template, and the service says so as it refuses:
+copy the line from `.env.example`. The unsubscribe
 link is the exception, on purpose: it stays on `NOTIFICATION_PUBLIC_URL`, one host
 with no tenant, since its signed token names the tenant.
 

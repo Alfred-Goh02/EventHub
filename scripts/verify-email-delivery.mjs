@@ -12,6 +12,10 @@
  *     password; a delivered but wrong link would look like success otherwise. And it
  *     opens on the tenant's own subdomain: the token works from any host, so a reset
  *     on the shared localhost:3000 that served no tenant passed every check here.
+ *   - A tenant whose slug the gateway would not route -- a reserved name, which Auth
+ *     still resolves -- gets no reset at all: no token, no email queued, no link. Its
+ *     user is real and within budget, so only the check on the link stops it, and
+ *     Auth's log line says the request got that far.
  *   - A redelivery sends nothing. The same outbox row is published again, and
  *     Notification's received counter must move. "Still one email" is also what a
  *     consumer that never saw the redelivery would produce.
@@ -25,9 +29,9 @@
  * Notification to count it before anything real is sent. Every later message has
  * the same key, so the same partition, and the consumer is known to be reading it.
  *
- * Scoped to a tenant, a user and consumer groups created for this run, the contact-card
- * group among them (scripts/lib/notification-groups.mjs); all of them, the delivery rows
- * and the inbox messages are removed at the end.
+ * Scoped to two tenants, a user in each and consumer groups created for this run, the
+ * contact-card group among them (scripts/lib/notification-groups.mjs); all of them, the
+ * delivery rows and the inbox messages are removed at the end.
  *
  * Run (with Postgres, Kafka, the Schema Registry and Mailpit up; Auth, the relay and
  * Notification built; both keypairs generated): node scripts/verify-email-delivery.mjs
@@ -63,6 +67,17 @@ const VICTIM = `victim-${RUN}@mailcheck.example`;
 const GROUP = `verify-email-delivery-${RUN}`;
 const GROUPS = notificationGroups(GROUP);
 const NEW_PASSWORD = `new-password-${RUN}`;
+/**
+ * A tenant whose slug, as the database holds it, is one the gateway would not route: a
+ * reserved name. Auth resolves any one DNS label to a tenant, a reserved one included,
+ * so only the check on the link stands between this row and a reset link on a host Kong
+ * refuses. A fixed name, since there are only nine reserved ones: a run first removes
+ * any tenant this file left behind under it, by its prefix.
+ */
+const ODD_TENANT = `tenant_maildeliveryodd_${RUN}`;
+const ODD_SLUG = 'assets';
+const ODD_USER_ID = `user_maildeliveryodd_${RUN}`;
+const ODD_EMAIL = `deliver-odd-${RUN}@mailcheck.example`;
 
 const NOTIFICATION_PORT = 3091;
 const AUTH_PORT = 3093;
@@ -157,13 +172,13 @@ const post = (path, body, headers = {}) =>
 
 const dispatch = async () => (await (await fetch(`http://127.0.0.1:${NOTIFICATION_PORT}/metrics`)).json()).dispatch;
 
-/** The dev sink's reset links for this run's tenant, oldest first. */
-function sinkLinks(log) {
+/** The dev sink's reset links for one of this run's tenants, oldest first. */
+function sinkLinks(log, tenant = TENANT) {
   const links = [];
   for (const line of log.split(/\r?\n/)) {
     try {
       const entry = JSON.parse(line);
-      if (entry.devOnlyResetUrl && entry.tenantId === TENANT) links.push(entry.devOnlyResetUrl);
+      if (entry.devOnlyResetUrl && entry.tenantId === tenant) links.push(entry.devOnlyResetUrl);
     } catch {
       // not a JSON log line
     }
@@ -307,6 +322,15 @@ async function main() {
     console.log('  the fixture');
     await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [TENANT, `Mail delivery ${RUN}`, TENANT_SLUG]);
     await inTenant(authApp, TENANT, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [USER_ID, TENANT, EMAIL]);
+    // An earlier run killed before its cleanup leaves its reserved-name tenant, whose
+    // unique slug would refuse the insert below. Only this file's own, by its prefix.
+    for (const { id } of (await authApp.query(`SELECT t.id FROM "Tenant" t WHERE t.slug = $1 AND t.id LIKE 'tenant_maildeliveryodd_%'`, [ODD_SLUG])).rows) {
+      await relayDb.query('DELETE FROM "OutboxMessage" WHERE "tenantId" = $1', [id]);
+      await inTenant(authApp, id, 'DELETE FROM "User" WHERE "tenantId" = $1', [id]);
+      await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [id]);
+    }
+    await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [ODD_TENANT, `Mail delivery ${RUN}, reserved`, ODD_SLUG]);
+    await inTenant(authApp, ODD_TENANT, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [ODD_USER_ID, ODD_TENANT, ODD_EMAIL]);
 
     // Waited for side by side, each with a full minute: one run saw Auth miss a
     // 30-second window that began only after Notification was ready.
@@ -473,6 +497,29 @@ async function main() {
     check(login.status === 200, `and the new password signs in (${login.status})`);
 
     console.log('');
+    console.log('  a tenant whose subdomain the gateway would not route gets no reset at all');
+    /**
+     * Kong never sends a reserved name as X-Tenant-Slug, but a client that reaches Auth
+     * directly can, and the tenant resolves. Filled in raw, the link would open
+     * assets.eventhub.localhost, which Kong refuses with 400: a reset nobody can use.
+     * The account is real and within its budget, so a reset would be issued but for the
+     * check on the link. Auth's log line is written only once the tenant has resolved,
+     * so it shows the request reached that check rather than stopping short of it.
+     */
+    const odd = await post('/forgot-password', { email: ODD_EMAIL }, { 'X-Tenant-Slug': ODD_SLUG });
+    // A refusal that changes nothing has to be given the time a change would take.
+    await sleep(1_000);
+    const oddTokens = (await inTenant(authApp, ODD_TENANT, 'SELECT count(*)::int AS n FROM "PasswordResetToken" WHERE "userId" = $1', [ODD_USER_ID])).rows[0].n;
+    const oddQueued = (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" o WHERE o."tenantId" = $1', [ODD_TENANT])).rows[0].n;
+    const oddLinks = sinkLinks(auth.log(), ODD_TENANT).length;
+    const oddSaid = auth.log().split(/\r?\n/).filter((l) => l.includes(ODD_TENANT) && /password reset not issued: the tenant has no subdomain/.test(l)).length;
+    check(oddSaid === 1, `CONTROL: the tenant resolved, and Auth logged why it issued nothing, once (${oddSaid})`);
+    check(
+      odd.status === 202 && oddTokens === 0 && oddQueued === 0 && oddLinks === 0,
+      `"${ODD_SLUG}", a reserved name: the same 202, and no reset token, no email queued and no link made (${odd.status}, ${oddTokens} token(s), ${oddQueued} queued, ${oddLinks} link(s))`,
+    );
+
+    console.log('');
     console.log("  Notification's output holds nothing to steal");
     const output = notification.log();
     const leaked = [['a token', token1], ['a token', token2], ['a link', link1], ['a link', link2], ['the address', EMAIL], ["the forged seal's address", VICTIM], ['the forged link', 'evil.example']].filter(([, s]) => s && output.includes(s));
@@ -495,7 +542,7 @@ async function main() {
     auth.child.kill();
     // Searched again rather than trusting the ids seen along the way: an email that
     // arrived after the last look was once left behind.
-    const found = [...(await inbox(EMAIL).catch(() => [])), ...(await inbox(VICTIM).catch(() => []))].map((m) => m.ID);
+    const found = [...(await inbox(EMAIL).catch(() => [])), ...(await inbox(VICTIM).catch(() => [])), ...(await inbox(ODD_EMAIL).catch(() => []))].map((m) => m.ID);
     await fetch(`${MAILPIT}/api/v1/messages`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
@@ -505,16 +552,28 @@ async function main() {
     await inTenant(notifyOwner, TENANT, 'DELETE FROM "NotificationDelivery" WHERE "tenantId" = $1', [TENANT]).catch(() => {});
     await inTenant(authApp, TENANT, 'DELETE FROM "User" WHERE id = $1', [USER_ID]).catch(() => {});
     await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [TENANT]).catch(() => {});
+    // The reserved-name tenant: nothing should have been written under it but itself and
+    // its user, and that is counted below rather than assumed.
+    await relayDb.query('DELETE FROM "OutboxMessage" WHERE "tenantId" = $1', [ODD_TENANT]).catch(() => {});
+    await inTenant(notifyOwner, ODD_TENANT, 'DELETE FROM "NotificationDelivery" WHERE "tenantId" = $1', [ODD_TENANT]).catch(() => {});
+    await inTenant(authApp, ODD_TENANT, 'DELETE FROM "User" WHERE id = $1', [ODD_USER_ID]).catch(() => {});
+    await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [ODD_TENANT]).catch(() => {});
     await producer.disconnect().catch(() => {});
     // The group empties once the killed consumer's session times out.
     const groupsLeft = await deleteGroupsWhenEmpty(admin, GROUPS.all);
     await admin.disconnect().catch(() => {});
     const left = {
-      outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
-      deliveries: (await inTenant(notifyOwner, TENANT, 'SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1', [TENANT])).rows[0].n,
-      inbox: (await inbox(EMAIL).catch(() => [])).length + (await inbox(VICTIM).catch(() => [])).length,
+      outbox: (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = ANY($1::text[])', [[TENANT, ODD_TENANT]])).rows[0].n,
+      deliveries:
+        (await inTenant(notifyOwner, TENANT, 'SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1', [TENANT])).rows[0].n +
+        (await inTenant(notifyOwner, ODD_TENANT, 'SELECT count(*)::int AS n FROM "NotificationDelivery" WHERE "tenantId" = $1', [ODD_TENANT])).rows[0].n,
+      inbox: (await inbox(EMAIL).catch(() => [])).length + (await inbox(VICTIM).catch(() => [])).length + (await inbox(ODD_EMAIL).catch(() => [])).length,
+      tenants: (await authApp.query('SELECT count(*)::int AS n FROM "Tenant" WHERE id = ANY($1::text[])', [[TENANT, ODD_TENANT]])).rows[0].n,
     };
-    check(left.outbox === 0 && left.deliveries === 0 && left.inbox === 0, `cleanup: this run's outbox rows, deliveries and emails are gone (${JSON.stringify(left)}); consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`);
+    check(
+      left.outbox === 0 && left.deliveries === 0 && left.inbox === 0 && left.tenants === 0,
+      `cleanup: this run's tenants, outbox rows, deliveries and emails are gone (${JSON.stringify(left)}); consumer groups ${groupsLeft.length === 0 ? 'deleted' : `left to expire: ${groupsLeft.join(', ')}`}`,
+    );
     await Promise.all([authApp, relayDb, notifyApp, notifyOwner].map((c) => c.end().catch(() => {})));
   }
 
