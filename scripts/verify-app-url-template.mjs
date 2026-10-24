@@ -22,6 +22,9 @@
  *     exactly its own host, so "no origin" is the rule refusing and not a template that
  *     fills nothing. Among the refused are the ones that would move a link if they were
  *     substituted raw: a dot, a slash, an @, a colon.
+ *   - Compose, both .env.examples and the README name the same template. Each is
+ *     written by hand, so compose's value is read out of docker-compose.yml, alias and
+ *     all, for exactly the two services that build links, and compared.
  *   - Auth and Notification each refuse to start with the template missing -- the
  *     deployment that still sets only PUBLIC_APP_URL -- with the OLD TENANTLESS BASE in
  *     it, and with each malformed shape, and each refusal names the variable and the
@@ -136,6 +139,27 @@ function kongRule() {
   return { reserved, patterns, max };
 }
 
+/**
+ * What compose gives each service as APP_URL_TEMPLATE, read from docker-compose.yml's
+ * own text: a service is a two-space key under `services:`, and an alias is resolved to
+ * the anchor it names. Lines may end in CRLF on this checkout, which `\s*$` absorbs.
+ */
+function composeTemplates() {
+  const yml = readFileSync(join(ROOT, 'docker-compose.yml'), 'utf8');
+  const anchors = Object.fromEntries([...yml.matchAll(/&([a-z0-9-]+)\s+"([^"]*)"/g)].map((m) => [m[1], m[2]]));
+  const services = yml.slice(Math.max(0, yml.search(/^services:\s*$/m)));
+  const found = {};
+  for (const block of services.split(/^(?=  [a-z][a-z0-9-]*:\s*$)/m)) {
+    const name = block.match(/^  ([a-z][a-z0-9-]*):\s*$/m)?.[1];
+    const value = block.match(/^\s+APP_URL_TEMPLATE:\s*(.+?)\s*$/m)?.[1];
+    if (!name || value === undefined) continue;
+    const alias = value.match(/^\*([a-z0-9-]+)$/)?.[1];
+    const anchored = value.match(/^&[a-z0-9-]+\s+"([^"]*)"$/)?.[1];
+    found[name] = alias !== undefined ? anchors[alias] : (anchored ?? value.replace(/^"(.*)"$/, '$1'));
+  }
+  return found;
+}
+
 async function main() {
   // ---------------------------------------------------------------------------------
   console.log("  the rule is the gateway's, read from kong.yml");
@@ -224,6 +248,22 @@ async function main() {
 
   // ---------------------------------------------------------------------------------
   console.log('');
+  console.log('  compose, both examples and the README name the same template');
+  // Hand-written in four places, so each is checked against the examples rather than trusted.
+  const composed = composeTemplates();
+  check(
+    Object.keys(composed).sort().join(',') === 'auth,notification',
+    `CONTROL: docker-compose.yml was read, and sets APP_URL_TEMPLATE for exactly the two services that build links (${Object.keys(composed).sort().join(', ') || 'none'})`,
+  );
+  check(
+    composed.auth === exampleTemplate && composed.notification === exampleTemplate,
+    `compose gives both the examples' template (${composed.auth ?? 'nothing'} / ${composed.notification ?? 'nothing'})`,
+  );
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  check(readme.includes(`\`${exampleTemplate}\` in compose`), `and the README names it as compose's (${exampleTemplate})`);
+
+  // ---------------------------------------------------------------------------------
+  console.log('');
   console.log('  a missing or malformed template refuses to start, in both services');
   const malformed = [
     ['missing, as in a deployment that still sets only PUBLIC_APP_URL', undefined, 'required'],
@@ -242,11 +282,14 @@ async function main() {
   const admin = kafka.admin();
   await admin.connect();
   try {
+    // A process already answering would pass the controls below for code this run never started.
+    let portsFree = true;
     for (const port of [AUTH_PORT, NOTIFICATION_PORT]) {
       const taken = await fetch(`http://127.0.0.1:${port}/health`).then(() => true, () => false);
       check(!taken, taken ? `something already answers on :${port}; stop it and run again` : `CONTROL: :${port} is free`);
+      if (taken) portsFree = false;
     }
-    if (failures > 0) return;
+    if (!portsFree) return;
 
     for (const [service, env, port] of [['auth', authEnv, AUTH_PORT], ['notification', notificationEnv, NOTIFICATION_PORT]]) {
       const outcomes = [];
