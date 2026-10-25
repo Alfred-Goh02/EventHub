@@ -194,8 +194,9 @@ export const mockApi: EventHubApi = {
   async listEvents(cursor) {
     requireAuth();
     await delay();
+    // As the real list does with ?upcoming=true: nothing that has ended.
     const all = db()
-      .events.filter((e) => e.status === "PUBLISHED")
+      .events.filter((e) => e.status === "PUBLISHED" && Date.parse(e.endsAt) > Date.now())
       .sort((a, b) => a.startsAt.localeCompare(b.startsAt));
     const start = cursor ? Number(cursor) : 0;
     const data = all.slice(start, start + 20);

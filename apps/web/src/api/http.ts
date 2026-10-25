@@ -186,8 +186,10 @@ export const httpApi: EventHubApi = {
     }
   },
   async listEvents(cursor) {
-    return (await authed(`/events?${qs({ status: "PUBLISHED", limit: 20, cursor })}`))
-      .body as Page<Event>;
+    // upcoming: events that have not ended, by the server's clock. The cursor does not
+    // carry it, so it goes with every page.
+    const query = qs({ status: "PUBLISHED", upcoming: "true", limit: 20, cursor });
+    return (await authed(`/events?${query}`)).body as Page<Event>;
   },
   async getEvent(id) {
     return (await authed(`/events/${encodeURIComponent(id)}`)).body as EventDetail;

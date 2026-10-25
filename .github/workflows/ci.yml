@@ -1643,6 +1643,14 @@ jobs:
       - name: Assert a buyer can see what they bought, and nobody else can
         run: node scripts/verify-reservation-reads.mjs
 
+      # The attendee app lists events soonest first, and opened on ones that were
+      # over. ?upcoming=true leaves out what has ended, by Postgres's clock: Event
+      # runs an hour fast, so an event ending in half an hour is over by its own
+      # clock and must still be listed. Paged one at a time, with an ended event
+      # sorted between two upcoming ones, so a filter on the first page only shows.
+      - name: Assert the upcoming list leaves out what has ended, by the database's clock
+        run: node scripts/verify-upcoming-events.mjs
+
       # The cross-service assertion, and the one that would have caught the
       # defect the Chapter 4 design review found: only /publish emitted an
       # outbox row, so Ticketing's projection was stale by construction for
