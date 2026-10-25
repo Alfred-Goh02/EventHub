@@ -127,11 +127,11 @@ async function main() {
   // here: the compose job has no dependencies, and Auth will replace it below anyway.
   const seededHash = await psql('eventhub_auth', `SELECT "passwordHash" FROM "User" WHERE email = 'alice@acme.com' AND "tenantId" = '${TENANTS[0].id}'`);
   check(seededHash.startsWith('$argon2'), `CONTROL: the seeded account's hash was read (${seededHash.slice(0, 12)}…)`);
-  const seededTenants = await psql('eventhub_auth', `SELECT string_agg(slug, ',' ORDER BY slug) FROM "Tenant" WHERE id IN (${TENANTS.map((t) => `'${t.id}'`).join(', ')})`);
+  const seededTenants = await psql('eventhub_auth', `SELECT string_agg(t.slug, ',' ORDER BY t.slug) FROM "Tenant" t WHERE t.id IN (${TENANTS.map((t) => `'${t.id}'`).join(', ')})`);
   check(seededTenants === TENANTS.map((t) => t.slug).sort().join(','), `CONTROL: both seeded tenants are there, by these slugs (${seededTenants || 'none'})`);
   // Every seeded alice's hash, each salted on its own, to show at the end that none changed.
   const seededIn = `email = 'alice@acme.com' AND "tenantId" IN (${TENANTS.map((t) => `'${t.id}'`).join(', ')})`;
-  const seededHashes = await psql('eventhub_auth', `SELECT string_agg("passwordHash", ' ' ORDER BY "tenantId") FROM "User" WHERE ${seededIn}`);
+  const seededHashes = await psql('eventhub_auth', `SELECT string_agg(u."passwordHash", ' ' ORDER BY u."tenantId") FROM "User" u WHERE ${seededIn}`);
   if (failures > 0) return;
 
   try {
@@ -218,7 +218,7 @@ async function main() {
     console.log('  the containers recorded it');
     const rows = await psql(
       'eventhub_notification',
-      `SELECT string_agg(status::text, ',' ORDER BY status::text) FROM "NotificationDelivery" WHERE "recipientId" IN (${TENANTS.map((t) => `'${userIn(t)}'`).join(', ')})`,
+      `SELECT string_agg(d.status::text, ',' ORDER BY d.status::text) FROM "NotificationDelivery" d WHERE d."recipientId" IN (${TENANTS.map((t) => `'${userIn(t)}'`).join(', ')})`,
     );
     check(rows === 'SENT,SENT', `the sent-log holds one delivery per tenant, each SENT (${rows || 'no row'})`);
     const caughtUp = await waitFor(async () => {
@@ -248,7 +248,7 @@ async function main() {
       inbox: (await inbox(EMAIL).catch(() => [])).length,
     };
     check(left.users === '0' && left.deliveries === '0' && left.inbox === 0, `cleanup: the run's users, deliveries and emails are gone (${JSON.stringify(left)})`);
-    const seedNow = await psql('eventhub_auth', `SELECT string_agg("passwordHash", ' ' ORDER BY "tenantId") FROM "User" WHERE ${seededIn}`).catch(() => '?');
+    const seedNow = await psql('eventhub_auth', `SELECT string_agg(u."passwordHash", ' ' ORDER BY u."tenantId") FROM "User" u WHERE ${seededIn}`).catch(() => '?');
     const seeded = seededHashes.split(' ').length;
     check(
       seedNow === seededHashes && seeded === TENANTS.length,
