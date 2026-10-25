@@ -137,7 +137,17 @@ export function parseAppUrlTemplate(raw: string): AppUrlTemplate {
     protocol,
     originFor(slug: unknown): string | null {
       if (!isTenantSlug(slug)) return null;
-      const url = new URL(template.split(APP_URL_PLACEHOLDER).join(slug));
+      // Kong routes an `xn--` label whatever follows it, and so does the rule above, but
+      // URL refuses one that is not valid punycode: `xn--a`, `xn--`, `xn---`. That throw
+      // escaped as a TypeError, which kafkajs treats as unrecoverable, and Notification's
+      // replies consumer crashed on the same message for good, for every tenant behind it.
+      // A label no URL can hold gets no link, like any other this cannot use.
+      let url: URL;
+      try {
+        url = new URL(template.split(APP_URL_PLACEHOLDER).join(slug));
+      } catch {
+        return null;
+      }
       // The slug passed the rule, so it can only have filled the first label; this is
       // the check that it did, rather than an assumption that it must have.
       if (url.hostname !== `${slug}.${domain}`) return null;

@@ -246,6 +246,32 @@ async function main() {
       : `put into a link: ${substituted.map((s) => `${show(s)} -> ${local.originFor(s) ?? production.originFor(s)}`).join(', ')}`,
   );
 
+  /**
+   * Labels the gateway routes but no URL can hold: `xn--` followed by something that is
+   * not valid punycode. originFor threw a TypeError for each, and in Notification's
+   * replies consumer kafkajs treats a TypeError as unrecoverable, so the consumer crashed
+   * on the same message for good. Each must answer null, like any slug it cannot use.
+   */
+  const unbuildable = ['xn--a', 'xn--', 'xn---', 'xn--zz'];
+  check(
+    unbuildable.every((s) => kongRoutes(s) && isTenantSlug(s)),
+    `CONTROL: the gateway routes each of ${unbuildable.map(show).join(', ')}, and isTenantSlug passes it, so a tenant can have one`,
+  );
+  const answered = unbuildable.map((s) => {
+    try {
+      return { s, local: local.originFor(s), production: production.originFor(s) };
+    } catch (err) {
+      return { s, threw: err instanceof Error ? `${err.name} ${err.code ?? err.message}` : String(err) };
+    }
+  });
+  const wrong = answered.filter((a) => a.threw || a.local !== null || a.production !== null);
+  check(
+    wrong.length === 0,
+    wrong.length === 0
+      ? `and none of them gets a link: originFor answers null for each, locally and in production, rather than throwing`
+      : `not answered with null: ${wrong.map((a) => `${show(a.s)} -> ${a.threw ? `threw ${a.threw}` : `${a.local} / ${a.production}`}`).join(', ')}`,
+  );
+
   // ---------------------------------------------------------------------------------
   console.log('');
   console.log('  compose, both examples and the README name the same template');
