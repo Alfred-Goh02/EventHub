@@ -221,20 +221,17 @@ export async function lookupInvite(token: string): Promise<InviteLookup> {
  *
  * Already-accepted invites are left alone: revoking one would not remove the
  * user it created, so it would only make the audit trail lie.
+ *
+ * revokedAt on the database's clock, as issueInvite's supersede stamps it. Nothing
+ * compares it with a time -- only whether it is set -- but a column filled from two
+ * clocks is one nobody can safely read later.
  */
 export async function revokeInvitesFor(params: {
   tenantId: string;
   email: string;
 }): Promise<number> {
-  const { count } = await prisma.invite.updateMany({
-    where: {
-      tenantId: params.tenantId,
-      email: params.email.toLowerCase(),
-      acceptedAt: null,
-      revokedAt: null,
-    },
-    data: { revokedAt: new Date() },
-  });
-
-  return count;
+  return prisma.$executeRaw`
+    UPDATE "Invite" SET "revokedAt" = now() AT TIME ZONE 'UTC'
+     WHERE "tenantId" = ${params.tenantId} AND email = ${params.email.toLowerCase()}
+       AND "acceptedAt" IS NULL AND "revokedAt" IS NULL`;
 }

@@ -1,7 +1,14 @@
 import { randomBytes } from 'node:crypto';
-import { prisma } from './db.js';
+import { databaseNow, prisma } from './db.js';
 import { hashSecretToken as hashToken, newSecretToken } from './secret-token.js';
 
+/**
+ * Thirty days, from the DATABASE'S now(), which is the clock the expiry is judged on:
+ * rotateRefreshToken's check and its claim both compare it there. It was
+ * `new Date(Date.now() + REFRESH_TTL_MS)`, this process's clock -- measured with Auth an
+ * hour fast, a fresh token expired 30 days and 3600 s after now(), and one the database
+ * said had thirty minutes left was refused.
+ */
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
@@ -39,7 +46,7 @@ export async function issueRefreshToken(
       tenantId,
       tokenHash: hashToken(token),
       familyId: familyId ?? randomBytes(16).toString('hex'),
-      expiresAt: new Date(Date.now() + REFRESH_TTL_MS),
+      expiresAt: await databaseNow(prisma, REFRESH_TTL_MS),
     },
   });
 
@@ -54,16 +61,25 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
   // Note: no join to User. RefreshToken carries its own tenantId because this
   // lookup happens BEFORE any tenant context exists — the tenant is a result of
   // the query, not an input to it, so an RLS-filtered join would return nothing.
-  const record = await prisma.refreshToken.findUnique({
-    where: { tokenHash: hashToken(presented) },
-  });
+  //
+  // Expired is the database's answer, like lookupResetToken's: this compared
+  // `record.expiresAt < new Date()` in JavaScript, on this process's clock.
+  const [record] = await prisma.$queryRaw<
+    Array<{ id: string; userId: string; tenantId: string; familyId: string; revoked: boolean; used: boolean; expired: boolean }>
+  >`
+    SELECT t.id, t."userId", t."tenantId", t."familyId",
+           t."revokedAt" IS NOT NULL AS revoked,
+           t."usedAt" IS NOT NULL AS used,
+           t."expiresAt" <= (now() AT TIME ZONE 'UTC') AS expired
+      FROM "RefreshToken" t
+     WHERE t."tokenHash" = ${hashToken(presented)}`;
 
-  if (!record || record.revokedAt) {
+  if (!record || record.revoked) {
     return { ok: false, reason: 'invalid' };
   }
 
   // Already used => someone has a copy. Kill the whole family.
-  if (record.usedAt) {
+  if (record.used) {
     await revokeFamilyById(record.familyId);
     return { ok: false, reason: 'reused' };
   }
@@ -95,7 +111,7 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
     return { ok: false, reason: 'expired' };
   }
 
-  if (record.expiresAt < new Date()) {
+  if (record.expired) {
     return { ok: false, reason: 'expired' };
   }
 
@@ -116,19 +132,34 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
    * looking for a token used a second time, and there isn't one. Demonstrated
    * against this service before the fix — two racers, two usable successors.
    *
-   * `usedAt: null` in the WHERE clause makes the check and the write the same
+   * `"usedAt" IS NULL` in the WHERE clause makes the check and the write the same
    * statement. Under READ COMMITTED the second transaction blocks on the row
    * lock, re-evaluates its predicate against the newly committed version, finds
-   * usedAt set, and matches nothing. Exactly the mechanism claimInvite() and the
-   * ticketing inventory guard already use.
+   * usedAt set, and matches nothing. Exactly the mechanism the invite claim in
+   * /register and the ticketing inventory guard already use.
+   *
+   * EXPIRY IS PART OF THE GUARD, on the database's clock, as it is in the invite
+   * claim. It was not, so a token that ran out after the check above was still
+   * rotated into a fresh thirty days. Measured by holding this row's lock while it
+   * expired: the claim went through and a successor was issued.
    */
-  const rotated = await prisma.$transaction(async (tx) => {
-    const claimed = await tx.refreshToken.updateMany({
-      where: { id: record.id, usedAt: null, revokedAt: null },
-      data: { usedAt: new Date() },
-    });
+  const rotated = await prisma.$transaction(async (tx): Promise<'rotated' | 'expired' | 'lost'> => {
+    const claimed = await tx.$executeRaw`
+      UPDATE "RefreshToken" SET "usedAt" = now() AT TIME ZONE 'UTC'
+       WHERE id = ${record.id} AND "usedAt" IS NULL AND "revokedAt" IS NULL
+         AND "expiresAt" > (now() AT TIME ZONE 'UTC')`;
 
-    if (claimed.count !== 1) return false;
+    if (claimed !== 1) {
+      /**
+       * Matching nothing is a lost race -- unless the token simply ran out. That is
+       * no evidence of a copy, so it is answered as the check above answers expiry,
+       * without killing the family or logging reuse. Same 401 either way.
+       */
+      const [now] = await tx.$queryRaw<Array<{ ranOut: boolean }>>`
+        SELECT "usedAt" IS NULL AND "revokedAt" IS NULL AND "expiresAt" <= (now() AT TIME ZONE 'UTC') AS "ranOut"
+          FROM "RefreshToken" WHERE id = ${record.id}`;
+      return now?.ranOut === true ? 'expired' : 'lost';
+    }
 
     await tx.refreshToken.create({
       data: {
@@ -136,14 +167,18 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
         tenantId: record.tenantId,
         tokenHash: hashToken(token),
         familyId: record.familyId,
-        expiresAt: new Date(Date.now() + REFRESH_TTL_MS),
+        expiresAt: await databaseNow(tx, REFRESH_TTL_MS),
       },
     });
 
-    return true;
+    return 'rotated';
   });
 
-  if (!rotated) {
+  if (rotated === 'expired') {
+    return { ok: false, reason: 'expired' };
+  }
+
+  if (rotated === 'lost') {
     /**
      * Lost the race: someone else spent this token in the same instant.
      *
@@ -162,12 +197,17 @@ export async function rotateRefreshToken(presented: string): Promise<RotateResul
   return { ok: true, userId: record.userId, tenantId: record.tenantId, token };
 }
 
-/** Revokes every live token in a family. The one place that write lives. */
+/**
+ * Revokes every live token in a family. The one place that write lives.
+ *
+ * revokedAt is only ever tested for NULL, so the clock it is stamped with harms
+ * nothing today; it is the database's anyway, in the statement that sets it, like
+ * every other time on the row.
+ */
 async function revokeFamilyById(familyId: string): Promise<void> {
-  await prisma.refreshToken.updateMany({
-    where: { familyId, revokedAt: null },
-    data: { revokedAt: new Date() },
-  });
+  await prisma.$executeRaw`
+    UPDATE "RefreshToken" SET "revokedAt" = now() AT TIME ZONE 'UTC'
+     WHERE "familyId" = ${familyId} AND "revokedAt" IS NULL`;
 }
 
 export async function revokeFamily(presented: string): Promise<void> {

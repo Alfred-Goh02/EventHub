@@ -12,7 +12,7 @@ import { requireAuth, requireRole } from './middleware/auth.js';
 import { issueRefreshToken, rotateRefreshToken, revokeFamily } from './tokens.js';
 import { ROLES } from '@eventhub/types';
 import { budgetAddress, issueInvite, lookupInvite, revokeInvitesFor } from './invites.js';
-import { issueResetToken, lookupResetToken } from './password-reset.js';
+import { issueResetToken, lookupResetToken, revokeLiveResets } from './password-reset.js';
 import { emitDevToken } from './dev-sink.js';
 import { AUTH_EMAIL_TOPIC, sealEmailRequest } from './email-request.js';
 import { queueContactCard } from './contact-card.js';
@@ -809,7 +809,7 @@ app.post('/reset-password', ah(async (req, res) => {
       /**
        * Claim FIRST, and guarded.
        *
-       * `usedAt: null` in the WHERE clause makes the check and the write one
+       * `"usedAt" IS NULL` in the WHERE clause makes the check and the write one
        * statement. lookupResetToken above only READ — its answer was already
        * stale when it returned, because nothing was locked. Two concurrent
        * redemptions of one link would both pass it, both write passwordHash, and
@@ -820,13 +820,20 @@ app.post('/reset-password', ah(async (req, res) => {
        * predicate against the committed version, finds usedAt set, and matches
        * nothing. Same mechanism as the invite claim in /register and the
        * inventory guard in ticketing.
+       *
+       * EXPIRY IS PART OF THE GUARD, on the database's clock, as it is in the
+       * invite claim. It was not: this checked usedAt and revokedAt only, so a
+       * token that ran out after lookupResetToken read it -- the argon2 hash above
+       * runs in between -- was spent anyway. Measured by holding this row's lock
+       * while the token expired: the claim went through and the password changed.
+       * usedAt is now() in the same statement.
        */
-      const claimed = await tx.passwordResetToken.updateMany({
-        where: { id: record.id, usedAt: null, revokedAt: null },
-        data: { usedAt: new Date() },
-      });
+      const claimed = await tx.$executeRaw`
+        UPDATE "PasswordResetToken" SET "usedAt" = now() AT TIME ZONE 'UTC'
+         WHERE id = ${record.id} AND "usedAt" IS NULL AND "revokedAt" IS NULL
+           AND "expiresAt" > (now() AT TIME ZONE 'UTC')`;
 
-      if (claimed.count !== 1) throw new Error('reset already claimed');
+      if (claimed !== 1) throw new Error('reset not claimable');
 
       /**
        * updateMany plus a count check, not update({ where: { id } }).
@@ -851,10 +858,7 @@ app.post('/reset-password', ah(async (req, res) => {
 
       // Kill this user's other live reset tokens. Without it, a link harvested
       // before the victim noticed anything survives their own recovery.
-      await tx.passwordResetToken.updateMany({
-        where: { userId: record.userId, usedAt: null, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
+      await revokeLiveResets(tx, record.userId);
 
       /**
        * And every session.
@@ -868,17 +872,18 @@ app.post('/reset-password', ah(async (req, res) => {
        * UPDATE. Before that fix a rotation already in flight would commit its
        * successor AFTER this sweep ran, handing an attacker a fresh 30-day token
        * on the account that had just been secured.
+       *
+       * revokedAt on the database's clock, like every other stamp on the row.
        */
-      await tx.refreshToken.updateMany({
-        where: { userId: record.userId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
+      await tx.$executeRaw`
+        UPDATE "RefreshToken" SET "revokedAt" = now() AT TIME ZONE 'UTC'
+         WHERE "userId" = ${record.userId} AND "revokedAt" IS NULL`;
     });
 
     return res.json({ status: 'reset' });
   } catch (err) {
     const message = err instanceof Error ? err.message : '';
-    if (message === 'reset already claimed' || message === 'user update matched no rows') {
+    if (message === 'reset not claimable' || message === 'user update matched no rows') {
       return res.status(400).json(generic);
     }
     logger.error({ err }, 'password reset failed');
