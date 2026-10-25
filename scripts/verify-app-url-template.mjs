@@ -247,29 +247,76 @@ async function main() {
   );
 
   /**
-   * Labels the gateway routes but no URL can hold: `xn--` followed by something that is
-   * not valid punycode. originFor threw a TypeError for each, and in Notification's
-   * replies consumer kafkajs treats a TypeError as unrecoverable, so the consumer crashed
-   * on the same message for good. Each must answer null, like any slug it cannot use.
+   * Labels the gateway routes that a URL parser may refuse: `xn--` followed by something
+   * that is not valid punycode. Whether it does depends on the Node build -- measured,
+   * 26.3.0 (ada 3.4.4) throws ERR_INVALID_URL for each, 26.12.1 builds them -- and the
+   * image takes whichever node:26 was current when it was built. originFor threw on the
+   * first kind, and in Notification's replies consumer kafkajs treats a TypeError as
+   * unrecoverable, so the consumer crashed on the same message for good.
+   *
+   * So it is asked twice. Once with this Node's own parser: no throw, and each answer is
+   * null or exactly its own host. And once with a parser that refuses these labels, as
+   * the older one does, which is the case the guard exists for and which this check
+   * would otherwise only see on some machines: each must answer null.
    */
   const unbuildable = ['xn--a', 'xn--', 'xn---', 'xn--zz'];
   check(
     unbuildable.every((s) => kongRoutes(s) && isTenantSlug(s)),
     `CONTROL: the gateway routes each of ${unbuildable.map(show).join(', ')}, and isTenantSlug passes it, so a tenant can have one`,
   );
-  const answered = unbuildable.map((s) => {
-    try {
-      return { s, local: local.originFor(s), production: production.originFor(s) };
-    } catch (err) {
-      return { s, threw: err instanceof Error ? `${err.name} ${err.code ?? err.message}` : String(err) };
-    }
-  });
-  const wrong = answered.filter((a) => a.threw || a.local !== null || a.production !== null);
+  const ask = () =>
+    unbuildable.map((s) => {
+      try {
+        return { s, local: local.originFor(s), production: production.originFor(s) };
+      } catch (err) {
+        return { s, threw: err instanceof Error ? `${err.name} ${err.code ?? err.message}` : String(err) };
+      }
+    });
+  const describe = (list) => list.map((a) => `${show(a.s)} -> ${a.threw ? `threw ${a.threw}` : `${a.local} / ${a.production}`}`).join(', ');
+
+  const ownParser = ask();
+  const notOwn = ownParser.filter(
+    (a) =>
+      a.threw ||
+      (a.local !== null && a.local !== `http://${a.s}.eventhub.localhost:5173`) ||
+      (a.production !== null && a.production !== `https://${a.s}.eventhub.com`),
+  );
   check(
-    wrong.length === 0,
-    wrong.length === 0
-      ? `and none of them gets a link: originFor answers null for each, locally and in production, rather than throwing`
-      : `not answered with null: ${wrong.map((a) => `${show(a.s)} -> ${a.threw ? `threw ${a.threw}` : `${a.local} / ${a.production}`}`).join(', ')}`,
+    notOwn.length === 0,
+    notOwn.length === 0
+      ? `with this Node's parser (${process.versions.node}) none of them throws, and each answers null or its own host (${describe(ownParser.slice(0, 1))})`
+      : `with this Node's parser (${process.versions.node}): ${describe(notOwn)}`,
+  );
+
+  const RealURL = globalThis.URL;
+  class RefusingURL extends RealURL {
+    constructor(input, base) {
+      super(input, base);
+      if (unbuildable.some((s) => this.hostname === s || this.hostname.startsWith(`${s}.`))) {
+        throw Object.assign(new TypeError('Invalid URL'), { code: 'ERR_INVALID_URL' });
+      }
+    }
+  }
+  let refused;
+  try {
+    globalThis.URL = RefusingURL;
+    let probeThrew = false;
+    try {
+      new URL('http://xn--a.eventhub.localhost:5173');
+    } catch {
+      probeThrew = true;
+    }
+    check(probeThrew, 'CONTROL: the stand-in parser refuses these labels, as Node 26.3.0 does');
+    refused = ask();
+  } finally {
+    globalThis.URL = RealURL;
+  }
+  const notNull = refused.filter((a) => a.threw || a.local !== null || a.production !== null);
+  check(
+    notNull.length === 0,
+    notNull.length === 0
+      ? 'and with a parser that refuses them, originFor answers null for each, locally and in production, rather than throwing'
+      : `with a parser that refuses them, not answered with null: ${describe(notNull)}`,
   );
 
   // ---------------------------------------------------------------------------------
