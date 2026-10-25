@@ -50,7 +50,10 @@ const run = `itb_${Date.now()}`;
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');

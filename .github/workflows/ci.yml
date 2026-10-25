@@ -112,6 +112,20 @@ jobs:
       - name: Assert the documented setup builds the system this workflow builds
         run: node scripts/verify-readme-setup.mjs
 
+      # A verifier's check() must set process.exitCode = 1 where the assertion
+      # fails, not only in an `if (failures > 0)` gate at the end of the run. Two
+      # search verifiers printed FAIL and exited 0: a `return` inside a `try` for a
+      # service that never started ran the `finally` and skipped the gate, so CI
+      # would have called a run that could not start the thing under test green.
+      # At 95475a1, 37 of 98 verifiers had a helper that only counted.
+      #
+      # Reads every scripts/verify-*.mjs with comments stripped, finds each file's
+      # failure-recording helpers and the FAILs printed outside them, and fails a
+      # file where one records a failure without setting the code. Reads files
+      # only, so it runs before anything is up.
+      - name: Assert every verifier sets its exit code where an assertion fails
+        run: node scripts/verify-checks-set-exit-code.mjs
+
       # The shared vocabulary must match the things it claims to describe.
       #
       # packages/types opens by saying "a shared type that disagrees with
