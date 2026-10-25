@@ -1,20 +1,32 @@
-import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
-import { Loader2, Ticket } from "lucide-react";
+import { CheckCircle2, Loader2 } from "lucide-react";
 import { api, ApiError, getSession, getTenantName, isMockHost, writeTokens } from "@/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ErrorNotice, FieldError, retryText } from "@/components/app/ErrorNotice";
-import { ThemeToggle } from "@/components/app/ThemeToggle";
+import { AccountFrame, accountCard } from "@/components/app/AccountFrame";
 
 const safeRedirect = (r: unknown) =>
   typeof r === "string" && r.startsWith("/") && !r.startsWith("//") ? r : "/";
 
+/** Why the account pages sent someone here. */
+const NOTICES = {
+  "password-changed":
+    "Your password has changed. Sign in with the new one. Every other device was signed out.",
+  "account-created": "Your account is ready. Sign in with the password you just chose.",
+} as const;
+type Notice = keyof typeof NOTICES;
+const isNotice = (n: unknown): n is Notice => typeof n === "string" && n in NOTICES;
+
 export const Route = createFileRoute("/login")({
   ssr: false,
-  validateSearch: (s: Record<string, unknown>) => ({ redirect: safeRedirect(s["redirect"]) }),
+  validateSearch: (s: Record<string, unknown>): { redirect: string; notice?: Notice } => ({
+    redirect: safeRedirect(s["redirect"]),
+    ...(isNotice(s["notice"]) ? { notice: s["notice"] } : {}),
+  }),
   beforeLoad: ({ search }) => {
     if (getSession()) throw redirect({ href: search.redirect });
   },
@@ -33,7 +45,7 @@ export const Route = createFileRoute("/login")({
 });
 
 function LoginPage() {
-  const { redirect: to } = Route.useSearch();
+  const { redirect: to, notice } = Route.useSearch();
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [email, setEmail] = useState("");
@@ -67,59 +79,57 @@ function LoginPage() {
         : undefined;
 
   return (
-    <div className="flex min-h-screen flex-col">
-      <div className="flex justify-end p-3">
-        <ThemeToggle />
-      </div>
-      <div className="flex flex-1 items-center justify-center px-4 pb-16">
-        <div className="w-full max-w-sm">
-          <div className="mb-8 text-center">
-            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent text-accent-foreground">
-              <Ticket className="h-6 w-6" />
-            </div>
-            <h1 className="text-3xl font-semibold">{getTenantName()}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Sign in to find events and get tickets.
-            </p>
-          </div>
-          <form onSubmit={submit} className="space-y-4 rounded-xl border bg-card p-6 shadow-sm">
-            <div className="space-y-1.5">
-              <Label htmlFor="email">Email</Label>
-              <Input
-                id="email"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-              <FieldError error={error} field="email" />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                type="password"
-                autoComplete="current-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <FieldError error={error} field="password" />
-            </div>
-            <ErrorNotice error={error} message={message} />
-            <Button type="submit" className="w-full" disabled={busy}>
-              {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-              Sign in
-            </Button>
-            {isMockHost() && (
-              <p className="text-center text-xs text-muted-foreground">
-                Preview mode: any email and password works.
-              </p>
-            )}
-          </form>
+    <AccountFrame title={getTenantName()} subtitle="Sign in to find events and get tickets.">
+      <form onSubmit={submit} className={accountCard}>
+        {notice && !error && (
+          <p role="status" className="flex gap-2 text-sm">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+            {NOTICES[notice]}
+          </p>
+        )}
+        <div className="space-y-1.5">
+          <Label htmlFor="email">Email</Label>
+          <Input
+            id="email"
+            type="email"
+            autoComplete="email"
+            required
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+          <FieldError error={error} field="email" />
         </div>
-      </div>
-    </div>
+        <div className="space-y-1.5">
+          <div className="flex items-baseline justify-between">
+            <Label htmlFor="password">Password</Label>
+            <Link
+              to="/forgot-password"
+              className="text-xs text-muted-foreground underline-offset-4 hover:underline"
+            >
+              Forgot your password?
+            </Link>
+          </div>
+          <Input
+            id="password"
+            type="password"
+            autoComplete="current-password"
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <FieldError error={error} field="password" />
+        </div>
+        <ErrorNotice error={error} message={message} />
+        <Button type="submit" className="w-full" disabled={busy}>
+          {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+          Sign in
+        </Button>
+        {isMockHost() && (
+          <p className="text-center text-xs text-muted-foreground">
+            Preview mode: any email and password works.
+          </p>
+        )}
+      </form>
+    </AccountFrame>
   );
 }
