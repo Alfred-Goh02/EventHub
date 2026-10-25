@@ -5,6 +5,7 @@ import {
   useNavigate,
   useRouterState,
 } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { getSession, onForcedSignOut, startSessionLifecycle, subscribeTokens } from "@/api";
 import { TopBar } from "@/components/app/TopBar";
@@ -19,16 +20,22 @@ export const Route = createFileRoute("/_app")({
 
 function AppLayout() {
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const href = useRouterState({ select: (s) => s.location.href });
 
   useEffect(() => {
     startSessionLifecycle();
-    const toLogin = () =>
+    // Every way out of a session drops what was cached for it: a sign-out in another tab,
+    // or a refresh Auth refused, would otherwise leave this user's reservations in the
+    // cache for whoever signs in next in this tab.
+    const toLogin = () => {
+      qc.clear();
       navigate({
         to: "/login",
         search: { redirect: window.location.pathname + window.location.search },
         replace: true,
       });
+    };
     onForcedSignOut(toLogin);
     // Another tab signed out, or tokens changed to another tenant.
     const unsub = subscribeTokens(() => {
@@ -37,7 +44,7 @@ function AppLayout() {
     return () => {
       unsub();
     };
-  }, [navigate, href]);
+  }, [navigate, qc, href]);
 
   return (
     <div className="min-h-screen">

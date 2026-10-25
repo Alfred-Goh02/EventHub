@@ -3,6 +3,8 @@ import { getTenantSlug } from "./env";
 
 const ACCESS = "eventhub.accessToken";
 const REFRESH = "eventhub.refreshToken";
+/** When this browser received the current pair, on THIS browser's clock. */
+const RECEIVED = "eventhub.tokensReceivedAt";
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
@@ -17,13 +19,41 @@ export function readTokens(): TokenPair | null {
 export function writeTokens(t: TokenPair) {
   localStorage.setItem(ACCESS, t.accessToken);
   localStorage.setItem(REFRESH, t.refreshToken);
+  localStorage.setItem(RECEIVED, String(Date.now()));
   emit();
 }
 
 export function clearTokens() {
   localStorage.removeItem(ACCESS);
   localStorage.removeItem(REFRESH);
+  localStorage.removeItem(RECEIVED);
   emit();
+}
+
+/**
+ * When to refresh the access token, on THIS browser's clock: its lifetime (exp - iat, both
+ * the server's) counted from when it arrived, a minute early, and never sooner than 30 s
+ * after it arrived.
+ *
+ * Comparing exp with Date.now() trusts the two clocks to agree. A browser 20 minutes fast
+ * then sees every new token as already expired, refreshes at once, gets another it judges
+ * the same way, and loops until the gateway's per-address limit on /auth refuses everyone
+ * behind that address.
+ */
+export function refreshDueAt(claims: AccessClaims, receivedAt: number): number {
+  const lifetimeMs =
+    typeof claims.iat === "number" ? (claims.exp - claims.iat) * 1000 : 15 * 60_000;
+  return receivedAt + Math.max(30_000, lifetimeMs - 60_000);
+}
+
+/** refreshDueAt for the stored pair. A pair stored before this was recorded counts from now. */
+export function storedRefreshDueAt(t: TokenPair): number | null {
+  const claims = decodeClaims(t.accessToken);
+  if (!claims) return null;
+  const raw = Number(localStorage.getItem(RECEIVED));
+  const receivedAt = Number.isFinite(raw) && raw > 0 ? raw : Date.now();
+  if (!(raw > 0)) localStorage.setItem(RECEIVED, String(receivedAt));
+  return refreshDueAt(claims, receivedAt);
 }
 
 function emit() {

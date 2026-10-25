@@ -1,14 +1,26 @@
+/**
+ * The host as a name, without the trailing dot a fully qualified one may carry:
+ * `acme.eventhub.com.` is the same site as `acme.eventhub.com`, and must not fall through
+ * to the sample data.
+ */
+const hostName = (h: string) => h.toLowerCase().replace(/\.$/, "");
+
+/** True when `hostname` is not a real EventHub host; the mock API is used then. */
+export function isMockHostname(hostname: string): boolean {
+  const h = hostName(hostname);
+  return !(h.endsWith(".eventhub.localhost") || h.endsWith(".eventhub.com"));
+}
+
 /** True when the page is not on a real EventHub host; the mock API is used then. */
 export function isMockHost(): boolean {
   if (typeof window === "undefined") return true;
-  const h = window.location.hostname;
-  return !(h.endsWith(".eventhub.localhost") || h.endsWith(".eventhub.com"));
+  return isMockHostname(window.location.hostname);
 }
 
 export function getTenantSlug(): string {
   if (typeof window === "undefined") return "";
   if (isMockHost()) return "acme";
-  return window.location.hostname.split(".")[0] ?? "";
+  return hostName(window.location.hostname).split(".")[0] ?? "";
 }
 
 export function getTenantName(): string {

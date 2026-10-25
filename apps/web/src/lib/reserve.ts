@@ -7,11 +7,22 @@ export interface KeyState {
   key: string;
 }
 
-export const cartSignature = (b: CreateReservationBody) =>
-  JSON.stringify([
-    b.eventId,
-    [...b.items].sort((a, z) => a.ticketTypeId.localeCompare(z.ticketTypeId)),
-  ]);
+/**
+ * The body exactly as it is sent: items in ticket type order.
+ *
+ * The server remembers an Idempotency-Key with a hash of the JSON body it arrived with. The
+ * page lists ticket types by price, so the same cart could be sent with its items in another
+ * order after a price change -- the same key with a different body, answered 422, and then a
+ * second hold under a new key. One order, always.
+ */
+export const canonicalBody = (b: CreateReservationBody): CreateReservationBody => ({
+  eventId: b.eventId,
+  items: [...b.items]
+    .sort((a, z) => a.ticketTypeId.localeCompare(z.ticketTypeId))
+    .map((i) => ({ ticketTypeId: i.ticketTypeId, quantity: i.quantity })),
+});
+
+export const cartSignature = (b: CreateReservationBody) => JSON.stringify(canonicalBody(b));
 
 /** Reuses the key for the same cart (retry after network/5xx), new key when the cart changes. */
 export function keyFor(body: CreateReservationBody, prev: KeyState | null): KeyState {
@@ -22,18 +33,40 @@ export function keyFor(body: CreateReservationBody, prev: KeyState | null): KeyS
 export const isRetryableTransport = (e: unknown) =>
   e instanceof ApiError && (e.isNetwork || [502, 503, 504].includes(e.status));
 
+/** Thrown when the page that asked for the reservation has gone. Nothing to show. */
+export class ReservationAbandoned extends Error {
+  constructor() {
+    super("reservation abandoned");
+  }
+}
+
+function waitFor(ms: number, signal: AbortSignal | undefined) {
+  return new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      reject(new ReservationAbandoned());
+    });
+  });
+}
+
 export async function reserve(
   body: CreateReservationBody,
   state: { current: KeyState | null },
   onWaiting?: (seconds: number, attempt: number) => void,
+  signal?: AbortSignal,
 ): Promise<CreatedReservation> {
-  let current = keyFor(body, state.current);
+  const sent = canonicalBody(body);
+  let current = keyFor(sent, state.current);
   state.current = current;
   let autoRetries = 0;
   let regenerated = false;
   for (;;) {
+    // Leaving the page stops the automatic retries: a hold taken after that would land
+    // the buyer on a checkout they had already walked away from.
+    if (signal?.aborted) throw new ReservationAbandoned();
     try {
-      const res = await api().createReservation(body, current.key);
+      const res = await api().createReservation(sent, current.key);
       state.current = null; // done: next checkout attempt gets a fresh key
       return res;
     } catch (e) {
@@ -44,7 +77,7 @@ export async function reserve(
         autoRetries++;
         const wait = e.retryAfterSeconds ?? 2;
         onWaiting?.(wait, autoRetries);
-        await new Promise((r) => setTimeout(r, wait * 1000));
+        await waitFor(wait * 1000, signal);
         continue;
       }
       if (e.status === 422 && !regenerated) {

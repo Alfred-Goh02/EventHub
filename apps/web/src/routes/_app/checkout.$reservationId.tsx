@@ -8,6 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorNotice } from "@/components/app/ErrorNotice";
 import { StatusBadge } from "@/components/app/StatusBadge";
 import { formatCountdown, formatDateTime, formatMoney } from "@/lib/format";
+import { settleAwaitedPayment } from "@/lib/payment";
 
 export const Route = createFileRoute("/_app/checkout/$reservationId")({
   head: () => ({
@@ -26,7 +27,9 @@ type Notice = { kind: "info" | "error"; text: string; error?: unknown } | null;
 function CheckoutPage() {
   const { reservationId } = Route.useParams();
   const [paying, setPaying] = useState(false);
-  const [awaitingBank, setAwaitingBank] = useState(false);
+  /** The attempt /pay answered 202 for, until a snapshot that names it settles it. */
+  const [awaitedPayment, setAwaitedPayment] = useState<string | null>(null);
+  const awaitingBank = awaitedPayment !== null;
   const [notice, setNotice] = useState<Notice>(null);
 
   const q = useQuery({
@@ -58,22 +61,24 @@ function CheckoutPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [left]);
 
-  // Resolve the "confirming" state from polling.
+  // Resolve the "confirming" state from polling, but only from a snapshot that knows the
+  // attempt (see settleAwaitedPayment).
   useEffect(() => {
-    if (!awaitingBank || !r) return;
-    if (r.status === "CONFIRMED") setAwaitingBank(false);
-    else if (r.status === "HELD") {
-      setAwaitingBank(false);
+    if (!awaitedPayment || !r) return;
+    const outcome = settleAwaitedPayment(r, awaitedPayment);
+    if (outcome === "waiting") return;
+    setAwaitedPayment(null);
+    if (outcome === "failed") {
       setNotice({ kind: "error", text: "Your payment didn't go through; you can try again." });
-    } else if (r.status === "EXPIRED" || r.status === "CANCELLED") setAwaitingBank(false);
-  }, [r, awaitingBank]);
+    }
+  }, [r, awaitedPayment]);
 
   const pay = async () => {
     setPaying(true);
     setNotice(null);
     try {
       const res = await api().payReservation(reservationId);
-      if (res.httpStatus === 202) setAwaitingBank(true);
+      if (res.httpStatus === 202) setAwaitedPayment(res.body.paymentId);
       await q.refetch();
     } catch (e) {
       if (e instanceof ApiError && e.status === 402) {

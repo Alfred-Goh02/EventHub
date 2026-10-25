@@ -1,6 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Loader2, Minus, Plus } from "lucide-react";
 import { api, ApiError, type CreateReservationBody } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorNotice } from "@/components/app/ErrorNotice";
 import { formatDateTime, formatMoney, formatTime, isPast } from "@/lib/format";
-import { isRetryableTransport, reserve, type KeyState } from "@/lib/reserve";
+import { isRetryableTransport, reserve, ReservationAbandoned, type KeyState } from "@/lib/reserve";
 
 export const Route = createFileRoute("/_app/events/$id")({
   head: () => ({
@@ -27,12 +27,25 @@ function EventPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const ev = useQuery({ queryKey: ["event", id], queryFn: () => api().getEvent(id), retry: false });
-  const tt = useQuery({ queryKey: ["ticket-types", id], queryFn: () => api().listTicketTypes(id) });
+  const tt = useQuery({
+    queryKey: ["ticket-types", id],
+    queryFn: () => api().listTicketTypes(id),
+    // A 404 is an answer -- Ticketing does not list this event's tickets (cancelled, or not
+    // yet on sale here) -- not a failure worth three retries.
+    retry: (n, err) => !(err instanceof ApiError && err.status === 404) && n < 3,
+  });
   const [qty, setQty] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
   const keyRef = useRef<KeyState | null>(null);
+  // Aborted when the page goes, so automatic retries do not take a hold for someone who left.
+  const leaving = useRef(new AbortController());
+  useEffect(() => {
+    const controller = new AbortController();
+    leaving.current = controller;
+    return () => controller.abort();
+  }, []);
 
   const types = useMemo(
     () => [...(tt.data?.data ?? [])].sort((a, b) => a.priceCents - b.priceCents),
@@ -40,6 +53,9 @@ function EventPage() {
   );
   const qtyOf = (tid: string) => qty[tid] ?? 0;
   const lines = types.filter((t) => qtyOf(t.id) > 0);
+  /** A reservation takes at most this many ticket types (the API's limit). */
+  const MAX_LINES = 10;
+  const atLineLimit = lines.length >= MAX_LINES;
   const total = lines.reduce((s, t) => s + t.priceCents * qtyOf(t.id), 0);
   const count = lines.reduce((s, t) => s + qtyOf(t.id), 0);
 
@@ -51,16 +67,20 @@ function EventPage() {
   const onReserve = async () => {
     const body: CreateReservationBody = {
       eventId: id,
-      items: lines.slice(0, 10).map((t) => ({ ticketTypeId: t.id, quantity: qtyOf(t.id) })),
+      items: lines.map((t) => ({ ticketTypeId: t.id, quantity: qtyOf(t.id) })),
     };
     setBusy(true);
     setError(null);
     try {
-      const r = await reserve(body, keyRef, (s, n) =>
-        setWaiting(`Still syncing — retrying in ${s} s (attempt ${n} of 3)…`),
+      const r = await reserve(
+        body,
+        keyRef,
+        (s, n) => setWaiting(`Still syncing — retrying in ${s} s (attempt ${n} of 3)…`),
+        leaving.current.signal,
       );
       navigate({ to: "/checkout/$reservationId", params: { reservationId: r.id } });
     } catch (e) {
+      if (e instanceof ReservationAbandoned) return;
       setError(e);
       if (e instanceof ApiError && e.status === 409)
         qc.invalidateQueries({ queryKey: ["ticket-types", id] });
@@ -104,7 +124,14 @@ function EventPage() {
         <section className="space-y-2">
           <h2 className="text-xl font-semibold">Tickets</h2>
           {tt.isPending && <Skeleton className="h-32 w-full rounded-xl" />}
-          {tt.isError && <ErrorNotice error={tt.error} />}
+          {tt.isError &&
+            (tt.error instanceof ApiError && tt.error.status === 404 ? (
+              <p className="rounded-xl border border-dashed p-6 text-center text-muted-foreground">
+                Tickets for this event aren't on sale.
+              </p>
+            ) : (
+              <ErrorNotice error={tt.error} />
+            ))}
           {tt.isSuccess && types.length === 0 && (
             <p className="rounded-xl border border-dashed p-6 text-center text-muted-foreground">
               No tickets yet.
@@ -145,7 +172,7 @@ function EventPage() {
                     size="icon"
                     className="h-8 w-8"
                     aria-label={`More ${t.name}`}
-                    disabled={n >= max || busy || past}
+                    disabled={n >= max || busy || past || (n === 0 && atLineLimit)}
                     onClick={() => set(t.id, n + 1, max)}
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -176,6 +203,11 @@ function EventPage() {
             <span>Total</span>
             <span className="tabular-nums">{formatMoney(total)}</span>
           </div>
+          {atLineLimit && (
+            <p className="text-sm text-muted-foreground">
+              One reservation takes up to {MAX_LINES} ticket types.
+            </p>
+          )}
           {waiting && <p className="text-sm text-muted-foreground">{waiting}</p>}
           <ErrorNotice error={error} />
           <Button className="w-full" disabled={count === 0 || busy || past} onClick={onReserve}>

@@ -1,4 +1,5 @@
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { Loader2, Ticket } from "lucide-react";
 import { api, ApiError, getSession, getTenantName, isMockHost, writeTokens } from "@/api";
@@ -34,6 +35,7 @@ export const Route = createFileRoute("/login")({
 function LoginPage() {
   const { redirect: to } = Route.useSearch();
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -44,7 +46,10 @@ function LoginPage() {
     setBusy(true);
     setError(null);
     try {
-      writeTokens(await api().login(email, password));
+      const tokens = await api().login(email, password);
+      // A new session starts from an empty cache, whoever was signed in before.
+      qc.clear();
+      writeTokens(tokens);
       navigate({ href: to, replace: true });
     } catch (err) {
       setError(err);

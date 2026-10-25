@@ -26,12 +26,15 @@ export function TopBar() {
   const navigate = useNavigate();
   const qc = useQueryClient();
 
+  // Forget the session HERE first, then tell Auth. Waiting on /auth/logout before clearing
+  // left the tokens in this browser for the next person if the tab closed, or Auth was slow.
   const signOut = async () => {
+    const refreshToken = getSession()?.tokens.refreshToken;
     await qc.cancelQueries();
-    await api().logout();
     clearTokens();
     qc.clear();
     navigate({ to: "/login", search: { redirect: "/" }, replace: true });
+    if (refreshToken) void api().logout(refreshToken);
   };
 
   return (

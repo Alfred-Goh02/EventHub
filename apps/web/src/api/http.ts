@@ -1,6 +1,12 @@
 import { ApiError, errorFromBody, parseRetryAfter } from "./errors";
 import { getApiOrigin } from "./env";
-import { forceSignOut, readTokens, subscribeTokens, decodeClaims, writeTokens } from "./tokens";
+import {
+  forceSignOut,
+  readTokens,
+  storedRefreshDueAt,
+  subscribeTokens,
+  writeTokens,
+} from "./tokens";
 import type {
   CreateReservationBody,
   CreatedReservation,
@@ -81,6 +87,14 @@ async function doRefresh(heldRefreshToken: string): Promise<TokenPair> {
   }
   if (r.status < 200 || r.status >= 300) throw toError(r);
   const pair = r.body as TokenPair;
+  // Signed out, or signed in as someone else, while this refresh was in flight: writing the
+  // new pair would sign that session back in. Revoke it instead, so nothing can use it.
+  if (readTokens()?.refreshToken !== current.refreshToken) {
+    raw("/auth/logout", { method: "POST", body: { refreshToken: pair.refreshToken } }).catch(
+      () => {},
+    );
+    throw new ApiError({ status: 401, message: "You've been signed out." });
+  }
   writeTokens(pair);
   return pair;
 }
@@ -100,16 +114,16 @@ export function refreshTokens(heldRefreshToken: string): Promise<TokenPair> {
   return pending;
 }
 
-// ---- proactive refresh ~60 s before exp ----
+// ---- proactive refresh a minute before the token's lifetime runs out (see refreshDueAt) ----
 let timer: ReturnType<typeof setTimeout> | null = null;
 let lifecycleStarted = false;
 function schedule() {
   if (timer) clearTimeout(timer);
   const t = readTokens();
   if (!t) return;
-  const c = decodeClaims(t.accessToken);
-  if (!c) return;
-  const ms = Math.max(0, c.exp * 1000 - Date.now() - 60_000);
+  const due = storedRefreshDueAt(t);
+  if (due === null) return;
+  const ms = Math.max(0, due - Date.now());
   timer = setTimeout(() => {
     const now = readTokens();
     if (now) refreshTokens(now.refreshToken).catch(() => {});
@@ -131,8 +145,8 @@ async function authed(
     forceSignOut();
     throw new ApiError({ status: 401, message: "Please sign in." });
   }
-  const c = decodeClaims(tokens.accessToken);
-  if (c && c.exp * 1000 - Date.now() < 60_000) {
+  const due = storedRefreshDueAt(tokens);
+  if (due !== null && Date.now() >= due) {
     try {
       tokens = await refreshTokens(tokens.refreshToken);
     } catch (e) {
@@ -164,14 +178,11 @@ export const httpApi: EventHubApi = {
     if (r.status < 200 || r.status >= 300) throw toError(r);
     return r.body as TokenPair;
   },
-  async logout() {
-    const t = readTokens();
-    if (t) {
-      try {
-        await raw("/auth/logout", { method: "POST", body: { refreshToken: t.refreshToken } });
-      } catch {
-        /* clear locally regardless */
-      }
+  async logout(refreshToken) {
+    try {
+      await raw("/auth/logout", { method: "POST", body: { refreshToken } });
+    } catch {
+      /* the tokens are already gone from this browser */
     }
   },
   async listEvents(cursor) {

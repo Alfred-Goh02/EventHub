@@ -138,7 +138,9 @@ function requireAuth() {
 
 function refreshState(r: Store["reservations"][number]) {
   if (r.status === "HELD" || r.status === "PENDING_PAYMENT") {
-    const left = Math.max(0, Math.floor((Date.parse(r.holdExpiresAt) - Date.now()) / 1000));
+    const left = r.holdExpiresAt
+      ? Math.max(0, Math.floor((Date.parse(r.holdExpiresAt) - Date.now()) / 1000))
+      : 0;
     r.holdSecondsLeft = left;
     if (r.status === "PENDING_PAYMENT" && r._pendingUntil && Date.now() > r._pendingUntil) {
       r.status = "CONFIRMED";
@@ -186,7 +188,7 @@ export const mockApi: EventHubApi = {
       refreshToken: rid(),
     };
   },
-  async logout() {
+  async logout(_refreshToken) {
     await delay(150);
   },
   async listEvents(cursor) {
@@ -225,11 +227,12 @@ export const mockApi: EventHubApi = {
     if (prev) {
       if (prev.sig !== sig) throw fail(422, "Idempotency-Key reused with a different request");
       const r = db().reservations.find((x) => x.id === prev.id)!;
+      // A replay answers with the original hold, whatever has happened to it since.
       return {
         id: r.id,
         eventId: r.event.id,
         status: "HELD",
-        expiresAt: r.holdExpiresAt,
+        expiresAt: new Date(Date.parse(r.createdAt) + 10 * 60_000).toISOString(),
         items: body.items,
       };
     }
@@ -250,6 +253,7 @@ export const mockApi: EventHubApi = {
       t.held += q;
     });
     const now = Date.now();
+    const holdExpiresAt = new Date(now + 10 * 60_000).toISOString();
     const total = lines.reduce((s, l) => s + l.t.priceCents * l.q, 0);
     const r: Store["reservations"][number] = {
       id: `res_${Math.random().toString(36).slice(2, 10)}`,
@@ -264,7 +268,7 @@ export const mockApi: EventHubApi = {
       totalCents: total,
       currency: "SGD",
       createdAt: new Date(now).toISOString(),
-      holdExpiresAt: new Date(now + 10 * 60_000).toISOString(),
+      holdExpiresAt,
       holdSecondsLeft: 600,
       confirmedAt: null,
       payment: null,
@@ -275,7 +279,7 @@ export const mockApi: EventHubApi = {
       id: r.id,
       eventId: e.id,
       status: "HELD",
-      expiresAt: r.holdExpiresAt,
+      expiresAt: holdExpiresAt,
       items: body.items,
     };
   },
@@ -313,7 +317,11 @@ export const mockApi: EventHubApi = {
       r._pendingUntil = Date.now() + 7000;
       return {
         httpStatus: 202,
-        body: { status: "PENDING", message: "waiting for the bank to respond" },
+        body: {
+          status: "PENDING",
+          paymentId: payment.id,
+          message: "waiting for the bank to respond",
+        },
       };
     }
     r.status = "CONFIRMED";

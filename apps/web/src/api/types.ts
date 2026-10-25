@@ -11,6 +11,8 @@ export interface AccessClaims {
   sub: string;
   tenantSlug: string;
   role: Role;
+  /** Seconds since the epoch, on the SERVER's clock, like exp. */
+  iat?: number;
   exp: number;
 }
 
@@ -89,19 +91,21 @@ export interface Reservation {
   totalCents: number;
   currency: string;
   createdAt: string;
-  holdExpiresAt: string;
-  holdSecondsLeft: number;
+  /** Both null unless the reservation is HELD: a paid or lapsed hold has no deadline. */
+  holdExpiresAt: string | null;
+  holdSecondsLeft: number | null;
   confirmedAt: string | null;
   payment: { id: string; status: PaymentStatus; amountCents: number; currency: string } | null;
 }
 
 export type PayResult =
   | { httpStatus: 200; body: { status: "CONFIRMED"; amountCents: number; [k: string]: unknown } }
-  | { httpStatus: 202; body: { status: "PENDING"; message: string } };
+  | { httpStatus: 202; body: { status: "PENDING"; paymentId: string; message: string } };
 
 export interface EventHubApi {
   login(email: string, password: string): Promise<TokenPair>;
-  logout(): Promise<void>;
+  /** Revokes this login's refresh-token family. The caller has already dropped the tokens. */
+  logout(refreshToken: string): Promise<void>;
   listEvents(cursor?: string | null): Promise<Page<Event>>;
   getEvent(id: string): Promise<EventDetail>;
   listTicketTypes(eventId: string): Promise<{ data: TicketType[] }>;
