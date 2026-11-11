@@ -66,3 +66,16 @@ export async function withTenant<T>(
     return fn(tx);
   });
 }
+
+/**
+ * The database's clock, read inside the caller's transaction.
+ *
+ * For a read that compares a column with "now": `new Date()` is this process's
+ * clock, and an event's times were written on the database's. Read and passed,
+ * rather than written into the statement, because Prisma has no way to put an
+ * expression in a `where`. See "Timestamps come from the database" in CLAUDE.md.
+ */
+export async function databaseNow(tx: Prisma.TransactionClient): Promise<Date> {
+  const rows = await tx.$queryRaw<Array<{ at: Date }>>`SELECT now() AS at`;
+  return rows[0]!.at;
+}
