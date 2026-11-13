@@ -8,7 +8,15 @@ parser. The two outputs come from the same object, so what the verifier checks i
 gets deployed.
 */}}
 {{- define "eventhub-common.all" -}}
+{{- /*
+  The environment Secret only when the installer hands over an environment. ArgoCD
+  installs from git, and passwords are not in git: there the Secret `<name>-env` is
+  made beside the chart -- by infra/local/up.mjs from compose locally, by External
+  Secrets on EKS -- and the Deployment names it either way.
+*/}}
+{{- if .Values.env }}
 {{- include "eventhub-common.emit" (list . "eventhub-common.secret") }}
+{{- end }}
 {{- include "eventhub-common.emit" (list . "eventhub-common.deployment") }}
 {{- if .Values.port }}
 {{- include "eventhub-common.emit" (list . "eventhub-common.service") }}

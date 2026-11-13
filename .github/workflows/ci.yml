@@ -139,6 +139,15 @@ jobs:
       - name: Assert every service chart renders a workload Kubernetes can run
         run: node scripts/verify-helm-charts.mjs
 
+      # ArgoCD (infra/argocd) runs the cluster from git, and GitOps fails quietly: an
+      # ApplicationSet whose generator misses a chart never creates that Application,
+      # and one reading the wrong branch stays Synced and Healthy on old code. So the
+      # generator is evaluated against charts/ -- every service chart, no library --
+      # and every app must read this repository's main, with automated prune and
+      # self-heal, value files that exist, and no key material in git.
+      - name: Assert ArgoCD runs exactly the service charts, from main, with no credential in git
+        run: node scripts/verify-argocd.mjs
+
       # The AWS demo environment's Terraform (infra/terraform). Nothing in CI plans or
       # applies it: there are no AWS credentials here, and none are wanted. So this is all
       # CI can know about it, and it is the part a deleted line would otherwise get past:
