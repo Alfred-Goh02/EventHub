@@ -1214,6 +1214,14 @@ jobs:
       - name: Assert the feed returns every post once, in order, while scores move
         run: node scripts/verify-community-feed-read.mjs
 
+      # Reply and digest emails link to /posts/<id>, so one post is handed out by id to
+      # anyone holding the link. It must be shown to exactly whom its thread is: not a
+      # hidden or deleted post, even to its author; a private space answers 404, not
+      # 403; a banned member is refused; another tenant's id is 404 under the same user
+      # id. Each refusal has a control that reads the same id successfully.
+      - name: Assert one post is shown to exactly the people its thread is shown to
+        run: node scripts/verify-post-read.mjs
+
       # Moderation. A moderator's role is judged in the TARGET'S space: one who
       # moderates S1 and is a plain member of S2 asks to hide S2's post, naming S1
       # in the body the way a route trusting its request would be fooled, and must
