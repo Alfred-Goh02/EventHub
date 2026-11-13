@@ -18,6 +18,7 @@ import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppTicketsRouteImport } from './routes/_app/tickets'
 import { Route as AppCheckoutReservationIdRouteImport } from './routes/_app/checkout.$reservationId'
 import { Route as AppEventsIdRouteImport } from './routes/_app/events.$id'
+import { Route as AppPostsPostIdRouteImport } from './routes/_app/posts.$postId'
 
 const AppRouteRoute = AppRouteRouteImport.update({
   id: '/_app',
@@ -64,6 +65,11 @@ const AppEventsIdRoute = AppEventsIdRouteImport.update({
   path: '/events/$id',
   getParentRoute: () => AppRouteRoute,
 } as any)
+const AppPostsPostIdRoute = AppPostsPostIdRouteImport.update({
+  id: '/posts/$postId',
+  path: '/posts/$postId',
+  getParentRoute: () => AppRouteRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
@@ -74,6 +80,7 @@ export interface FileRoutesByFullPath {
   '/tickets': typeof AppTicketsRoute
   '/checkout/$reservationId': typeof AppCheckoutReservationIdRoute
   '/events/$id': typeof AppEventsIdRoute
+  '/posts/$postId': typeof AppPostsPostIdRoute
 }
 export interface FileRoutesByTo {
   '/accept-invite': typeof AcceptInviteRoute
@@ -84,6 +91,7 @@ export interface FileRoutesByTo {
   '/': typeof AppIndexRoute
   '/checkout/$reservationId': typeof AppCheckoutReservationIdRoute
   '/events/$id': typeof AppEventsIdRoute
+  '/posts/$postId': typeof AppPostsPostIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -96,6 +104,7 @@ export interface FileRoutesById {
   '/_app/': typeof AppIndexRoute
   '/_app/checkout/$reservationId': typeof AppCheckoutReservationIdRoute
   '/_app/events/$id': typeof AppEventsIdRoute
+  '/_app/posts/$postId': typeof AppPostsPostIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -108,6 +117,7 @@ export interface FileRouteTypes {
     | '/tickets'
     | '/checkout/$reservationId'
     | '/events/$id'
+    | '/posts/$postId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/accept-invite'
@@ -118,6 +128,7 @@ export interface FileRouteTypes {
     | '/'
     | '/checkout/$reservationId'
     | '/events/$id'
+    | '/posts/$postId'
   id:
     | '__root__'
     | '/_app'
@@ -129,6 +140,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/checkout/$reservationId'
     | '/_app/events/$id'
+    | '/_app/posts/$postId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -204,6 +216,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppEventsIdRouteImport
       parentRoute: typeof AppRouteRoute
     }
+    '/_app/posts/$postId': {
+      id: '/_app/posts/$postId'
+      path: '/posts/$postId'
+      fullPath: '/posts/$postId'
+      preLoaderRoute: typeof AppPostsPostIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
   }
 }
 
@@ -212,6 +231,7 @@ interface AppRouteRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppCheckoutReservationIdRoute: typeof AppCheckoutReservationIdRoute
   AppEventsIdRoute: typeof AppEventsIdRoute
+  AppPostsPostIdRoute: typeof AppPostsPostIdRoute
 }
 
 const AppRouteRouteChildren: AppRouteRouteChildren = {
@@ -219,6 +239,7 @@ const AppRouteRouteChildren: AppRouteRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppCheckoutReservationIdRoute: AppCheckoutReservationIdRoute,
   AppEventsIdRoute: AppEventsIdRoute,
+  AppPostsPostIdRoute: AppPostsPostIdRoute,
 }
 
 const AppRouteRouteWithChildren = AppRouteRoute._addFileChildren(

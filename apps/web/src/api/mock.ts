@@ -1,7 +1,7 @@
 import { ApiError } from "./errors";
 import { getTenantSlug } from "./env";
 import { readTokens } from "./tokens";
-import type { EventDetail, EventHubApi, Reservation, TicketType } from "./types";
+import type { Comment, EventDetail, EventHubApi, Post, Reservation, TicketType } from "./types";
 
 // In-memory sample backend for previews off EventHub hosts. Built lazily
 // (no randomness or clocks at module scope).
@@ -366,4 +366,99 @@ export const mockApi: EventHubApi = {
       nextCursor: start + 20 < all.length ? String(start + 20) : null,
     };
   },
+  // In preview there is one post, "post_demo"; any other id is not found, as a hidden,
+  // deleted or private one is for the real API.
+  async getPost(id) {
+    requireAuth();
+    await delay();
+    if (id !== "post_demo") throw fail(404, "not found");
+    return structuredClone(demoPost);
+  },
+  async getThread(postId) {
+    requireAuth();
+    await delay();
+    if (postId !== "post_demo") throw fail(404, "not found");
+    return {
+      comments: structuredClone(demoComments),
+      count: countComments(demoComments),
+      truncated: false,
+    };
+  },
+  async addComment(postId, body, parentId) {
+    requireAuth();
+    await delay();
+    if (postId !== "post_demo") throw fail(404, "not found");
+    const id = rid();
+    const comment: Comment = {
+      id,
+      parentId: parentId ?? null,
+      authorId: "usr_demo",
+      body,
+      deleted: false,
+      depth: 1,
+      reactionCount: 0,
+      createdAt: new Date().toISOString(),
+      replies: [],
+    };
+    const parent = parentId ? findComment(demoComments, parentId) : null;
+    if (parentId && !parent) throw fail(404, "no such parent comment on this post");
+    if (parent) {
+      comment.depth = parent.depth + 1;
+      parent.replies.push(comment);
+    } else demoComments.push(comment);
+    demoPost.commentCount += 1;
+    return { id };
+  },
 };
+
+const demoPost: Post = {
+  id: "post_demo",
+  spaceId: "space_demo",
+  authorId: "usr_organiser",
+  body: "Doors open at 6:30. Who's coming early for the soundcheck?",
+  reactionCount: 4,
+  commentCount: 2,
+  createdAt: "2026-10-20T10:00:00.000Z",
+  space: {
+    id: "space_demo",
+    slug: "jazz-night",
+    name: "Harbourfront Jazz Night",
+    visibility: "PUBLIC",
+  },
+  canReply: true,
+};
+const demoComments: Comment[] = [
+  {
+    id: "c1",
+    parentId: null,
+    authorId: "usr_a",
+    body: "I'll be there by 6!",
+    deleted: false,
+    depth: 1,
+    reactionCount: 1,
+    createdAt: "2026-10-20T10:05:00.000Z",
+    replies: [
+      {
+        id: "c2",
+        parentId: "c1",
+        authorId: "usr_demo",
+        body: "Same, see you at the front.",
+        deleted: false,
+        depth: 2,
+        reactionCount: 0,
+        createdAt: "2026-10-20T10:07:00.000Z",
+        replies: [],
+      },
+    ],
+  },
+];
+function findComment(list: Comment[], id: string): Comment | null {
+  for (const c of list) {
+    if (c.id === id) return c;
+    const below = findComment(c.replies, id);
+    if (below) return below;
+  }
+  return null;
+}
+const countComments = (list: Comment[]): number =>
+  list.reduce((n, c) => n + 1 + countComments(c.replies), 0);
