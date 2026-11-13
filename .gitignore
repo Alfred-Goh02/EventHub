@@ -35,6 +35,32 @@ build/
 # Chart.lock beside them, which IS committed.
 charts/*/charts/
 
+# Terraform (infra/terraform). The family, not one name of it:
+#   - .terraform/ is the downloaded providers and module index;
+#   - state holds every resource's attributes in plain text, secrets among them, in
+#     terraform.tfstate, its backups (*.tfstate.backup) and numbered copies;
+#   - variable files hold real values (addresses, account ids, emails), in .tfvars and
+#     .tfvars.json alike; only the *.tfvars.example files are committed;
+#   - a saved plan holds the same values as state;
+#   - override files and CLI config are one machine's, and crash logs are dumps.
+# The lock file, .terraform.lock.hcl, IS committed: one per root, pinning each provider
+# to the version and checksums it was validated with.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
 # Logs and OS noise
 *.log
 npm-debug.log*

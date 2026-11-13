@@ -148,6 +148,33 @@ jobs:
       - name: Assert ArgoCD runs exactly the service charts, from main, with no credential in git
         run: node scripts/verify-argocd.mjs
 
+      # The AWS demo environment's Terraform (infra/terraform). Nothing in CI plans or
+      # applies it: there are no AWS credentials here, and none are wanted. So this is all
+      # CI can know about it, and it is the part a deleted line would otherwise get past:
+      # every root formats, initialises without a backend against its committed lock file,
+      # and validates, and the guards the chapter's decisions rest on are still there --
+      # S3-native state locking, a state bucket that is versioned, encrypted, private and
+      # TLS-only, ONE NAT gateway, no static keys, an EKS public endpoint with no
+      # open-to-the-world default, immutable image tags, default tags, and the budget.
+      #
+      # Pinned to a full commit SHA, not a tag: a tag can be moved to other code, a commit
+      # cannot. dfe3c3f8 is v4.0.1, the latest release, read from the GitHub API on
+      # 2026-11-13. terraform_version is the one infra/TOOLVERSIONS.md records, and the
+      # verifier fails if the two disagree. The wrapper is off because the verifier reads
+      # terraform's own stdout and exit code, and the wrapper stands between them.
+      #
+      # It leaves the providers, about 0.8 GB, in the runner's temp directory. Measured on
+      # main's run 43378553836: 51% used after "Free runner disk" and 63% once the stack
+      # was up, against the 85% guard below, so about one point of 22.
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: Assert the Terraform formats, validates, and keeps its cost and security guards
+        run: node scripts/verify-terraform.mjs
+
       # The shared vocabulary must match the things it claims to describe.
       #
       # packages/types opens by saying "a shared type that disagrees with
@@ -2372,6 +2399,14 @@ jobs:
       # Asserted against the BUILT IMAGE rather than by re-reading the ignore
       # rules, because re-reading the rules is what missed it. This runs here
       # because this is the only job that builds the image at all.
+      #
+      # infra/terraform too, the whole directory. On a machine that has run terraform
+      # it holds the bootstrap's local state, terraform.tfvars with real values and the
+      # provider binaries, and `COPY . .` takes all of it. Measured with a probe build
+      # of this context: with .dockerignore's infra/terraform rule, 0 Terraform files in
+      # the image; with it removed, 30, a planted terraform.tfstate and terraform.tfvars
+      # among them. Here the directory holds only committed files, so the check sees the
+      # rule itself: without it, /app/infra/terraform exists.
       - name: Assert the image carries no secrets
         run: |
           set -euo pipefail
@@ -2380,15 +2415,16 @@ jobs:
             find /app -name ".env*" -not -name "*.example" -not -path "*/node_modules/*"
             find /app \( -name "*.pem" -o -name "*.key" -o -name "id_rsa*" \) -not -path "*/node_modules/*"
             ls -d /app/.git 2>/dev/null || true
+            ls -d /app/infra/terraform 2>/dev/null || true
           ')
 
           if [ -n "$found" ]; then
             echo "these are inside the image and must not be:"
             echo "$found"
             echo ""
-            echo "A real .env, key material or the git history in a layer travels with"
-            echo "every copy of the image. Add the shape to .dockerignore -- and note that"
-            echo "**/.env does NOT match .env.something."
+            echo "A real .env, key material, the git history or Terraform's state and"
+            echo "variables in a layer travel with every copy of the image. Add the shape"
+            echo "to .dockerignore -- and note that **/.env does NOT match .env.something."
             exit 1
           fi
 
