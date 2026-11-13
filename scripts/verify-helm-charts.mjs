@@ -125,8 +125,8 @@ function helm(args) {
 }
 
 /** The chart's resources, rendered as JSON through eventhub-common's render=json. */
-function render(chart, extra = []) {
-  const r = helm(['template', chart, join('charts', chart), '--set', 'render=json', '--set', 'env.PORT=0', ...extra]);
+function render(chart, extra = [], withEnv = true) {
+  const r = helm(['template', chart, join('charts', chart), '--set', 'render=json', ...(withEnv ? ['--set', 'env.PORT=0'] : []), ...extra]);
   if (r.status !== 0) return { error: r.stderr.trim() };
   const docs = r.stdout
     .split(/^---\s*$/m)
@@ -262,6 +262,17 @@ function main() {
 
     const latest = render(chart, ['--set', 'image.tag=latest']);
     check(Boolean(latest.error) && /latest/.test(latest.error), 'and the library refuses image.tag=latest');
+
+    // As ArgoCD installs it, from git: no environment, because passwords are not in git.
+    // The chart must then render no Secret -- an empty one would overwrite the one made
+    // beside it -- and the Deployment must still name that Secret.
+    const gitops = render(chart, [], false);
+    const gitopsDeploy = gitops.resources?.find((r) => r.kind === 'Deployment');
+    const envRef = gitopsDeploy?.spec?.template?.spec?.containers?.[0]?.envFrom?.[0]?.secretRef?.name;
+    check(
+      !gitops.error && !gitops.resources.some((r) => r.kind === 'Secret') && envRef === `${chart}-env`,
+      `with no environment, as ArgoCD installs it: no Secret rendered, and the Deployment still reads ${envRef}`,
+    );
   }
 
   console.log('');

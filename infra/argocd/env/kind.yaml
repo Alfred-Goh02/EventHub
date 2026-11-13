@@ -1,0 +1,7 @@
+# What differs on the local kind cluster: the image is the one compose builds, loaded into
+# the nodes by infra/local/up.mjs, never pulled. On EKS this file's sibling names the git
+# SHA that CI pushed to ECR.
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent

@@ -86,7 +86,16 @@ function hostsOf(env, composeNames) {
   return found;
 }
 
-const wanted = process.argv.slice(2).filter((a) => a !== '--');
+const args = process.argv.slice(2).filter((a) => a !== '--');
+/**
+ * --gitops: prepare the cluster for ArgoCD, which installs the charts from git. Every step
+ * up to the image runs as usual; then, instead of installing, each chart's environment
+ * goes into the Secret `<name>-env` the chart names -- passwords are not in git, so ArgoCD
+ * cannot carry them -- and any release this script installed itself is removed, so that
+ * ArgoCD alone owns what runs. infra/argocd/bootstrap.mjs runs this first.
+ */
+const GITOPS = args.includes('--gitops');
+const wanted = args.filter((a) => !a.startsWith('--'));
 const charts = wanted.length ? wanted : allCharts();
 for (const c of charts) if (!existsSync(join(ROOT, 'charts', c, 'Chart.yaml'))) fail(`no chart at charts/${c}`);
 
@@ -186,11 +195,33 @@ if (charts.includes('notification')) {
 step('5. the image');
 run('kind', ['load', 'docker-image', IMAGE, '--name', CLUSTER], { stdio: 'inherit' });
 
+const envOf = (chart) =>
+  Object.fromEntries(Object.entries(services[chart].environment ?? {}).map(([k, v]) => [k, v === null ? '' : String(v)]));
+
+if (GITOPS) {
+  step('6. each chart\'s environment, for ArgoCD to find');
+  for (const chart of charts) {
+    const env = envOf(chart);
+    const s = {
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: `${chart}-env`, labels: { 'app.kubernetes.io/name': chart, 'app.kubernetes.io/part-of': 'eventhub' } },
+      type: 'Opaque',
+      stringData: env,
+    };
+    kubectl(['apply', '-f', '-'], JSON.stringify(s));
+    const owned = spawnSync('helm', ['status', chart, '--kube-context', CONTEXT], { encoding: 'utf8' }).status === 0;
+    if (owned) run('helm', ['uninstall', chart, '--kube-context', CONTEXT, '--wait']);
+    console.log(`    ok    ${chart}-env: ${Object.keys(env).length} variable(s) from compose${owned ? '; the Helm release this script made is removed, so ArgoCD owns it' : ''}`);
+  }
+  console.log('\nthe cluster is ready for ArgoCD: node infra/argocd/bootstrap.mjs installs the charts from git');
+  process.exit(0);
+}
+
 step('6. the charts');
 const scratch = mkdtempSync(join(tmpdir(), 'eventhub-up-'));
 for (const chart of charts) {
-  const svc = services[chart];
-  const env = Object.fromEntries(Object.entries(svc.environment ?? {}).map(([k, v]) => [k, v === null ? '' : String(v)]));
+  const env = envOf(chart);
   const valuesFile = join(scratch, `${chart}.json`);
   writeFileSync(valuesFile, JSON.stringify({ env }));
   run('helm', ['dependency', 'build', join('charts', chart)]);
