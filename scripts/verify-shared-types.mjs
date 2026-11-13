@@ -35,7 +35,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');

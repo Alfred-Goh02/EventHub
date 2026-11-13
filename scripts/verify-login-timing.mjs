@@ -65,7 +65,10 @@ const MAX_RATIO = 2.0;
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
