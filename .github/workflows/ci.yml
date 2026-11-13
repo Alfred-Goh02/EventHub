@@ -129,6 +129,16 @@ jobs:
       - name: Assert every verifier sets its exit code where an assertion fails
         run: node scripts/verify-checks-set-exit-code.mjs
 
+      # The services' Helm charts (charts/, through the eventhub-common library).
+      # The first install on kind left Auth Running and 0/2 ready for five minutes:
+      # its readiness probe asked /ready, and Auth had only /health. So each probe
+      # path is judged against the routes the service's own source registers, and
+      # every chart must render split probes, requests and limits, non-root, a grace
+      # period above the drain backstop, and a spread and disruption budget for more
+      # than one replica. Renders only, with the runner's helm: no cluster needed.
+      - name: Assert every service chart renders a workload Kubernetes can run
+        run: node scripts/verify-helm-charts.mjs
+
       # The shared vocabulary must match the things it claims to describe.
       #
       # packages/types opens by saying "a shared type that disagrees with
