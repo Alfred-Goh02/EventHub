@@ -3,8 +3,10 @@
 Everything AWS needs before Kubernetes can run the charts, written resource by resource
 with no registry modules. Terraform stops at the cluster boundary: nothing here installs
 anything into the cluster. Helm and ArgoCD own everything inside it, the AWS Load Balancer
-Controller included. Region **ap-southeast-1**. The environment exists only for short,
-timeboxed demo windows; the teardown runbook below is part of using it.
+Controller included. Region **ap-southeast-2** (Sydney): the AWS account is on AWS's new
+experience, whose project Region is set by the contact address -- Singapore maps to Sydney
+-- and cannot be changed. The environment exists only for short, timeboxed demo windows;
+the teardown runbook below is part of using it.
 
 | | |
 |---|---|
@@ -32,9 +34,9 @@ rests on. `--static` runs the guards alone.
 $env:AWS_PROFILE = 'eventhub'
 aws sts get-caller-identity --profile eventhub
 
-# Kubernetes 1.37 should be listed for the region. If it is not, set
-# kubernetes_version = "1.36" in envs/demo/terraform.tfvars.
-aws eks describe-cluster-versions --region ap-southeast-1 --profile eventhub --output table
+# Kubernetes 1.37 should be listed for the region (it was on 2026-11-13: standard support
+# until 2027-12-01). If it is not, set kubernetes_version = "1.36" in envs/demo/terraform.tfvars.
+aws eks describe-cluster-versions --region ap-southeast-2 --profile eventhub --output table
 
 # kubectl must be 1.36 or newer for a 1.37 cluster. On this machine Docker Desktop's
 # kubectl 1.34.1 comes first on PATH, ahead of winget's 1.37.2.
@@ -68,7 +70,7 @@ kubectl version --client
 
    ```powershell
    terraform -chdir=infra/terraform/envs/demo output
-   aws eks update-kubeconfig --region ap-southeast-1 --name eventhub-demo --alias eventhub-demo --profile eventhub
+   aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias eventhub-demo --profile eventhub
    kubectl get nodes
    ```
 
@@ -82,25 +84,24 @@ kubectl version --client
    ```powershell
    $repo = terraform -chdir=infra/terraform/envs/demo output -raw ecr_repository_url
    $sha = git rev-parse --short HEAD
-   aws ecr get-login-password --region ap-southeast-1 --profile eventhub | docker login --username AWS --password-stdin $repo.Split('/')[0]
+   aws ecr get-login-password --region ap-southeast-2 --profile eventhub | docker login --username AWS --password-stdin $repo.Split('/')[0]
    docker tag "eventhub/app:$sha" "${repo}:$sha"
    docker push "${repo}:$sha"
    ```
 
 ## What an hour costs
 
-List prices for ap-southeast-1 as best known when this was written, **to be confirmed in
-the [AWS Pricing Calculator](https://calculator.aws/) before the first apply**. Only the
-EKS control plane and the public IPv4 rate are the same in every region; the rest are
-approximate.
+ap-southeast-2 on-demand list prices, read from the AWS Price List API on 2026-11-13
+(`aws pricing get-products --region us-east-1`, location "Asia Pacific (Sydney)"). The
+public IPv4 rate and the KMS key price are AWS's published flat rates, not read from the API.
 
-| What | ap-southeast-1 list price (confirm) | Per hour |
+| What | ap-southeast-2 list price | Per hour |
 |---|---|---|
 | EKS control plane, standard support | $0.10 per cluster-hour (extended support would be $0.60; `upgrade_policy` keeps it standard) | $0.10 |
-| 2 x t3.medium, Linux, on demand | about $0.053 per instance-hour | about $0.11 |
-| 1 NAT gateway | about $0.059 per hour, plus about $0.059 per GB it processes | about $0.06, plus traffic |
+| 2 x t3.medium, Linux, on demand | $0.0528 per instance-hour | $0.106 |
+| 1 NAT gateway | $0.059 per hour, plus $0.059 per GB it processes | $0.059, plus traffic |
 | The NAT's public IPv4 address | $0.005 per hour | $0.005 |
-| 2 x 20 GiB node root volumes (EBS) | about $0.10 to $0.12 per GB-month | under $0.01 |
+| 2 x 20 GiB node root volumes (EBS gp3) | $0.096 per GB-month | about $0.005 |
 | KMS key for Secrets | $1 per key-month, prorated | about $0.001 |
 | ECR | $0.10 per GB-month stored; basic scan on push | pennies a month |
 | State bucket and budget | kilobytes in S3; one budget is inside the allowance AWS publishes | about $0 |
@@ -122,7 +123,7 @@ they go first, while the controller is still running to delete them.
 
 ```powershell
 $env:AWS_PROFILE = 'eventhub'
-aws eks update-kubeconfig --region ap-southeast-1 --name eventhub-demo --alias eventhub-demo --profile eventhub
+aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias eventhub-demo --profile eventhub
 ```
 
 1. **Delete every Ingress and every Service of type LoadBalancer**, before uninstalling
@@ -145,9 +146,9 @@ aws eks update-kubeconfig --region ap-southeast-1 --name eventhub-demo --alias e
    `aws ec2 delete-security-group`) before going on.
 
    ```powershell
-   aws elbv2 describe-load-balancers --region ap-southeast-1 --profile eventhub --query "LoadBalancers[].[LoadBalancerName,Type,VpcId]" --output table
-   aws elbv2 describe-target-groups --region ap-southeast-1 --profile eventhub --query "TargetGroups[].[TargetGroupName,VpcId]" --output table
-   aws ec2 describe-security-groups --region ap-southeast-1 --profile eventhub --filters "Name=tag-key,Values=elbv2.k8s.aws/cluster" --query "SecurityGroups[].[GroupId,GroupName,VpcId]" --output table
+   aws elbv2 describe-load-balancers --region ap-southeast-2 --profile eventhub --query "LoadBalancers[].[LoadBalancerName,Type,VpcId]" --output table
+   aws elbv2 describe-target-groups --region ap-southeast-2 --profile eventhub --query "TargetGroups[].[TargetGroupName,VpcId]" --output table
+   aws ec2 describe-security-groups --region ap-southeast-2 --profile eventhub --filters "Name=tag-key,Values=elbv2.k8s.aws/cluster" --query "SecurityGroups[].[GroupId,GroupName,VpcId]" --output table
    ```
 
 3. **Destroy the demo environment.** Read the plan it shows: everything in it should be
@@ -164,10 +165,10 @@ aws eks update-kubeconfig --region ap-southeast-1 --name eventhub-demo --alias e
    `--profile`). An address with no association is billing for nothing.
 
    ```powershell
-   aws ec2 describe-volumes --region ap-southeast-1 --profile eventhub --filters "Name=status,Values=available" --query "Volumes[].[VolumeId,Size,CreateTime]" --output table
-   aws ec2 describe-network-interfaces --region ap-southeast-1 --profile eventhub --filters "Name=status,Values=available" --query "NetworkInterfaces[].[NetworkInterfaceId,VpcId,Description]" --output table
-   aws ec2 describe-addresses --region ap-southeast-1 --profile eventhub --query "Addresses[].[PublicIp,AllocationId,AssociationId]" --output table
-   aws logs describe-log-groups --region ap-southeast-1 --profile eventhub --log-group-name-prefix /aws/eks/eventhub-demo --query "logGroups[].logGroupName" --output table
+   aws ec2 describe-volumes --region ap-southeast-2 --profile eventhub --filters "Name=status,Values=available" --query "Volumes[].[VolumeId,Size,CreateTime]" --output table
+   aws ec2 describe-network-interfaces --region ap-southeast-2 --profile eventhub --filters "Name=status,Values=available" --query "NetworkInterfaces[].[NetworkInterfaceId,VpcId,Description]" --output table
+   aws ec2 describe-addresses --region ap-southeast-2 --profile eventhub --query "Addresses[].[PublicIp,AllocationId,AssociationId]" --output table
+   aws logs describe-log-groups --region ap-southeast-2 --profile eventhub --log-group-name-prefix /aws/eks/eventhub-demo --query "logGroups[].logGroupName" --output table
    ```
 
    The KMS key is not deleted at once: `destroy` schedules it, seven days out.

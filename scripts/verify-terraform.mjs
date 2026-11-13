@@ -491,6 +491,27 @@ function backendChecks(units, roots) {
     }
   }
   check(s3 > 0, `CONTROL: ${s3} S3 backend(s) judged`);
+
+  // ONE REGION, WRITTEN IN SEVERAL PLACES. The state bucket is made in bootstrap's region,
+  // each S3 backend names that region to find it, and each root's provider runs in its own
+  // `region` variable. Nothing ties the copies together: a backend left on the old region
+  // fails `init` on the first real apply, which nothing without an account can see. Moving
+  // from ap-southeast-1 to ap-southeast-2 touched three of them.
+  const regions = [];
+  for (const r of roots) {
+    const v = blocksOf(r.items, 'variable', 'region')[0];
+    if (v) regions.push({ at: `${r.rel} variable "region" default`, value: literal(attrOf(v.body, 'default')) });
+    for (const b of backendsOf(r).filter((x) => x.labels[0] === 's3')) {
+      regions.push({ at: `${r.rel} backend "s3" region`, value: literal(attrOf(b.body, 'region')) });
+    }
+  }
+  const distinct = [...new Set(regions.map((x) => x.value))];
+  check(
+    regions.length >= roots.length + s3 && distinct.length === 1 && Boolean(distinct[0]),
+    distinct.length === 1 && distinct[0]
+      ? `every root's region and every backend's region is ${distinct[0]} (${regions.length} place(s))`
+      : `the region is not the same everywhere: ${regions.map((x) => `${x.at} = ${x.value ?? 'not a literal'}`).join('; ')}`,
+  );
 }
 
 function bucketChecks(units) {

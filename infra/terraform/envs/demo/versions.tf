@@ -22,7 +22,7 @@ terraform {
   #   terraform -chdir=infra/terraform/envs/demo init "-backend-config=bucket=<state_bucket>"
   backend "s3" {
     key          = "envs/demo/terraform.tfstate"
-    region       = "ap-southeast-1"
+    region       = "ap-southeast-2"
     encrypt      = true
     use_lockfile = true
   }

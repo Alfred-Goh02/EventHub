@@ -17,9 +17,11 @@ variable "cluster_name" {
 #     version about 14 months). Past standard support a cluster costs $0.60 an hour
 #     instead of $0.10, which is the difference between a cheap demo and an expensive one.
 #
-# Before the first apply, confirm it in the region (see infra/terraform/README.md):
-#   aws eks describe-cluster-versions --region ap-southeast-1 --profile eventhub
-# If 1.37 is not listed there, 1.36 is the fallback: the same AMI release builds it.
+# Confirmed in the region on 2026-11-13, once there was an account to ask:
+#   aws eks describe-cluster-versions --region ap-southeast-2 --profile eventhub
+# listed 1.37 as STANDARD_SUPPORT until 2027-12-01, and the SSM parameter for its AL2023
+# node AMI resolved (ami-04ae6dd537dbb9c44). If 1.37 ever is not listed, 1.36 is the
+# fallback: the same AMI release builds it.
 variable "kubernetes_version" {
   description = "The EKS Kubernetes version, major.minor. See the comment above for why the default is what it is."
   type        = string
