@@ -1,0 +1,9 @@
+apiVersion: v2
+name: live
+description: "The Live service: Q&A over WebSockets, fanned out through Redis. Everything it shares with the others is in eventhub-common."
+type: application
+version: 0.1.0
+dependencies:
+  - name: eventhub-common
+    version: 0.1.0
+    repository: file://../eventhub-common

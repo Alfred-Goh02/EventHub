@@ -65,30 +65,43 @@ spec:
             - name: AUTH_PUBLIC_KEY_FILE
               value: /run/eventhub/keys/public.pem
           {{- end }}
-          {{- if $v.port }}
+          {{- /*
+            A service listens on `port`, behind a Service, and is probed there. A worker
+            has no Service; one that runs a probe listener names it as probes.port. One
+            with neither -- the sweeper, the reconciler -- is not probed.
+          */}}
+          {{- $probePort := $v.port | default $v.probes.port }}
+          {{- $portName := ternary "http" "probes" (not (empty $v.port)) }}
+          {{- if $probePort }}
           ports:
-            - name: http
-              containerPort: {{ $v.port }}
+            - name: {{ $portName }}
+              containerPort: {{ $probePort }}
+          {{- if $v.probes.liveness }}
           livenessProbe:
             httpGet:
               path: {{ $v.probes.liveness }}
-              port: http
+              port: {{ $portName }}
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: {{ $v.probes.readiness }}
-              port: http
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 2
           startupProbe:
             httpGet:
               path: {{ $v.probes.liveness }}
-              port: http
+              port: {{ $portName }}
             periodSeconds: 2
             failureThreshold: 30
+          {{- end }}
+          {{- if $v.probes.readiness }}
+          readinessProbe:
+            httpGet:
+              path: {{ $v.probes.readiness }}
+              port: {{ $portName }}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          {{- end }}
+          {{- end }}
+          {{- if $v.port }}
           # SIGTERM and the removal of this pod from the Service's endpoints start at the
           # same moment, and the removal takes a second or two to reach every node's
           # kube-proxy. Closing the listener at once refused the connections still routed
@@ -106,16 +119,24 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-          {{- if ne $v.keys "none" }}
+          {{- if or (ne $v.keys "none") $v.secretMounts }}
           volumeMounts:
+            {{- if ne $v.keys "none" }}
             - name: jwt-keys
               # Auth signs, so it reads both halves where jwt.ts looks for them. Every
               # other service gets the public half only, at the path AUTH_PUBLIC_KEY_FILE names.
               mountPath: {{ if eq $v.keys "private" }}{{ $v.workingDir }}/keys{{ else }}/run/eventhub/keys{{ end }}
               readOnly: true
+            {{- end }}
+            {{- range $v.secretMounts }}
+            - name: {{ .secret }}
+              mountPath: {{ .mountPath }}
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if ne $v.keys "none" }}
+      {{- if or (ne $v.keys "none") $v.secretMounts }}
       volumes:
+        {{- if ne $v.keys "none" }}
         - name: jwt-keys
           secret:
             secretName: jwt-keys
@@ -124,5 +145,11 @@ spec:
               - key: public.pem
                 path: public.pem
             {{- end }}
+        {{- end }}
+        {{- range $v.secretMounts }}
+        - name: {{ .secret }}
+          secret:
+            secretName: {{ .secret }}
+        {{- end }}
       {{- end }}
 {{- end -}}

@@ -1,0 +1,22 @@
+name: ticketing
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/ticketing
+command: ["node","dist/index.js"]
+port: 3003
+probes:
+  liveness: /health
+  readiness: /ready
+keys: public
+resources:
+  requests:
+    cpu: 50m
+    memory: 192Mi
+  limits:
+    memory: 384Mi
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+env: {}

@@ -68,6 +68,24 @@ function hostsIn(value, composeNames) {
   return found;
 }
 
+/**
+ * Every compose host an environment names: host:port inside a value, and a bare
+ * `X_HOST=<service>` with its `X_PORT` beside it -- how Notification names mailpit.
+ * A bare value alone is not a host: CLICKHOUSE_DATABASE=analytics and
+ * KAFKA_CONSUMER_GROUP=analytics-ingest both equal a compose service's name.
+ */
+function hostsOf(env, composeNames) {
+  const found = [];
+  for (const [key, value] of Object.entries(env)) {
+    found.push(...hostsIn(value, composeNames));
+    const prefix = /^(.*)_HOST$/.exec(key)?.[1];
+    if (prefix && composeNames.has(String(value)) && /^\d{2,5}$/.test(String(env[`${prefix}_PORT`] ?? ''))) {
+      found.push({ host: String(value), port: Number(env[`${prefix}_PORT`]) });
+    }
+  }
+  return found;
+}
+
 const wanted = process.argv.slice(2).filter((a) => a !== '--');
 const charts = wanted.length ? wanted : allCharts();
 for (const c of charts) if (!existsSync(join(ROOT, 'charts', c, 'Chart.yaml'))) fail(`no chart at charts/${c}`);
@@ -108,12 +126,10 @@ const bridges = new Map();
 for (const chart of charts) {
   const svc = services[chart];
   if (!svc) fail(`charts/${chart} has no compose service of the same name to take its environment from`);
-  for (const value of Object.values(svc.environment ?? {})) {
-    for (const { host, port } of hostsIn(value, composeNames)) {
-      if (charts.includes(host)) continue;
-      if (!bridges.has(host)) bridges.set(host, new Set());
-      bridges.get(host).add(port);
-    }
+  for (const { host, port } of hostsOf(svc.environment ?? {}, composeNames)) {
+    if (charts.includes(host)) continue;
+    if (!bridges.has(host)) bridges.set(host, new Set());
+    bridges.get(host).add(port);
   }
 }
 const manifests = [];
@@ -151,6 +167,21 @@ for (const need of ['private.pem', 'public.pem']) {
 const secret = kubectl(['create', 'secret', 'generic', 'jwt-keys', ...pems.map((f) => `--from-file=${f}=${join(keys, f)}`), '--dry-run=client', '-o', 'json']);
 kubectl(['apply', '-f', '-'], secret);
 console.log(`    ok    jwt-keys: ${pems.join(', ')}`);
+
+// Notification's own keypair, which only Notification mounts. Auth holds its public half
+// as notification-public.pem; a different keypair here and every email request Auth
+// seals is one Notification cannot open.
+if (charts.includes('notification')) {
+  const nkeys = join(ROOT, 'services', 'notification', 'keys');
+  const npems = existsSync(nkeys) ? readdirSync(nkeys).filter((f) => f.endsWith('.pem')).sort() : [];
+  if (!npems.includes('private.pem')) fail('services/notification/keys has no private.pem; run setup (docker compose up)');
+  if (npems.includes('public.pem') && readFileSync(join(nkeys, 'public.pem'), 'utf8') !== readFileSync(join(keys, 'notification-public.pem'), 'utf8')) {
+    fail("services/notification/keys/public.pem is not the notification-public.pem Auth holds: Auth would seal requests Notification cannot open");
+  }
+  const nsecret = kubectl(['create', 'secret', 'generic', 'notification-keys', ...npems.map((f) => `--from-file=${f}=${join(nkeys, f)}`), '--dry-run=client', '-o', 'json']);
+  kubectl(['apply', '-f', '-'], nsecret);
+  console.log(`    ok    notification-keys: ${npems.join(', ')}, its public half the one Auth seals to`);
+}
 
 step('5. the image');
 run('kind', ['load', 'docker-image', IMAGE, '--name', CLUSTER], { stdio: 'inherit' });

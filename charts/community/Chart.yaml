@@ -1,0 +1,9 @@
+apiVersion: v2
+name: community
+description: "The Community service: spaces, posts, threads, the feed consumer. Everything it shares with the others is in eventhub-common."
+type: application
+version: 0.1.0
+dependencies:
+  - name: eventhub-common
+    version: 0.1.0
+    repository: file://../eventhub-common

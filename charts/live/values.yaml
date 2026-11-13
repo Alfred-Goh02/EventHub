@@ -1,0 +1,22 @@
+name: live
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/live
+command: ["node","dist/index.js"]
+port: 3004
+probes:
+  liveness: /health
+  readiness: /ready
+keys: public
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+env: {}

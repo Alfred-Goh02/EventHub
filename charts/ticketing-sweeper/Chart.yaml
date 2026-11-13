@@ -1,0 +1,9 @@
+apiVersion: v2
+name: ticketing-sweeper
+description: "Ticketing's hold sweeper: expires holds and returns their seats. Everything it shares with the others is in eventhub-common."
+type: application
+version: 0.1.0
+dependencies:
+  - name: eventhub-common
+    version: 0.1.0
+    repository: file://../eventhub-common

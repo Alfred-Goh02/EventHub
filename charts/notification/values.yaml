@@ -1,0 +1,26 @@
+name: notification
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/notification
+command: ["node","dist/index.js"]
+port: 3007
+probes:
+  liveness: /health
+  readiness: /ready
+keys: public
+# Its own private key, which Auth seals email requests to; only Notification mounts it.
+secretMounts:
+  - secret: notification-keys
+    mountPath: /app/services/notification/keys
+resources:
+  requests:
+    cpu: 50m
+    memory: 160Mi
+  limits:
+    memory: 384Mi
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+env: {}

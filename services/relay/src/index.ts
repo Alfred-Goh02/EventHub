@@ -108,6 +108,12 @@ async function loop(): Promise<void> {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const metricsServer = createServer((req, res) => {
+  // Liveness: the process is up. It touches nothing, because /metrics asks the database,
+  // and a liveness probe on a dependency restarts every relay when the database is slow.
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ status: 'ok', service: 'relay' }));
+    return;
+  }
   if (req.url !== '/metrics') {
     res.writeHead(404).end();
     return;

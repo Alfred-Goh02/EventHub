@@ -1,0 +1,21 @@
+name: relay-auth
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 1
+workingDir: /app/services/relay
+command: ["node","dist/index.js"]
+# A worker: no Service, but a probe listener of its own.
+probes:
+  port: 3012
+  liveness: /health
+keys: none
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+terminationGracePeriodSeconds: 30
+env: {}
