@@ -1,0 +1,22 @@
+name: event
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/event
+command: ["node", "dist/index.js"]
+port: 3002
+probes:
+  liveness: /health
+  readiness: /ready
+# Verifies tokens, mints none: the public half only.
+keys: public
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+terminationGracePeriodSeconds: 30
+env: {}

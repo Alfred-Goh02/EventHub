@@ -1,0 +1,9 @@
+apiVersion: v2
+name: eventhub-common
+description: >-
+  What every EventHub service's chart has in common: a Deployment of the shared
+  image, its Service, a PodDisruptionBudget, and the Secret its environment comes
+  from. A library chart renders nothing by itself; each service's thin chart
+  includes "eventhub-common.all" and sets values.
+type: library
+version: 0.1.0

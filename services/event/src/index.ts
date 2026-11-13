@@ -1,9 +1,9 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler, refuseUnstorableText } from '@eventhub/http';
+import { drainOnSignal, errorHandler, readiness, refuseUnstorableText } from '@eventhub/http';
 import { requireAuth } from './auth.js';
-import { assertRuntimeRoleCannotBypassRls } from './db.js';
+import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
 import { events } from './routes/events.js';
 
 const env = loadBaseEnv();
@@ -17,6 +17,9 @@ app.use(refuseUnstorableText());
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'event' });
 });
+
+/** Readiness: the database answers as this process, the app role. See @eventhub/http. */
+app.get('/ready', readiness({ database: () => prisma.$queryRaw`SELECT 1` }));
 
 // Proves this service verifies a token AUTH signed, holding only the public
 // key — no call to Auth, no shared session store.
@@ -34,9 +37,10 @@ async function main() {
   // Refuse to start rather than run with tenant isolation silently disabled.
   await assertRuntimeRoleCannotBypassRls();
 
-  app.listen(env.PORT, () => {
+  const server = app.listen(env.PORT, () => {
     logger.info(`event-service listening on port ${env.PORT}`);
   });
+  drainOnSignal(server, { logger, cleanup: () => prisma.$disconnect() });
 }
 
 main().catch((err) => {

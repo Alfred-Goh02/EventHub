@@ -3,9 +3,9 @@ import express from 'express';
 import { createLogger } from '@eventhub/logger';
 import { hash, verify } from '@node-rs/argon2';
 import { z } from 'zod';
-import { ah, errorHandler, refuseUnstorableText } from '@eventhub/http';
+import { ah, drainOnSignal, errorHandler, readiness, refuseUnstorableText } from '@eventhub/http';
 import { env } from './env.js';
-import { assertRuntimeRoleCannotBypassRls, withTenant } from './db.js';
+import { assertRuntimeRoleCannotBypassRls, prisma, withTenant } from './db.js';
 import { Prisma } from './generated/prisma/client.js';
 import { signAccessToken } from './jwt.js';
 import { requireAuth, requireRole } from './middleware/auth.js';
@@ -98,6 +98,9 @@ app.use(refuseUnstorableText());
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'auth' });
 });
+
+/** Readiness: the database answers as this process, the app role. See @eventhub/http. */
+app.get('/ready', readiness({ database: () => prisma.$queryRaw`SELECT 1` }));
 
 /**
  * Email, normalised at the SCHEMA boundary rather than at each use site.
@@ -938,9 +941,10 @@ app.use(errorHandler(logger));
 async function main(): Promise<void> {
   await assertRuntimeRoleCannotBypassRls();
 
-  app.listen(env.PORT, () => {
+  const server = app.listen(env.PORT, () => {
     logger.info(`auth-service listening on port ${env.PORT}`);
   });
+  drainOnSignal(server, { logger, cleanup: () => prisma.$disconnect() });
 }
 
 main().catch((err) => {
