@@ -102,6 +102,39 @@ export type PayResult =
   | { httpStatus: 200; body: { status: "CONFIRMED"; amountCents: number; [k: string]: unknown } }
   | { httpStatus: 202; body: { status: "PENDING"; paymentId: string; message: string } };
 
+/** GET /posts/:postId: one visible post, and whether this reader may reply in its space. */
+export interface Post {
+  id: string;
+  spaceId: string;
+  authorId: string;
+  body: string;
+  reactionCount: number;
+  commentCount: number;
+  createdAt: string;
+  space: { id: string; slug: string; name: string; visibility: "PUBLIC" | "PRIVATE" };
+  canReply: boolean;
+}
+
+/** One comment in GET /posts/:postId/comments, with its replies nested under it. */
+export interface Comment {
+  id: string;
+  parentId: string | null;
+  /** Null, with the body, on a deleted comment kept to hold its replies. */
+  authorId: string | null;
+  body: string | null;
+  deleted: boolean;
+  depth: number;
+  reactionCount: number;
+  createdAt: string;
+  replies: Comment[];
+}
+
+export interface Thread {
+  comments: Comment[];
+  count: number;
+  truncated: boolean;
+}
+
 /** POST /auth/register: the account an invitation created. */
 export interface RegisteredUser {
   id: string;
@@ -132,4 +165,8 @@ export interface EventHubApi {
     status?: ReservationStatus | undefined;
     cursor?: string | null;
   }): Promise<Page<Reservation>>;
+  getPost(id: string): Promise<Post>;
+  getThread(postId: string): Promise<Thread>;
+  /** A reply to the post, or to one of its comments when parentId is given. */
+  addComment(postId: string, body: string, parentId?: string): Promise<{ id: string }>;
 }
