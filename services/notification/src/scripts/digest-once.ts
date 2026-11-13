@@ -39,14 +39,16 @@ async function main(): Promise<void> {
         logger,
         unsubscribeSecret: env.UNSUBSCRIBE_SECRET,
         publicUrl: env.NOTIFICATION_PUBLIC_URL,
-        appUrl: env.PUBLIC_APP_URL,
+        appUrl: env.APP_URL_TEMPLATE,
       },
       { batchSize: env.DIGEST_BATCH_SIZE },
     );
     console.log(
       `sent ${r.digestsSent} digest(s) to ${r.waiting} waiting; settled ${r.itemsSettled} held ` +
         `repl${r.itemsSettled === 1 ? 'y' : 'ies'}; dropped ${r.droppedOptedOut} opted out, ${r.droppedNoAddress} without an address ` +
-        `and ${r.droppedStale} stale; deferred ${r.deferred}; stepped over ${r.busyElsewhere} another pass had; failed ${r.recipientFailures}`,
+        `and ${r.droppedStale} stale; deferred ${r.deferred}; stepped over ${r.busyElsewhere} another pass had; failed ${r.recipientFailures}; ` +
+        // Last, so the line's start reads as it did. Above zero: cards still to republish.
+        `${r.withoutLinks} built without links, for a card that names no subdomain`,
     );
     if (r.recipientFailures > 0) process.exitCode = 1;
   } finally {

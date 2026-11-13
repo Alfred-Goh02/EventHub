@@ -64,7 +64,7 @@
  * run's nor another verifier's, which is what a group written into the code looks like.
  *
  * AND THE OTHER DIRECTION, FOR AUTH: the example is a laptop's configuration, and
- * Auth run from it as production must refuse. Its PUBLIC_APP_URL is localhost,
+ * Auth run from it as production must refuse. Its APP_URL_TEMPLATE is localhost,
  * and a production Auth that kept it would email every password-reset link
  * pointing at the reader's own machine. See authInProduction below.
  *
@@ -395,12 +395,12 @@ async function exitOrListen(proc, timeoutMs) {
 /**
  * Auth, as production, from the same example: it must refuse the example's origin.
  *
- * PUBLIC_APP_URL is where every invite and password-reset link points, and the
- * example's is http://localhost:3000 -- right on a laptop. A production Auth that
- * forgot to set it would start, seal every reset link to the reader's own machine,
- * and email it; password reset would be broken for everyone, and nothing would say
- * so. So Auth refuses to start under NODE_ENV=production unless it is https, and
- * this boots it exactly the way a forgetful deployment would: the example, and
+ * APP_URL_TEMPLATE is where every invite and password-reset link points, and the
+ * example's is http://{tenant}.eventhub.localhost:5173 -- right on a laptop. A
+ * production Auth that kept it would start, seal every reset link to the reader's own
+ * machine, and email it; password reset would be broken for everyone, and nothing
+ * would say so. So Auth refuses to start under NODE_ENV=production unless it is https,
+ * and this boots it exactly the way a forgetful deployment would: the example, and
  * NODE_ENV=production, and nothing else.
  *
  * The control is the same process given an https origin, which must start. Without
@@ -425,8 +425,8 @@ async function authInProduction() {
     // and a looser pattern would match that instead of the message.
     const named = refused.log().match(/Error: refusing to start: (.+?) must be https/)?.[1] ?? '';
     check(
-      outcome.exit !== undefined && outcome.exit !== 0 && named.includes('PUBLIC_APP_URL'),
-      `with the example's PUBLIC_APP_URL (${example['PUBLIC_APP_URL'] ?? 'absent'}), a production auth refuses to ` +
+      outcome.exit !== undefined && outcome.exit !== 0 && named.includes('APP_URL_TEMPLATE'),
+      `with the example's APP_URL_TEMPLATE (${example['APP_URL_TEMPLATE'] ?? 'absent'}), a production auth refuses to ` +
         `start and names it (${outcome.listening ? 'it STARTED' : `exit ${outcome.exit ?? 'none'}`}: ${named || 'no such message'})`,
     );
   } finally {
@@ -434,7 +434,7 @@ async function authInProduction() {
     await refused.exited;
   }
 
-  const control = startAuthInProduction({ PUBLIC_APP_URL: 'https://app.eventhub.example' });
+  const control = startAuthInProduction({ APP_URL_TEMPLATE: 'https://{tenant}.eventhub.example' });
   try {
     const outcome = await exitOrListen(control, 30_000);
     // Still ours: it answered, and it is the process this started, still running.
@@ -444,8 +444,8 @@ async function authInProduction() {
     check(
       ours,
       ours
-        ? 'CONTROL: with an https PUBLIC_APP_URL, the same production process starts'
-        : `CONTROL: with an https PUBLIC_APP_URL, the production process did NOT start (exit ${outcome.exit ?? 'none'}): ${reason}`,
+        ? 'CONTROL: with an https APP_URL_TEMPLATE, the same production process starts'
+        : `CONTROL: with an https APP_URL_TEMPLATE, the production process did NOT start (exit ${outcome.exit ?? 'none'}): ${reason}`,
     );
   } finally {
     control.child.kill();

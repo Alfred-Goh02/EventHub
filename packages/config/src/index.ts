@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+// Where emailed links point, per tenant. In a module of its own; see the note there.
+export * from './app-url.js';
+
 /**
  * Exported so a service can build on it, rather than copying it.
  *

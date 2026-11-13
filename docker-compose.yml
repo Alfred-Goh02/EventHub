@@ -481,7 +481,10 @@ services:
         DATABASE_URL="$$AUTH_DATABASE_URL" pnpm --filter @eventhub/auth exec prisma db seed
 
         # Seeded users get no card from /register, so they are queued here. Only
-        # users who never had one: a second `up` queues nothing.
+        # users who never had one, and users whose card was not made under their
+        # tenant's current slug -- every card from before cards named the tenant's
+        # subdomain, which Notification needs for a reply's link. A second `up`
+        # queues nothing.
         #
         # PORT is given although the command listens on nothing: Auth's db.ts validates
         # the whole base environment, and PORT has no default there. Without it the
@@ -529,6 +532,11 @@ services:
       # The cost, while this port is still published: a client calling Auth
       # directly can name its own address. scripts/verify-compose-gateway.mjs.
       TRUST_PROXY: "1"
+      # Where reset and invitation links open: the web app on the tenant's own
+      # subdomain, the Vite dev server's port. Unset, Auth refuses to start; it used to
+      # default every link to http://localhost:3000, a host that serves no tenant.
+      # Notification builds its reply links on the same template.
+      APP_URL_TEMPLATE: &app-url-template "http://{tenant}.eventhub.localhost:5173"
     volumes:
       # The only container that gets the PRIVATE key, because it is the only one
       # that signs. jwt.ts resolves keys/ relative to its own file, so the mount
@@ -1067,6 +1075,10 @@ services:
       # The development value from .env.example. NODE_ENV is development here; a
       # production process refuses to start with this.
       UNSUBSCRIBE_SECRET: dev-only-unsubscribe-secret-change-me-0123456789
+      # Reply and digest links open on the recipient's tenant's subdomain, Auth's
+      # template filled with the slug on their contact card. The unsubscribe link does
+      # not: it stays on NOTIFICATION_PUBLIC_URL, one host for every tenant.
+      APP_URL_TEMPLATE: *app-url-template
     volumes:
       - jwt-public:/run/eventhub/keys:ro
       # keys/ resolves beside dist/, so the layout fixes this mount point.

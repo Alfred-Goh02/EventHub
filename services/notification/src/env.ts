@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { loadBaseEnv } from '@eventhub/config';
+import { appUrlTemplateSchema, loadBaseEnv } from '@eventhub/config';
 
 /**
  * Notification's own configuration, on top of the shared base: PORT, NODE_ENV,
@@ -34,10 +34,19 @@ const notificationEnvSchema = z.object({
   /**
    * Where this service answers /unsubscribe, as a reader's mail client reaches it:
    * the origin every unsubscribe link and List-Unsubscribe header points at.
+   *
+   * ONE HOST FOR EVERY TENANT, on purpose, unlike the template below: the link needs
+   * no session, its signed token names the tenant, and the gateway routes it on the api
+   * subdomain, which has no tenant in it.
    */
   NOTIFICATION_PUBLIC_URL: z.string().url().default('http://localhost:3007'),
-  /** Where the web app shows a post, for the link in a reply email. Auth's reset links use the same name. */
-  PUBLIC_APP_URL: z.string().url().default('http://localhost:3000'),
+  /**
+   * Where the web app shows a post, for the links in a reply email and a digest: the
+   * RECIPIENT's tenant's own subdomain, with {tenant} where it goes, read from the slug
+   * on their contact card. The same variable Auth builds its links on, checked the same
+   * way: see @eventhub/config's app-url.ts.
+   */
+  APP_URL_TEMPLATE: appUrlTemplateSchema,
   /**
    * Where a new replies group starts on community.feed. latest, unlike password
    * resets: on first deploy, earliest would email everyone about a week of replies
@@ -144,16 +153,20 @@ if (base.NODE_ENV === 'production' && parsed.data.UNSUBSCRIBE_SECRET.startsWith(
 }
 
 /**
- * The same for the two public origins. Both default to localhost, which is right on a
- * laptop and wrong everywhere else: a production process that forgot them would send
+ * The same for the two public origins. Both are localhost in the example, which is right
+ * on a laptop and wrong everywhere else: a production process that kept them would send
  * every reply with an unsubscribe link pointing at the reader's own machine — and replies
  * are on by default, so nobody could turn them off from the email. RFC 8058 also
  * requires one-click unsubscribe over https. So production requires https for both.
  */
 if (base.NODE_ENV === 'production') {
-  const plain = (['NOTIFICATION_PUBLIC_URL', 'PUBLIC_APP_URL'] as const).filter((name) => new URL(parsed.data[name]).protocol !== 'https:');
+  const protocols = {
+    NOTIFICATION_PUBLIC_URL: new URL(parsed.data.NOTIFICATION_PUBLIC_URL).protocol,
+    APP_URL_TEMPLATE: parsed.data.APP_URL_TEMPLATE.protocol,
+  };
+  const plain = (Object.keys(protocols) as Array<keyof typeof protocols>).filter((name) => protocols[name] !== 'https:');
   if (plain.length > 0) {
-    throw new Error(`refusing to start: ${plain.join(' and ')} must be https in production (the defaults point at localhost)`);
+    throw new Error(`refusing to start: ${plain.join(' and ')} must be https in production (the default and the example point at localhost)`);
   }
 }
 

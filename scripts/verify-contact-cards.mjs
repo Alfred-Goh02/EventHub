@@ -10,8 +10,14 @@
  *   - Notification stores the card still SEALED: the row holds no address, and the
  *     verifier opens the stored ciphertext itself and checks Auth's signature, so a
  *     row full of something other than the genuine card fails.
- *   - The publish command queues exactly the users who never had a card, run in its
- *     DOCUMENTED form; a second run queues none.
+ *   - The card names the tenant's subdomain, `tenantSlug`, INSIDE what Auth signed and
+ *     nowhere in the envelope, and the user is marked with the slug it was made under.
+ *     A reply's link opens the host this names, so a copy anyone could edit would be a
+ *     way to move it.
+ *   - The publish command, run in its DOCUMENTED form, queues a card for a user who
+ *     never had one, for one carded before cards named the subdomain, and for one carded
+ *     under a slug the tenant was since renamed from -- each naming the current slug --
+ *     and none for a user whose card already does; a second run queues none.
  *   - The latest card wins by the signed occurredAt: an older genuine card is ignored,
  *     a newer one replaces.
  *   - Forgeries never reach the table and are dead-lettered: signed by the wrong key,
@@ -69,6 +75,8 @@ const DIRECT_EMAIL = `contact-direct-${RUN}@mailcheck.example`;
 const GROUP = `verify-contact-cards-${RUN}`;
 const GROUPS = notificationGroups(GROUP);
 const CANARY = `user_contact_canary_${RUN}`;
+/** Each tenant's subdomain, which its users' cards must name. */
+const SLUGS = { [TENANT]: `contact-${RUN}`, [OTHER]: `contact-other-${RUN}` };
 
 const NOTIFICATION_PORT = 3981;
 const AUTH_PORT = 3982;
@@ -139,12 +147,18 @@ function relayOnce() {
   });
 }
 
-/** The publish command in its DOCUMENTED form, through pnpm, as an operator runs it. */
-function publishCommand() {
+/**
+ * The publish command in its DOCUMENTED form, through pnpm, as an operator runs it, kept
+ * to this run's tenants: a card is signed with this working tree's keys, and the
+ * database is shared with compose, whose Notification cannot open those. The `--` is
+ * passed as the usage line writes it, so a script that did not drop it would read `--`
+ * as a tenant and refuse.
+ */
+function publishCommand(...tenants) {
   return new Promise((done) => {
     execFile(
       process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm',
-      ['--filter', '@eventhub/auth', 'run', 'contact-cards:publish'],
+      ['--filter', '@eventhub/auth', 'run', 'contact-cards:publish', ...(tenants.length > 0 ? ['--', ...tenants] : [])],
       { cwd: ROOT, env: authEnv, shell: process.platform === 'win32', maxBuffer: 16 * 1024 * 1024 },
       (err, stdout, stderr) => done({ code: err ? (err.code ?? 1) : 0, out: `${stdout}${stderr}` }),
     );
@@ -243,12 +257,14 @@ async function main() {
   const auth = start('auth', ['dist/index.js'], authEnv);
   let userId = null;
   let directId = null;
+  let oldCardId = null;
+  let renamedId = null;
 
   try {
     const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
     notification = start('notification', ['dist/index.js'], notificationEnv);
     console.log('  the fixture');
-    for (const [id, slug] of [[TENANT, `contact-${RUN}`], [OTHER, `contact-other-${RUN}`]]) {
+    for (const [id, slug] of Object.entries(SLUGS)) {
       await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [id, `Contact ${RUN}`, slug]);
     }
     const [ready, authUp] = await Promise.all([
@@ -357,19 +373,71 @@ async function main() {
     check(Boolean(stored) && !stored.sealed.toLowerCase().includes(EMAIL.toLowerCase()), 'and holds no address: the row is ciphertext');
     const opened = stored ? await openStored(stored.sealed).catch((err) => ({ error: err.message })) : null;
     check(opened?.email === EMAIL && opened?.tenantId === TENANT && opened?.sub === userId, `opened with Notification's key and verified with Auth's, it is this user's address (${opened?.email ?? opened?.error})`);
+    // The slug a reply's links are built on, inside what Auth signed: the envelope beside
+    // it is plaintext anyone producing to the topic could edit.
+    const markedSlug = (await inTenant(authApp, TENANT, `SELECT "contactSlug" FROM "User" WHERE id = $1`, [userId])).rows[0]?.contactSlug;
+    check(
+      opened?.tenantSlug === SLUGS[TENANT] && markedSlug === SLUGS[TENANT],
+      `and it names the tenant's subdomain, signed with the rest, the slug the user is marked as carded under (${opened?.tenantSlug ?? 'none'} / ${markedSlug ?? 'none'})`,
+    );
+    check(
+      queued.payload.includes(TENANT) && !queued.payload.includes(SLUGS[TENANT]),
+      'which is nowhere in the outbox row outside the seal, where a search finds the tenant id: the envelope carries no slug a producer could rewrite',
+    );
 
     console.log('');
-    console.log('  the publish command covers users who never had a card, once');
+    console.log('  the publish command covers users who never had a card, and cards without their tenant\'s slug, once');
+    /**
+     * Three users the command must reach, and one it must not:
+     *   - one who never had a card;
+     *   - one carded before cards named the tenant's subdomain: published, no slug, as
+     *     every user was when this shipped;
+     *   - one carded under a slug the tenant has since been renamed from;
+     *   - and the user who registered above, whose card already names the current slug.
+     * Written straight to "User" as the app role in each tenant, as a deployment that
+     * predates the column looks.
+     */
     directId = `user_contact_direct_${RUN}`;
+    oldCardId = `user_contact_oldcard_${RUN}`;
+    renamedId = `user_contact_renamed_${RUN}`;
     await inTenant(authApp, TENANT, `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt") VALUES ($1, $2, $3, 'not-a-hash', now())`, [directId, TENANT, DIRECT_EMAIL]);
-    const firstRun = await publishCommand();
-    const firstQueued = Number(firstRun.out.match(/contact cards queued: (\d+)/)?.[1] ?? -1);
-    const directRows = (await relayDb.query(`SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1 AND topic = $2 AND "aggregateId" = $3`, [TENANT, TOPIC, `${TENANT}:${directId}`])).rows[0].n;
-    check(firstRun.code === 0 && firstQueued >= 1 && directRows === 1, `the documented command queued ${firstQueued} card(s), one of them for the user who had none (exit ${firstRun.code})`);
-    const secondRun = await publishCommand();
+    await inTenant(
+      authApp,
+      TENANT,
+      `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt", "contactPublishedAt") VALUES ($1, $2, $3, 'not-a-hash', now(), now())`,
+      [oldCardId, TENANT, `contact-oldcard-${RUN}@mailcheck.example`],
+    );
+    await inTenant(
+      authApp,
+      OTHER,
+      `INSERT INTO "User" (id, "tenantId", email, "passwordHash", "updatedAt", "contactPublishedAt", "contactSlug") VALUES ($1, $2, $3, 'not-a-hash', now(), now(), $4)`,
+      [renamedId, OTHER, `contact-renamed-${RUN}@mailcheck.example`, `contact-before-the-rename-${RUN}`],
+    );
+    const cardsOf = async (tenant, user) =>
+      (await relayDb.query(`SELECT o.payload->>'sealed' AS sealed FROM "OutboxMessage" o WHERE o."tenantId" = $1 AND o.topic = $2 AND o."aggregateId" = $3 ORDER BY o.seq`, [tenant, TOPIC, `${tenant}:${user}`])).rows;
+    const reach = [[TENANT, directId, 'never had a card'], [TENANT, oldCardId, 'carded before cards named the tenant\'s subdomain'], [OTHER, renamedId, 'carded under the slug before a rename']];
+    const firstRun = await publishCommand(TENANT, OTHER);
+    const firstQueued = Number(firstRun.out.match(/contact cards queued: (\d+), across (\d+) tenant/)?.[1] ?? -1);
+    const across = Number(firstRun.out.match(/contact cards queued: \d+, across (\d+) tenant/)?.[1] ?? -1);
+    check(
+      firstRun.code === 0 && firstQueued === reach.length && across === 2,
+      `the documented command, given this run's two tenants, queued ${firstQueued} card(s) across ${across} tenant(s) (exit ${firstRun.code})`,
+    );
+    for (const [tenant, user, what] of reach) {
+      const cards = await cardsOf(tenant, user);
+      const claims = cards.length === 1 ? await openStored(cards[0].sealed).catch(() => null) : null;
+      const marked = (await inTenant(authApp, tenant, `SELECT "contactSlug" FROM "User" WHERE id = $1`, [user])).rows[0]?.contactSlug;
+      check(
+        cards.length === 1 && claims?.tenantSlug === SLUGS[tenant] && marked === SLUGS[tenant],
+        `one for the user who ${what}, naming the tenant's current subdomain, signed (${cards.length} card(s), ${claims?.tenantSlug ?? 'no slug'}, marked ${marked ?? 'nothing'})`,
+      );
+    }
+    const upToDate = (await cardsOf(TENANT, userId)).length;
+    check(upToDate === 1, `and none again for the user whose card already names it (${upToDate} card(s), the one from /register)`);
+    const secondRun = await publishCommand(TENANT, OTHER);
     const secondQueued = Number(secondRun.out.match(/contact cards queued: (\d+)/)?.[1] ?? -1);
-    const directAgain = (await relayDb.query(`SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1 AND topic = $2 AND "aggregateId" = $3`, [TENANT, TOPIC, `${TENANT}:${directId}`])).rows[0].n;
-    check(secondRun.code === 0 && secondQueued === 0 && directAgain === 1, `run again, it queues nothing (${secondQueued} queued, still ${directAgain} row for that user)`);
+    const again = await Promise.all(reach.map(([tenant, user]) => cardsOf(tenant, user).then((c) => c.length)));
+    check(secondRun.code === 0 && secondQueued === 0 && again.every((n) => n === 1), `run again, it queues nothing (${secondQueued} queued, still ${again.join(', ')} row(s) for those users)`);
 
     console.log('');
     console.log('  the latest card wins, by the occurredAt Auth signed');
@@ -447,8 +515,9 @@ async function main() {
      * run's cards stay on it for good, and every Notification that ever reads it from
      * the start copies cards for tenants that no longer exist.
      */
-    const keys = [CANARY, userId, directId, `user_contact_forged_${RUN}`].filter(Boolean).map((u) => `${TENANT}:${u}`);
+    const keys = [CANARY, userId, directId, oldCardId, `user_contact_forged_${RUN}`].filter(Boolean).map((u) => `${TENANT}:${u}`);
     keys.push(`${OTHER}:user_contact_forged_${RUN}`);
+    if (renamedId) keys.push(`${OTHER}:${renamedId}`);
     const tombstoned = await producer
       .send({ topic: TOPIC, messages: keys.map((k) => ({ key: k, value: null })) })
       .then(() => keys.length, () => 0);

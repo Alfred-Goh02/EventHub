@@ -12,6 +12,13 @@
  * EACH PROPERTY, AND WHAT WOULD LOOK THE SAME WITHOUT IT:
  *   - One email, whose link registers the invitee, who can then sign in. Read out of
  *     the inbox: a dev-sink token would pass with a broken link in the email.
+ *   - The link opens on the inviting tenant's own subdomain, and an invitation from a
+ *     second tenant on that one's: /register returns no tenant, so the page has to be
+ *     on the right host already to sign the new user in. The token works from any
+ *     host, so every link on the old shared localhost:3000 registered, and passed.
+ *   - A tenant whose slug the gateway would not route -- a reserved name, a capital and
+ *     a dot -- gets no invitation at all: no row, no email queued, no link made. Put in
+ *     raw, its link would open a host Kong refuses.
  *   - The token, the link and the address are nowhere in clear in Auth's outbox row or
  *     in the bytes on the topic. Each search is shown to find what IS there -- the
  *     invite's id -- so an empty search cannot pass for a clean one.
@@ -59,7 +66,7 @@
  * end of the topic before it starts, and an expired canary is sent to EVERY partition
  * and counted before anything real is sent.
  *
- * Scoped to three tenants, consumer groups and addresses made for this run. The Auth
+ * Scoped to five tenants, consumer groups and addresses made for this run. The Auth
  * rows, the inbox messages, the groups and the contact cards registration published are
  * removed at the end. The settled sent-log and suppression rows are KEPT: the run's
  * sealed requests stay deliverable on the topic for an hour, and a Notification started
@@ -117,6 +124,16 @@ const BUDGET_TENANT = `tenant_invitebudget_${RUN}`;
 const OTHER_TENANT = `tenant_inviteother_${RUN}`;
 const TENANTS = [TENANT, BUDGET_TENANT, OTHER_TENANT];
 const slugOf = (tenant) => tenant.replace(/_/g, '-');
+/**
+ * Tenants whose slug, as the database holds it, is not one the gateway would route: a
+ * reserved name, and a label with a capital and a dot. Nothing stops such a row being
+ * written, and Auth builds an invitation's link from the row. Fixed names in the first:
+ * there are only nine reserved ones, so a run first removes any this file left behind.
+ */
+const ODD = [
+  { tenant: `tenant_inviteodd_${RUN}`, slug: 'status', what: 'a reserved name' },
+  { tenant: `tenant_inviteshape_${RUN}`, slug: `Odd.${RUN}`, what: 'a capital and a dot' },
+];
 const ADMIN_ID = `user_inviteadmin_${RUN}`;
 const at = (name) => `${name}-${RUN}@mailcheck.example`;
 /** A Gmail local part, so dots can be shown to count for nothing there. Only ever delivered to Mailpit. */
@@ -129,6 +146,8 @@ const longAddress = (length) => {
 };
 const A = {
   invitee: at('invitee'),
+  elsewhere: at('elsewhere'),
+  odd: at('oddslug'),
   reinvitee: at('reinvitee'),
   race: at('race'),
   revokee: at('revokee'),
@@ -522,6 +541,12 @@ async function main() {
     for (const tenant of TENANTS) {
       await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Invitations ${tenant}`, slugOf(tenant)]);
     }
+    // An earlier run killed before its cleanup leaves its reserved-name tenant, which
+    // would make this insert fail on the unique slug. Only this file's own, by its prefix.
+    await authApp.query(`DELETE FROM "Tenant" WHERE slug = ANY($1::text[]) AND id LIKE 'tenant_inviteodd_%'`, [ODD.map((o) => o.slug)]);
+    for (const { tenant, slug } of ODD) {
+      await authApp.query(`INSERT INTO "Tenant" (id, name, slug, "updatedAt") VALUES ($1, $2, $3, now())`, [tenant, `Invitations ${tenant}`, slug]);
+    }
     // The scans read only what this run writes.
     await commitAtEnd(admin, SCAN_TOPIC_GROUP, [TOPIC]);
     await commitAtEnd(admin, SCAN_DLQ_GROUP, [DLQ]);
@@ -659,8 +684,17 @@ async function main() {
       /also emailed/.test(first.sinkMessage) && !/would be emailed/.test(first.sinkMessage),
       `the dev sink's own line says the link is also emailed, not that it would be ("${first.sinkMessage}")`,
     );
-    const told = [['the tenant id', TENANT], ['the tenant slug', slugOf(TENANT)], ['the inviting admin', ADMIN_ID], ['the invite id', first.inviteId]].filter(([, s]) => `${email1?.Text}\n${email1?.HTML}`.includes(s));
-    check(told.length === 0, told.length === 0 ? 'and nothing the invitee did not need: no tenant, no inviter, no internal id' : `it also tells the reader ${told.map(([n]) => n).join(', ')}`);
+    // Outside the link, whose host IS the tenant's subdomain now: that is where the
+    // invitee must land, so the slug there is needed, and anywhere else it is not.
+    const prose = `${email1?.Text}\n${email1?.HTML}`.split(first.link ?? '\u0000').join('');
+    const told = [['the tenant id', TENANT], ['the tenant slug', slugOf(TENANT)], ['the inviting admin', ADMIN_ID], ['the invite id', first.inviteId]].filter(([, s]) => prose.includes(s));
+    check(prose.includes('as an attendee'), 'CONTROL: what is left with the link taken out is the rest of the email');
+    check(told.length === 0, told.length === 0 ? 'and nothing the invitee did not need: no tenant, no inviter, no internal id, outside the link' : `it also tells the reader ${told.map(([n]) => n).join(', ')}`);
+    const origin1 = textLink ? new URL(textLink).origin : null;
+    check(
+      origin1 === `http://${slugOf(TENANT)}.eventhub.localhost:5173`,
+      `the link opens on the inviting tenant's own subdomain, where /register's new user can be signed in (${origin1 ?? 'no link'})`,
+    );
     check(header(headers1, 'X-EventHub-Message-Id')?.[0] === row.id, 'CONTROL: its headers were read: X-EventHub-Message-Id is the outbox message id');
     check(!header(headers1, 'List-Unsubscribe') && !header(headers1, 'List-Unsubscribe-Post'), 'it carries no List-Unsubscribe: an invitation is not a subscription');
     const [delivery1] = await deliveriesOf(TENANT, [row.id]);
@@ -678,6 +712,27 @@ async function main() {
     check(login1.status === 200, `and the new user signs in (${login1.status})`);
     const again1 = await register(textLink);
     check(again1.status === 400, `the same link a second time is refused (${again1.status})`);
+
+    console.log('');
+    console.log("  an invitation in another tenant opens on that tenant's subdomain");
+    // The same template and the same Auth: only the inviting admin's tenant differs, so
+    // a host that did not follow the tenant would be the same host twice.
+    const elsewhere = await invite(OTHER_TENANT, A.elsewhere);
+    const pubElsewhere = await published([elsewhere.row?.id].filter(Boolean));
+    const mailElsewhere = await mailTo(A.elsewhere, 1);
+    const linkElsewhere = inviteLinkIn((await messageById(mailElsewhere.messages[0]?.ID))?.Text);
+    check(
+      elsewhere.status === 201 && pubElsewhere.ok && mailElsewhere.count === 1 && linkElsewhere === elsewhere.link,
+      `CONTROL: one email, carrying the link Auth issued (${elsewhere.status}, ${mailElsewhere.count} email)`,
+    );
+    const originElsewhere = linkElsewhere ? new URL(linkElsewhere).origin : null;
+    check(
+      originElsewhere === `http://${slugOf(OTHER_TENANT)}.eventhub.localhost:5173` && originElsewhere !== origin1,
+      `it opens ${originElsewhere ?? 'nothing'}, not ${origin1}`,
+    );
+    const regElsewhere = await register(linkElsewhere);
+    const loginElsewhere = await authCall('/login', { email: A.elsewhere, password: PASSWORD }, { 'X-Tenant-Slug': slugOf(OTHER_TENANT) });
+    check(regElsewhere.status === 201 && loginElsewhere.status === 200, `and the user it registers signs in on that subdomain (${regElsewhere.status}, ${loginElsewhere.status})`);
 
     // ---------------------------------------------------------------------------------
     console.log('');
@@ -938,6 +993,37 @@ async function main() {
     check((await inviteRows(TENANT, A.notAdmin)).length === 0 && (await outboxCount()) === outboxBefore, 'and writes no invitation and queues no email');
 
     console.log('');
+    console.log("  a tenant whose slug the gateway would not route gets no link on it, and so no invitation");
+    /**
+     * Its admin's token is genuine and its slug matches the header, so everything up to
+     * the link is as for any tenant; the slug is the one thing wrong. Substituted raw, it
+     * would make status.eventhub.localhost, which Kong refuses, or a host with a dot in
+     * the label. The control is every invitation above, made by the same route.
+     */
+    for (const { tenant, slug, what } of ODD) {
+      const token = await new SignJWT({ tenantId: tenant, tenantSlug: slug, role: 'ADMIN' })
+        .setProtectedHeader({ alg: 'RS256' })
+        .setSubject(ADMIN_ID)
+        .setIssuer(authEnv.JWT_ISSUER)
+        .setAudience(authEnv.JWT_AUDIENCE)
+        .setIssuedAt()
+        .setExpirationTime(Math.floor(Date.now() / 1000) + 3 * 3600)
+        .sign(authSigning);
+      const queuedFor = async () => (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" o WHERE o."tenantId" = $1', [tenant])).rows[0].n;
+      const res = await authCall('/invites', { email: A.odd, role: 'ATTENDEE' }, { Authorization: `Bearer ${token}`, 'X-Tenant-Slug': slug });
+      const made = (await inviteRows(tenant, A.odd)).length;
+      const linked = auth.log().split(/\r?\n/).some((l) => json(l)?.devOnlyResetUrl && json(l)?.tenantId === tenant);
+      check(
+        res.status === 500 && made === 0 && (await queuedFor()) === 0 && !linked,
+        `${what} (${slug}): refused, with no invitation, no email queued and no link made (${res.status}, ${made} invitation(s))`,
+      );
+    }
+    check(
+      auth.log().split(/\r?\n/).filter((l) => /invitation refused: the tenant has no subdomain/.test(l)).length === ODD.length,
+      "and Auth's log says why, once for each",
+    );
+
+    console.log('');
     console.log('  an address longer than SMTP can carry is refused');
     check(A.long254.length === 254 && A.long255.length === 255, `CONTROL: the two addresses are ${A.long254.length} and ${A.long255.length} characters`);
     const tooLong = await invite(OTHER_TENANT, A.long255);
@@ -1040,7 +1126,15 @@ async function main() {
       }
       deleted += (await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
     }
-    const left = { outbox: 0, invites: 0, pending: 0, inbox: 0 };
+    // The tenants no link could be made for: nothing should have been written under them
+    // but themselves, and that is asserted, not assumed.
+    for (const { tenant } of ODD) {
+      deleted += (await relayDb.query('DELETE FROM "OutboxMessage" WHERE "tenantId" = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+      deleted += (await authApp.query('DELETE FROM "Invite" WHERE "tenantId" = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+      deleted += (await authApp.query('DELETE FROM "Tenant" WHERE id = $1', [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+    }
+    const left = { outbox: 0, invites: 0, pending: 0, inbox: 0, oddTenants: 0 };
+    left.oddTenants = (await authApp.query('SELECT count(*)::int AS n FROM "Tenant" WHERE id = ANY($1::text[])', [ODD.map((o) => o.tenant)])).rows[0].n;
     for (const tenant of TENANTS) {
       left.outbox += (await relayDb.query('SELECT count(*)::int AS n FROM "OutboxMessage" WHERE "tenantId" = $1', [tenant])).rows[0].n;
       left.invites += (await authApp.query('SELECT count(*)::int AS n FROM "Invite" WHERE "tenantId" = $1', [tenant])).rows[0].n;

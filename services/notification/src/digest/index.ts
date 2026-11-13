@@ -35,6 +35,7 @@ export function createDigestFlusher(
     recipientFailures: 0,
     busyElsewhere: 0,
     digestsSent: 0,
+    withoutLinks: 0,
     itemsSettled: 0,
     droppedOptedOut: 0,
     droppedNoAddress: 0,
@@ -49,6 +50,7 @@ export function createDigestFlusher(
     try {
       const r = await flushOnce(pool, opts, { batchSize: opts.batchSize, stopping: () => stopping });
       counters.digestsSent += r.digestsSent;
+      counters.withoutLinks += r.withoutLinks;
       counters.itemsSettled += r.itemsSettled;
       counters.droppedOptedOut += r.droppedOptedOut;
       counters.droppedNoAddress += r.droppedNoAddress;
@@ -84,6 +86,8 @@ export function createDigestFlusher(
         failuresTotal: counters.failures,
         recipientFailuresTotal: counters.recipientFailures,
         digestsSentTotal: counters.digestsSent,
+        /** Digests built with no links: the recipient's card names no subdomain the gateway routes. */
+        withoutLinksTotal: counters.withoutLinks,
         itemsSettledTotal: counters.itemsSettled,
         droppedOptedOutTotal: counters.droppedOptedOut,
         droppedNoAddressTotal: counters.droppedNoAddress,

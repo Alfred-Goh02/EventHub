@@ -9,8 +9,17 @@
  *     that never saw it would produce.
  *   - The email carries List-Unsubscribe and List-Unsubscribe-Post, and the token in it
  *     is signed for THIS tenant, user and category — checked here with the secret, not
- *     just found. The body links to the post at the WEB APP's origin, which is set to
- *     one only this run uses, so a link built from any other origin fails.
+ *     just found.
+ *   - The body links to the post on the RECIPIENT'S TENANT'S OWN SUBDOMAIN: the
+ *     example's APP_URL_TEMPLATE filled with the slug Auth signed into their contact
+ *     card. Two tenants, each with a slug only this run uses, and each recipient's link
+ *     must open exactly their own tenant's host, so a link on one shared host -- what
+ *     PUBLIC_APP_URL was -- or on the other tenant's fails. The unsubscribe link must
+ *     NOT follow: it stays on NOTIFICATION_PUBLIC_URL, one host for both tenants.
+ *   - A card with no slug, from before cards carried one, and cards whose signed slug
+ *     the gateway would not route -- a reserved name, a capital and a dot, a slash --
+ *     each get the email WITHOUT the post link, and the counter that says so moves. No
+ *     link anywhere in such an email opens a host made from the slug.
  *   - The reply's words are someone else's text: markup in them arrives escaped, in
  *     both parts, and only an excerpt is quoted in either. The fixture puts an emoji
  *     across the excerpt's cut, so a cut by UTF-16 unit, which splits it, is visible.
@@ -64,8 +73,8 @@
  * default says, and a canary on this run's key proves it is reading the partition every
  * later message lands on before anything real is sent.
  *
- * Scoped to a tenant created for this run; its rows, inbox messages and consumer groups
- * are removed at the end, and what was deleted is reported. Every SELECT this revokes is
+ * Scoped to two tenants created for this run; their rows, inbox messages and consumer
+ * groups are removed at the end, and what was deleted is reported. Every SELECT this revokes is
  * granted back in the same run, and granted again at the start in case a run was killed
  * holding one.
  *
@@ -96,12 +105,18 @@ const DLQ = 'notification.dlq';
 const MAILPIT = process.env['MAILPIT_URL'] ?? 'http://127.0.0.1:8025';
 const RUN = randomBytes(4).toString('hex');
 const TENANT = `tenant_replies_${RUN}`;
+/** A second tenant, so a post link that does not follow the recipient's tenant shows. */
+const TENANT2 = `tenant_replies_other_${RUN}`;
+const TENANTS = [TENANT, TENANT2];
+/** Each tenant's subdomain, as Auth signs it into a card: slugs only this run uses. */
+const SLUG = `replies-${RUN}`;
+const SLUG2 = `replies-other-${RUN}`;
+/** The host each recipient's post link must open: the example's template, filled. */
+const hostOf = (slug) => `${slug}.eventhub.localhost:5173`;
 const SPACE = `space_replies_${RUN}`;
 const GROUP = `verify-reply-emails-${RUN}`;
 const GROUPS = notificationGroups(GROUP);
 const PORT = 3985;
-/** An origin only this run uses, so the post link's origin is checked, not just its path. */
-const APP_URL = `https://app-${RUN}.replies.example`;
 /** Short, so a retried reply comes back within the run. */
 const DELAYS_MS = [3000, 3000, 3000];
 /** Forty-five minutes: a limit no other setting shares, so a limit wired to another would show. */
@@ -128,6 +143,15 @@ const L2 = who('stuckretry');
 const W = who('resetter');
 const W2 = who('resetretry');
 const Y = who('recent');
+/** In the second tenant, with that tenant's slug on the card. */
+const R2 = { ...who('othertenant'), tenant: TENANT2 };
+/** Cards that name no subdomain a link can open: none at all, as before cards carried one, and three the gateway would not route. */
+const NS = who('noslug');
+const BAD = [
+  [who('reservedslug'), 'www'],
+  [who('shapedslug'), 'Evil.Example'],
+  [who('pathslug'), 'evil.example/x'],
+];
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
@@ -139,7 +163,7 @@ const notificationEnv = serviceEnv(ROOT, 'notification', {
   NODE_OPTIONS: `--import=${pathToFileURL(join(ROOT, 'scripts', 'lib', 'skewed-clock.mjs')).href}`,
   // The link in the email points at THIS instance, so the loop below can follow it.
   NOTIFICATION_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
-  PUBLIC_APP_URL: APP_URL,
+  // APP_URL_TEMPLATE is the example's: the post links below must open its hosts.
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
 });
 // DISPATCH_START_FROM stays .env.example's `earliest`, and COMMUNITY_START_FROM is left
@@ -198,6 +222,10 @@ const headersOf = async (id) => {
   return res.ok ? res.json() : {};
 };
 const kafkaHeaders = (m) => Object.fromEntries(Object.entries(m.headers ?? {}).map(([k, v]) => [k, v?.toString()]));
+/** The post link on its own line in an email's text, whole, or null. */
+const postLinkIn = (text) => text?.match(/^(https?:\/\/\S*\/posts\/\S+?)\r?$/m)?.[1] ?? null;
+/** Every URL in both parts of an email. */
+const urlsIn = (mail) => [...`${mail?.Text ?? ''}\n${mail?.HTML ?? ''}`.matchAll(/https?:\/\/[^\s"<>]+/g)].map((m) => m[0]);
 
 /** The claims in an unsubscribe token, if the service's secret signed it. */
 function verifyToken(token) {
@@ -255,11 +283,16 @@ async function main() {
   const seal = async (jws) =>
     new CompactEncrypt(new TextEncoder().encode(jws)).setProtectedHeader({ alg: 'RSA-OAEP-256', enc: 'A256GCM', cty: 'JWT', kid }).encrypt(notificationPublic);
 
-  /** A card as Auth seals one and the contact consumer stores it: the sealed string, its message id and its instant. */
-  async function storeCard(user, sealedOverride) {
+  /**
+   * A card as Auth seals one and the contact consumer stores it: the sealed string, its
+   * message id and its instant. The tenant's slug is signed in with the rest, as Auth
+   * signs it, unless `slug` is null: a card from before cards carried one.
+   */
+  async function storeCard(user, sealedOverride, { slug = user.tenant === TENANT2 ? SLUG2 : SLUG } = {}) {
+    const tenant = user.tenant ?? TENANT;
     const messageId = randomUUID();
     const occurredAt = '2026-09-26T00:00:00.000Z';
-    const signed = await new SignJWT({ tenantId: TENANT, email: user.email, occurredAt })
+    const signed = await new SignJWT({ tenantId: tenant, email: user.email, occurredAt, ...(slug === null ? {} : { tenantSlug: slug }) })
       .setProtectedHeader({ alg: 'RS256', typ: 'auth-contact+jwt' })
       .setSubject(user.id)
       .setJti(messageId)
@@ -270,9 +303,9 @@ async function main() {
     const sealed = sealedOverride ?? (await seal(signed));
     await inTenant(
       owner,
-      TENANT,
+      tenant,
       `INSERT INTO "ContactCard" ("tenantId", "userId", sealed, "messageId", "occurredAt") VALUES ($1, $2, $3, $4, ($5::timestamptz AT TIME ZONE 'UTC'))`,
-      [TENANT, user.id, sealed, messageId, occurredAt],
+      [tenant, user.id, sealed, messageId, occurredAt],
     );
   }
 
@@ -393,13 +426,15 @@ async function main() {
       [TENANT, messageId],
     )).rows;
 
-  const everyone = [ACTOR, R, U, O, N, S, T, E, K, X, C, V, P, L, L2, W, W2, Y];
+  const everyone = [ACTOR, R, U, O, N, S, T, E, K, X, C, V, P, L, L2, W, W2, Y, R2, NS, ...BAD.map(([u]) => u)];
   let service = null;
   let log = '';
 
   try {
     console.log('  the fixture, before the service starts');
-    for (const user of [R, U, O, S, T, E, K, C, V, P, L, L2, Y]) await storeCard(user);
+    for (const user of [R, U, O, S, T, E, K, C, V, P, L, L2, Y, R2]) await storeCard(user);
+    await storeCard(NS, undefined, { slug: null });
+    for (const [user, slug] of BAD) await storeCard(user, undefined, { slug });
     // Sealed to nobody: a card that was stored and no longer opens.
     await storeCard(X, 'not-a-jwe');
     await inTenant(owner, TENANT, `INSERT INTO "NotificationPreference" ("tenantId", "userId", category, channel, enabled) VALUES ($1, $2, 'COMMUNITY_REPLY', 'EMAIL', false)`, [TENANT, O.id]);
@@ -485,14 +520,21 @@ async function main() {
       claims?.t === TENANT && claims?.u === R.id && claims?.c === 'COMMUNITY_REPLY',
       "and the token in it is signed with the service's secret, for this tenant, this user and replies only",
     );
-    const postUrl = `${APP_URL}/posts/${encodeURIComponent(reply.postId)}`;
+    const postUrl = `http://${hostOf(SLUG)}/posts/${encodeURIComponent(reply.postId)}`;
     check(
       Boolean(mail) && mail.Text.includes(unsubscribeUrl) && mail.HTML.includes(`href="${unsubscribeUrl}"`),
       'both parts carry the same unsubscribe link, where the reader can see it',
     );
+    // The post link on its own line, whole, compared with ===: a link with something
+    // appended still contains the real one.
+    const postLink = postLinkIn(mail?.Text);
     check(
-      Boolean(mail) && mail.Text.includes(postUrl) && mail.HTML.includes(`href="${postUrl}"`),
-      `and link to the post on the web app's origin (${APP_URL})`,
+      postLink === postUrl && Boolean(mail) && mail.HTML.includes(`href="${postUrl}"`),
+      `and link to the post on the recipient's tenant's own subdomain, in both parts (${postLink ? new URL(postLink).host : 'no post link'})`,
+    );
+    check(
+      Boolean(unsubscribeUrl) && new URL(unsubscribeUrl).origin === notificationEnv.NOTIFICATION_PUBLIC_URL,
+      `while the unsubscribe link stays on NOTIFICATION_PUBLIC_URL, the one host for every tenant (${unsubscribeUrl ? new URL(unsubscribeUrl).host : 'none'})`,
     );
 
     const again = await produceAndWait(reply, 'dispatch.duplicatesSkippedTotal');
@@ -504,6 +546,56 @@ async function main() {
     const second = await waitFor(async () => ((await inbox(R.email)).length === 2 ? true : null), 45_000);
     const subjects = (await inbox(R.email)).map((m) => m.Subject).sort();
     check(Boolean(second) && subjects.includes('Someone commented on your post'), `a top-level comment says so (${subjects.join(' / ')})`);
+
+    console.log('');
+    console.log("  in another tenant the post link follows the recipient's tenant, and the unsubscribe link does not");
+    const elsewhere = activity({ tenantId: TENANT2, recipientId: R2.id, body: 'in the other tenant' });
+    await produce(elsewhere);
+    const otherMail = await waitFor(async () => {
+      const m = await inbox(R2.email);
+      return m.length >= 1 ? m : null;
+    }, 45_000);
+    const om = otherMail?.[0] ? await message(otherMail[0].ID) : null;
+    const otherPost = postLinkIn(om?.Text);
+    check(
+      otherMail?.length === 1 && otherPost === `http://${hostOf(SLUG2)}/posts/${encodeURIComponent(elsewhere.postId)}`,
+      `one email, whose post link opens ${otherPost ? new URL(otherPost).host : 'nothing'}, not ${hostOf(SLUG)}`,
+    );
+    const otherUnsubscribe = ((otherMail?.[0] ? await headersOf(otherMail[0].ID) : {})['List-Unsubscribe']?.[0] ?? '').match(/^<(.+)>$/)?.[1] ?? '';
+    check(
+      Boolean(otherUnsubscribe) &&
+        new URL(otherUnsubscribe).origin === new URL(unsubscribeUrl).origin &&
+        verifyToken(new URL(otherUnsubscribe).searchParams.get('token') ?? '')?.t === TENANT2,
+      `its unsubscribe link is on the same host as the first tenant's, signed for this tenant (${otherUnsubscribe ? new URL(otherUnsubscribe).host : 'none'})`,
+    );
+
+    console.log('');
+    console.log('  a card that names no subdomain the gateway routes: the email goes, without the post link');
+    /**
+     * A card from before cards carried the slug, and three whose signed slug Kong would
+     * refuse. Each reply is still news, and its unsubscribe link still works; only the
+     * post link needs the slug, so only the post link is left out. Put into the template
+     * raw, each of these would make a host -- null.eventhub..., www.eventhub...,
+     * evil.example.eventhub..., evil.example -- which is what the host check reads for.
+     */
+    const unsubscribeHost = new URL(notificationEnv.NOTIFICATION_PUBLIC_URL).host;
+    for (const [user, slug] of [[NS, null], ...BAD]) {
+      const before = (await metrics()).replies.withoutLinkTotal;
+      await produce(activity({ recipientId: user.id, body: `to a card with ${slug ?? 'no slug'}` }));
+      const got = await waitFor(async () => ((await inbox(user.email)).length === 1 ? (await inbox(user.email))[0] : null), 45_000);
+      const m = got ? await message(got.ID) : null;
+      const after = (await metrics()).replies.withoutLinkTotal;
+      const hosts = [...new Set(urlsIn(m).map((u) => new URL(u).host))];
+      check(
+        Boolean(m) &&
+          after === before + 1 &&
+          !urlsIn(m).some((u) => u.includes('/posts/')) &&
+          hosts.length === 1 && hosts[0] === unsubscribeHost &&
+          /Sign in to EventHub to read the conversation/.test(m.Text) && m.HTML.includes('Sign in to EventHub to read the conversation'),
+        `${slug === null ? 'no slug on the card' : `the signed slug ${JSON.stringify(slug)}`}: one email, no post link, the only host in it the unsubscribe one ` +
+          `(${hosts.join(', ') || 'no link'}), and counted (withoutLinkTotal ${before} -> ${after})`,
+      );
+    }
 
     console.log('');
     console.log('  and nobody it should not');
@@ -777,11 +869,14 @@ async function main() {
     service?.kill();
     for (const table of OUTAGE_TABLES) await grantBack(table).catch((err) => check(false, `could not grant SELECT on ${table} back: ${err.message}`));
     let removed = 0;
-    for (const table of ['NotificationDelivery', 'ContactCard', 'NotificationPreference', 'EmailSuppression']) {
-      removed += (await inTenant(owner, TENANT, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [TENANT]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+    let left = 0;
+    for (const tenant of TENANTS) {
+      for (const table of ['NotificationDelivery', 'ContactCard', 'NotificationPreference', 'EmailSuppression']) {
+        removed += (await inTenant(owner, tenant, `DELETE FROM "${table}" WHERE "tenantId" = $1`, [tenant]).catch(() => ({ rowCount: 0 }))).rowCount ?? 0;
+      }
+      left += Number((await inTenant(owner, tenant, `SELECT (SELECT count(*) FROM "NotificationDelivery" WHERE "tenantId" = $1) + (SELECT count(*) FROM "ContactCard" WHERE "tenantId" = $1)
+         + (SELECT count(*) FROM "NotificationPreference" WHERE "tenantId" = $1) + (SELECT count(*) FROM "EmailSuppression" WHERE "tenantId" = $1) AS n`, [tenant])).rows[0].n);
     }
-    const left = (await inTenant(owner, TENANT, `SELECT (SELECT count(*) FROM "NotificationDelivery" WHERE "tenantId" = $1) + (SELECT count(*) FROM "ContactCard" WHERE "tenantId" = $1)
-       + (SELECT count(*) FROM "NotificationPreference" WHERE "tenantId" = $1) + (SELECT count(*) FROM "EmailSuppression" WHERE "tenantId" = $1) AS n`, [TENANT])).rows[0].n;
     const ids = [];
     for (const user of everyone) ids.push(...(await inbox(user.email).catch(() => [])).map((m) => m.ID));
     if (ids.length > 0) {
