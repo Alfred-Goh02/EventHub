@@ -15,8 +15,15 @@ import { randomBytes } from 'node:crypto';
  *
  * Base36 milliseconds, padded to a fixed width so the prefixes compare correctly as
  * strings, then random bytes for uniqueness within a millisecond.
+ *
+ * THE MILLISECONDS ARE THE DATABASE'S, passed in by the caller: the same now() the
+ * row's createdAt is stamped from, in the same transaction. They were `Date.now()`,
+ * this process's clock, so a thread's order was whatever each replica believed the
+ * time was. Measured with one replica an hour fast and one not: a reply written first
+ * sorted last, under createdAt values that said the opposite.
  */
-export function sortableId(): string {
-  const at = Date.now().toString(36).padStart(9, '0');
+export function sortableId(atMs: number): string {
+  if (!Number.isSafeInteger(atMs) || atMs < 0) throw new Error(`not a time in milliseconds: ${atMs}`);
+  const at = atMs.toString(36).padStart(9, '0');
   return `c${at}${randomBytes(8).toString('hex')}`;
 }

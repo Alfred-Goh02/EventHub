@@ -43,6 +43,29 @@ export async function withTenant<T>(
 }
 
 /**
+ * The database's clock, plus `plusMs`, read on the client or transaction given.
+ *
+ * For every expiry this service writes: a reset token's and a refresh token's. Each is
+ * judged against now() in SQL -- by the lookups and by the guarded claims that spend
+ * them -- so it is stamped on the clock it is judged by. `new Date(Date.now() + ttl)`
+ * was this process's clock instead: measured with Auth an hour fast, a thirty-minute
+ * reset link was stored to expire 5400 s after the database's now(), and a link the
+ * database said had thirty minutes left was refused as expired. See "Timestamps come
+ * from the database" in CLAUDE.md.
+ *
+ * Read and passed, rather than written into the statement, because Prisma has no way
+ * to put an expression in `data` -- the same reason Ticketing's databaseNow gives.
+ * An invitation's expiry is read the same way, in invites.ts.
+ */
+export async function databaseNow(client: Prisma.TransactionClient, plusMs = 0): Promise<Date> {
+  const rows = await client.$queryRaw<Array<{ at: Date }>>`
+    SELECT now() + (${plusMs}::bigint * interval '1 millisecond') AS at`;
+  const at = rows[0]?.at;
+  if (!(at instanceof Date)) throw new Error('the database returned no time to stamp an expiry with');
+  return at;
+}
+
+/**
  * Refuses to start if the runtime role can bypass row-level security.
  *
  * Ticketing and the relay have asserted this since they were built; auth did

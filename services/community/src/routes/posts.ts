@@ -235,11 +235,22 @@ export function postRoutes(
     const allowed = await reach(tenantId, spaceId, userId, 'write');
     if (allowed.status !== 200) return res.status(allowed.status).json({ error: allowed.error ?? 'not found' });
 
-    const commentId = sortableId();
     const parentId = parsed.data.parentId ?? null;
+    let commentId = '';
 
     try {
       await withTenant(tenantId, async (tx) => {
+        /**
+         * ONE TIMESTAMP, USED TWICE, as the post's is: the id's time prefix, which
+         * orders siblings in the thread, and the row's createdAt, which a reader is
+         * shown. Both are this transaction's now(), truncated to the column's
+         * milliseconds, so the order a thread is drawn in and the times it shows
+         * cannot disagree. See ids.ts.
+         */
+        const [stamp] = await tx.$queryRaw<Array<{ ms: bigint }>>`
+          SELECT (extract(epoch FROM date_trunc('milliseconds', now())) * 1000)::bigint AS ms`;
+        if (!stamp) throw new Error('the database returned no time to stamp a comment with');
+        commentId = sortableId(Number(stamp.ms));
         await tx.$executeRaw`
           WITH parent AS (
             /*
@@ -266,7 +277,7 @@ export function postRoutes(
                  ELSE (SELECT path FROM parent) || ${commentId}::ltree END,
             CASE WHEN ${parentId}::text IS NULL THEN 1
                  ELSE (SELECT nlevel(path) FROM parent) + 1 END,
-            ${parsed.data.body}, 'VISIBLE'::"ContentStatus", now())`;
+            ${parsed.data.body}, 'VISIBLE'::"ContentStatus", date_trunc('milliseconds', now()))`;
         await tx.$executeRaw`
           UPDATE "Post"
              SET "commentCount" = "commentCount" + 1,

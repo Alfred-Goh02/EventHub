@@ -1669,6 +1669,17 @@ jobs:
       - name: Assert row stamps and event times are the database's clock, in every service
         run: node scripts/verify-event-times-from-database.mjs
 
+      # What Auth expires, and the order Community shows a thread in, were the app
+      # server's clock: a reset link stamped and judged by Date.now(), refresh tokens the
+      # same, and a comment id whose millisecond prefix the thread sorts by. With Auth an
+      # hour fast, a 30-minute reset lived 90 minutes, and a reply written first sorted
+      # last. And the reset and refresh claims did not re-check expiry, so a token that
+      # ran out between the read and the claim was spent anyway. Runs Auth and one
+      # Community replica an hour fast, compares every value with now() in SQL, and
+      # forces the claim race by holding the row's lock while the token expires.
+      - name: Assert Auth's expiries and Community's thread order are the database's clock
+        run: node scripts/verify-database-clock.mjs
+
       # The buyer's side of it. Nothing answered a buyer after POST /reservations and
       # /pay -- not even after /pay said 202, "being confirmed". Asserts a reservation
       # read through its life (held with a countdown, paid, declined twice showing the
