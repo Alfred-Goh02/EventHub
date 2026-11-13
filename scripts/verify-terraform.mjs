@@ -733,6 +733,14 @@ function budgetChecks(units) {
       missing.length === 0,
       `${u.rel}: aws_budgets_budget.${r.labels[1]} alerts a subscriber at 50, 80 and 100% actual and 100% forecast (${alerts.join(', ') || 'no alerts'})${missing.length ? ` -- missing ${missing.join(', ')}` : ''}`,
     );
+    // Credits netted off -- AWS's default when cost_types is unset -- and a Free Tier
+    // account's spend reads $0 until the credits are gone: the budget never alerts.
+    const ct = blocksOf(r.body, 'cost_types')[0];
+    const credit = ct ? attrOf(ct.body, 'include_credit') : undefined;
+    check(
+      credit === 'false',
+      `${u.rel}: aws_budgets_budget.${r.labels[1]} counts usage before credits (cost_types include_credit = ${credit ?? 'unset, so AWS nets credits off and a credit-funded spend reads $0'})`,
+    );
   }
 }
 
