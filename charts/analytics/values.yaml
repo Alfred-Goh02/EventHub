@@ -1,0 +1,22 @@
+name: analytics
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/analytics
+command: ["node","dist/index.js"]
+port: 3006
+probes:
+  liveness: /health
+  readiness: /ready
+keys: public
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+env: {}

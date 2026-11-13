@@ -74,7 +74,10 @@ function stripComments(src) {
   return out;
 }
 
-/** Every GET route a service registers: app.get('/x' or router.get('/x'. */
+/**
+ * Every GET route a service registers: app.get('/x' or router.get('/x' in Express, and
+ * req.url === '/x' in a bare node:http listener, which is how the relay answers.
+ */
 function routesOf(serviceDir) {
   const routes = new Set();
   const walk = (dir) => {
@@ -84,11 +87,37 @@ function routesOf(serviceDir) {
       } else if (e.name.endsWith('.ts')) {
         const code = stripComments(readFileSync(join(dir, e.name), 'utf8'));
         for (const m of code.matchAll(/\.get\(\s*'([^']+)'/g)) routes.add(m[1]);
+        for (const m of code.matchAll(/req\.url\s*[!=]==\s*'([^']+)'/g)) routes.add(m[1]);
       }
     }
   };
   walk(join(serviceDir, 'src'));
   return routes;
+}
+
+/** Whether a source file starts a listener: Express's app.listen or node:http's createServer. */
+const listens = (file) => /\.listen\(|createServer\(/.test(stripComments(readFileSync(file, 'utf8')));
+
+/**
+ * Every long-running process compose runs from the app image, with what it runs and the
+ * port its healthcheck asks. setup is left out by name: it is a one-shot (migrations,
+ * keys, topics), and on EKS it becomes a Job, not a Deployment.
+ */
+function composeProcesses() {
+  const r = spawnSync('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) return { error: r.stderr.trim() || `docker compose config exited ${r.status}` };
+  const services = JSON.parse(r.stdout).services;
+  const processes = {};
+  for (const [name, s] of Object.entries(services)) {
+    if (!String(s.image ?? '').startsWith('eventhub/app') || name === 'setup') continue;
+    const test = (s.healthcheck?.test ?? []).join(' ');
+    processes[name] = {
+      workingDir: s.working_dir,
+      command: s.command,
+      probePort: Number(/localhost:(\d+)\//.exec(test)?.[1]) || null,
+    };
+  }
+  return { processes };
 }
 
 function helm(args) {
@@ -125,6 +154,9 @@ function main() {
     'CONTROL: comments are stripped before routes are read, and a // inside a string is kept',
   );
 
+  const compose = composeProcesses();
+  check(!compose.error, `CONTROL: compose's own configuration is read${compose.error ? `: ${compose.error}` : ` (${Object.keys(compose.processes).length} long-running process(es) from the app image)`}`);
+
   const drainSrc = readFileSync(join(ROOT, 'packages', 'http', 'src', 'index.ts'), 'utf8');
   const drainMs = Number(/graceMs \?\? ([\d_]+)/.exec(drainSrc)?.[1]?.replace(/_/g, ''));
   check(Number.isFinite(drainMs) && drainMs > 0, `CONTROL: the drain backstop is read from @eventhub/http (${drainMs} ms)`);
@@ -136,6 +168,17 @@ function main() {
   const libraries = charts.filter((c) => /^type:\s*library\s*$/m.test(readFileSync(join(ROOT, 'charts', c, 'Chart.yaml'), 'utf8')));
   const services = charts.filter((c) => !libraries.includes(c));
   check(libraries.includes('eventhub-common') && services.length > 0, `CONTROL: charts read from charts/: library ${libraries.join(', ')}; ${services.length} service chart(s): ${services.join(', ')}`);
+
+  // A process compose runs with no chart would never run on the cluster -- the same gap
+  // verify-compose-starts-every-process.mjs closes for compose -- and a chart with no
+  // process would run something nothing else does.
+  if (compose.processes) {
+    const procs = Object.keys(compose.processes).sort();
+    const noChart = procs.filter((p) => !services.includes(p));
+    const noProcess = services.filter((c) => !procs.includes(c));
+    check(noChart.length === 0, noChart.length === 0 ? `every process compose runs has a chart (${procs.length})` : `compose runs ${noChart.join(', ')}, and no chart does`);
+    check(noProcess.length === 0, noProcess.length === 0 ? 'and every chart is a process compose runs' : `charts/${noProcess.join(', charts/')} run nothing compose does`);
+  }
 
   for (const chart of services) {
     console.log('');
@@ -160,16 +203,32 @@ function main() {
     const source = entry ? join(serviceDir, entry.replace(/^dist\//, 'src/').replace(/\.js$/, '.ts')) : null;
     check(Boolean(source && existsSync(source)), `its command runs a file the service builds (${(c.command ?? []).join(' ')})`);
 
+    const proc = compose.processes?.[chart];
+    if (proc) {
+      check(
+        proc.workingDir === c.workingDir && JSON.stringify(proc.command) === JSON.stringify(c.command),
+        `it runs what compose runs (${c.workingDir}: ${(c.command ?? []).join(' ')})`,
+      );
+    }
+
     const port = c.ports?.[0]?.containerPort;
+    const isService = c.ports?.[0]?.name === 'http';
     const live = c.livenessProbe?.httpGet?.path;
     const ready = c.readinessProbe?.httpGet?.path;
     if (port) {
       const routes = routesOf(serviceDir);
       check(routes.has('/health'), `CONTROL: the route scan of services/${dir}/src finds its /health (${routes.size} GET route(s))`);
-      check(Boolean(live && ready && live !== ready), `liveness and readiness ask different paths (${live}, ${ready})`);
-      check(routes.has(live), `liveness asks ${live}, a route services/${dir} registers`);
-      check(routes.has(ready), `readiness asks ${ready}, a route services/${dir} registers`);
-      check(of('Service').length === 1, 'a Service, since it listens');
+      if (proc) check(proc.probePort === port, `it is probed on ${port}, the port compose's healthcheck asks (${proc.probePort})`);
+      check(Boolean(live) && routes.has(live), `liveness asks ${live}, a route services/${dir} registers`);
+      if (isService) {
+        check(Boolean(ready && ready !== live), `liveness and readiness ask different paths (${live}, ${ready})`);
+        check(of('Service').length === 1, 'a Service, since it serves');
+      }
+      if (ready) check(routes.has(ready), `readiness asks ${ready}, a route services/${dir} registers`);
+    } else {
+      // Nothing to probe is only right for a process that never listens.
+      check(Boolean(source) && !listens(source), `it has no listener to probe, and ${entry} starts none`);
+      if (proc) check(proc.probePort === null, 'and compose has no healthcheck for it either');
     }
 
     const res = c.resources ?? {};
@@ -177,7 +236,7 @@ function main() {
     check(pod.securityContext?.runAsNonRoot === true && c.securityContext?.allowPrivilegeEscalation === false, 'runs as non-root, and cannot escalate');
     const grace = pod.terminationGracePeriodSeconds;
     const preStop = Number(c.lifecycle?.preStop?.exec?.command?.[1] ?? 0);
-    if (port) {
+    if (isService) {
       check(
         c.lifecycle?.preStop?.exec?.command?.[0] === 'sleep' && preStop > 0,
         `it keeps serving ${preStop} s after termination starts, while its endpoint is removed (a rolling restart lost 8 of 690,712 requests without it)`,

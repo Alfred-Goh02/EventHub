@@ -1,0 +1,19 @@
+name: ticketing-reconciler
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 1
+workingDir: /app/services/ticketing
+command: ["node","dist/reconciler/index.js"]
+# A worker with no listener at all: nothing to probe.
+probes: {}
+keys: none
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+terminationGracePeriodSeconds: 30
+env: {}

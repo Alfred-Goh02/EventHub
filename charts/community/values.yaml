@@ -1,0 +1,22 @@
+name: community
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/community
+command: ["node","dist/index.js"]
+port: 3008
+probes:
+  liveness: /health
+  readiness: /ready
+keys: public
+resources:
+  requests:
+    cpu: 50m
+    memory: 160Mi
+  limits:
+    memory: 384Mi
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+env: {}

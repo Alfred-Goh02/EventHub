@@ -1,0 +1,6 @@
+dependencies:
+- name: eventhub-common
+  repository: file://../eventhub-common
+  version: 0.1.0
+digest: sha256:980e13ab0ce69a7ca155fdc574ecd0518957d83aca1ac3b082324253e272c16e
+generated: "2026-11-13T13:35:48.349627+08:00"

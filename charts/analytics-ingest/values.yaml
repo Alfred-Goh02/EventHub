@@ -1,0 +1,22 @@
+name: analytics-ingest
+image:
+  repository: eventhub/app
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 1
+workingDir: /app/services/analytics
+command: ["node","dist/consumer.js"]
+# A worker: no Service, but a probe listener of its own.
+probes:
+  port: 3016
+  liveness: /health
+  readiness: /ready
+keys: none
+resources:
+  requests:
+    cpu: 50m
+    memory: 160Mi
+  limits:
+    memory: 384Mi
+terminationGracePeriodSeconds: 30
+env: {}

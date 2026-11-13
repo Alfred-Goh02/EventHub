@@ -1,0 +1,9 @@
+apiVersion: v2
+name: ticketing-reconciler
+description: "Ticketing's payment reconciler: asks the provider about payments it never answered. Everything it shares with the others is in eventhub-common."
+type: application
+version: 0.1.0
+dependencies:
+  - name: eventhub-common
+    version: 0.1.0
+    repository: file://../eventhub-common
