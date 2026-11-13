@@ -334,6 +334,71 @@ export function postRoutes(
   }));
 
   /**
+   * One post, for the page an emailed link opens.
+   *
+   * Notification's reply and digest emails link to /posts/<postId> on the tenant's web
+   * app, and until this route a post could only be reached through its space's list or
+   * the feed. It refuses what the thread below refuses, in the same order, so a post
+   * and its thread always answer alike:
+   *   - nothing that is not VISIBLE, for anyone, its author included. spaceOfPost runs
+   *     first, so a banned member asking for a hidden post gets the same 404 as
+   *     everyone else rather than a 403 that admits the id is real;
+   *   - a PRIVATE space the caller is not in is 404, never 403;
+   *   - a member banned from the space is 403.
+   *
+   * canReply IS reach(..., 'write'), not a second reading of the membership, so the page
+   * offers a reply box exactly when POST /posts/:postId/comments would take the reply.
+   *
+   * THE READ ASKS FOR VISIBLE AGAIN. spaceOfPost judged the post in an earlier
+   * transaction, and a hide can commit between that and this read. The thread's
+   * comments are not words of the post itself, but this response is, so the statement
+   * that returns them asks again. scripts/verify-post-read.mjs forces a hide into that
+   * gap rather than waiting for one.
+   *
+   * NO TENANT FILTER. Row security decides whose post this is. A `"tenantId" = ...` here
+   * would answer the same 404 with the policy broken, and the cross-tenant check would
+   * then be testing this line instead of the policy.
+   */
+  router.get('/posts/:postId', ah(async (req, res) => {
+    const { tenantId, userId } = getAuth(req);
+    const postId = req.params['postId']!;
+    const spaceId = await spaceOfPost(tenantId, postId);
+    if (!spaceId) return res.status(404).json({ error: 'not found' });
+    const allowed = await reach(tenantId, spaceId, userId, 'read');
+    if (allowed.status !== 200) return res.status(allowed.status).json({ error: allowed.error ?? 'not found' });
+    const canReply = (await reach(tenantId, spaceId, userId, 'write')).status === 200;
+
+    const rows = await withTenant(tenantId, (tx) =>
+      tx.$queryRaw<
+        Array<{
+          id: string;
+          spaceId: string;
+          authorId: string;
+          body: string;
+          reactionCount: number;
+          commentCount: number;
+          createdAt: string;
+          slug: string;
+          name: string;
+          visibility: string;
+        }>
+      >`
+        SELECT p.id, p."spaceId", p."authorId", p.body, p."reactionCount", p."commentCount",
+               -- Rendered by Postgres, as GET /feed renders it: the web app reads one shape.
+               to_char(p."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
+               s.slug, s.name, s.visibility::text AS visibility
+          FROM "Post" p
+          JOIN "CommunitySpace" s ON s.id = p."spaceId"
+         WHERE p.id = ${postId} AND p.status = 'VISIBLE'::"ContentStatus"`,
+    );
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'not found' });
+
+    const { slug, name, visibility, ...post } = row;
+    return res.json({ ...post, space: { id: row.spaceId, slug, name, visibility }, canReply });
+  }));
+
+  /**
    * The whole thread in one query, in render order.
    *
    * ORDER BY path is depth-first pre-order — the sequence a threaded view draws — so
