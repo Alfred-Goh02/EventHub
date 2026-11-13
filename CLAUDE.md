@@ -808,3 +808,29 @@ reservations, which `verify-inventory-reconciliation.mjs` asks of every tenant. 
 through the provider's webhook, assert nothing is unsettled and the counters agree, and
 delete only the money-free rows made by SQL, counted. `verify-reservation-reads.mjs` is the
 model.
+
+## A dry run answers whether you may, not whether it will
+
+`run-instances --dry-run` of t3.medium answered `DryRunOperation`, and #179 wrote that the
+free plan allowed the node size. It did not. In the first real apply, every launch the node
+group's Auto Scaling group made failed with "not eligible for Free Tier". A dry run checks
+IAM permissions; what the account's plan will launch is decided on the real call. All the
+while, EKS reported the node group CREATING, with no health issue, for eighteen minutes,
+until the destroy took it down, with the cluster and the NAT billing.
+
+The error was in CloudTrail 59 seconds after the node group was created, on calls neither
+Terraform nor EKS showed: `lookup-events` for `RunInstances` named it in one line. It was
+read only after the destroy. When a managed service sits in a pending state, read
+the calls it makes on your behalf before waiting longer. Then move the check to where it
+fails first. The node group now has a precondition against the list
+`describe-instance-types` gives for `free-tier-eligible`, read at plan time. A
+`terraform test` plans against a mocked provider and watches it refuse t3.medium, because
+the static guards could not tell a precondition that refuses from one that never can: five
+such mutations stayed green until a review found them.
+
+Not every limit is written where you would look. The same apply met the account's SCP
+(`iam:*Provider*` is denied, so no IRSA) on a call that a read of the published policy
+would have ruled out: read the published SCPs before designing against an account you do
+not run. The free plan's instance types are in no SCP; EC2 enforces them at the call, and
+`describe-instance-types` lists them. Both are the account's version of reading the library
+at the version you run.

@@ -65,8 +65,13 @@ resource "aws_iam_role" "node" {
 
 # The three standard managed-node policies: joining the cluster, the VPC CNI's address
 # management, and pulling images from ECR. The CNI's policy sits on the node role, the
-# standard place; moving it to its own IRSA role would keep it from every other pod on
-# the node, and is the next tightening when one is wanted.
+# standard place; moving it to a Pod Identity role of its own (modules/pod-identity-role)
+# would keep it from every other pod on the node, and is the next tightening when one is
+# wanted.
+#
+# AmazonEKSWorkerNodePolicy also grants eks-auth:AssumeRoleForPodIdentity, which the
+# eks-pod-identity-agent on each node calls for the pods it serves (read from the
+# policy's default version on 2026-11-13).
 resource "aws_iam_role_policy_attachment" "node" {
   for_each = toset([
     "AmazonEKSWorkerNodePolicy",
@@ -78,21 +83,6 @@ resource "aws_iam_role_policy_attachment" "node" {
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/${each.key}"
 }
 
-# ---------------------------------------------------------------------------
-# IRSA: the cluster's OIDC issuer, trusted by IAM, so a Kubernetes service account
-# can assume an IAM role (modules/irsa-role) without any node credentials.
-# ---------------------------------------------------------------------------
-
-# The thumbprint is the SHA-1 of the issuer's root CA certificate, which tls_certificate
-# lists first in the chain. For an issuer whose certificate chains to a CA IAM already
-# trusts, AWS documents that it validates against that CA and keeps the thumbprint only
-# as configuration. Computed here rather than pasted, it is right either way.
-data "tls_certificate" "oidc" {
-  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
-}
-
-resource "aws_iam_openid_connect_provider" "this" {
-  url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
-}
+# No IAM OIDC provider, so no IRSA: this AWS project's SCPs deny iam:*Provider* on both
+# plans. A service account gets an AWS role through EKS Pod Identity instead
+# (modules/pod-identity-role), served by the eks-pod-identity-agent addon in main.tf.

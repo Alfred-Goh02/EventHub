@@ -12,27 +12,53 @@ the teardown runbook below is part of using it.
 |---|---|
 | `bootstrap/` | Applied once, with local state: the S3 state bucket (versioned, SSE-S3, all four public-access-block flags, TLS-only policy, `prevent_destroy`) and a $10 monthly AWS Budgets cost budget that emails at 50%, 80% and 100% actual and 100% forecast |
 | `modules/network/` | A `10.40.0.0/16` VPC across two zones: a public and a private subnet in each, one internet gateway, **one** NAT gateway (the comment says why), route tables, a free S3 gateway endpoint, and the subnet tags the Load Balancer Controller discovers |
-| `modules/eks/` | The cluster (Kubernetes 1.37, access entries only, private and restricted public endpoint, Secrets envelope-encrypted with KMS, standard support only), its IAM role, one managed node group (2 x t3.medium, AL2023, private subnets), the IRSA OIDC provider, the vpc-cni, kube-proxy and coredns addons, and one cluster-admin access entry |
-| `modules/irsa-role/` | An IAM role exactly one service account can assume through the OIDC provider |
+| `modules/eks/` | The cluster (Kubernetes 1.37, access entries only, private and restricted public endpoint, Secrets envelope-encrypted with KMS, standard support only), its IAM role, one managed node group (2 x m7i-flex.large, AL2023, private subnets, its types checked at plan time against what the account can launch), the vpc-cni, kube-proxy, eks-pod-identity-agent and coredns addons, and one cluster-admin access entry |
+| `modules/pod-identity-role/` | An IAM role exactly one service account in one cluster can assume through EKS Pod Identity, and the association that binds it. Not IRSA: the AWS project's SCPs deny `iam:*Provider*`, so an OIDC provider cannot be created |
 | `modules/ecr/` | `eventhub/app`, with immutable tags (images are tagged by git SHA), scan on push, and a keep-the-last-N lifecycle policy |
 | `envs/demo/` | The modules wired together, with state in the bootstrap bucket, locked by S3 itself (`use_lockfile`) |
 | `policies/` | The Load Balancer Controller's IAM policy: a reviewed copy of upstream's, at v3.6.3 (`envs/demo/main.tf` says where from) |
 
-**Not here yet: the data layer.** RDS, ElastiCache, MSK and OpenSearch are the next part.
-Until then the cluster has nothing to point the services at, so this part stands up the
-platform only. `10.40.32.0/19` and `10.40.192.0/18` are left free in the VPC for them.
+**Not here yet: the data layer.** It is the next part. Until then the cluster has nothing
+to point the services at, so this part stands up the platform only. `10.40.32.0/19` and
+`10.40.192.0/18` are left free in the VPC for it. On the free plan the project's SCP allows
+`rds`, `elasticache` and `es` but not `kafka`, so MSK needs the paid plan; Kafka can run in
+the cluster instead.
+
+**What the account allows.** Two limits shaped this directory, from two places:
+
+- **The project's managed SCPs**, published in full at
+  [Managed policies for your organization](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html).
+  They deny `iam:*Provider*` on both plans, so no IAM OIDC provider and no IRSA.
+- **The free plan itself.** EC2 launches only the instance types
+  `aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true` lists, and
+  refuses the rest at `RunInstances`. No SCP says so. `free_plan` in `envs/demo` defaults to
+  true and checks the node group against that list at plan time; set it false after
+  upgrading.
 
 `node scripts/verify-terraform.mjs` checks all of it without an AWS account: formatting,
-`init -backend=false` and `validate` in every root, and the guards each decision above
-rests on. `--static` runs the guards alone.
+`init -backend=false` and `validate` in every root, each root's `terraform test` (plans
+against a mocked provider: `envs/demo/tests` watches the node-type check refuse), and the
+guards each decision above rests on. `--static` runs the guards alone.
 
 ## Before the first apply
 
+**A login that renews itself.** `aws login` hands out credentials that last 15 minutes and
+are renewed by the CLI. Terraform read them once and did not renew them, so the first apply
+died halfway with `ExpiredTokenException`; an EKS cluster alone takes ten minutes or more.
+A profile whose `credential_process` asks the CLI each time is renewed on every request.
+Add it to `~/.aws/config` once, beside the `eventhub` profile `aws login` made:
+
+```ini
+[profile eventhub-tf]
+region = ap-southeast-2
+credential_process = aws configure export-credentials --profile eventhub --format process
+```
+
 ```powershell
-# An AWS CLI profile named eventhub. Terraform reads it from the environment;
-# set this in every shell you run terraform from.
-$env:AWS_PROFILE = 'eventhub'
-aws sts get-caller-identity --profile eventhub
+# Terraform reads the profile from the environment; set this in every shell you run
+# terraform from. The aws commands below keep --profile eventhub.
+$env:AWS_PROFILE = 'eventhub-tf'
+aws sts get-caller-identity --profile eventhub-tf
 
 # Kubernetes 1.37 should be listed for the region (it was on 2026-11-13: standard support
 # until 2027-12-01). If it is not, set kubernetes_version = "1.36" in envs/demo/terraform.tfvars.
@@ -75,10 +101,10 @@ kubectl version --client
    ```
 
    The Load Balancer Controller's chart takes `clusterName` (`cluster_name`), `region`,
-   `vpcId` (`vpc_id`), and a service account `aws-load-balancer-controller` in
-   `kube-system` annotated `eks.amazonaws.com/role-arn` with
-   `aws_load_balancer_controller_role_arn`. Install the chart release that ships
-   controller v3.6.3, the version the IAM policy is copied from. Images go to
+   `vpcId` (`vpc_id`), and a service account named `aws-load-balancer-controller` in
+   `kube-system`, with **no** role annotation: Terraform's Pod Identity association binds
+   `aws_load_balancer_controller_role_arn` to that name. Install the chart release that
+   ships controller v3.6.3, the version the IAM policy is copied from. Images go to
    `ecr_repository_url`, tagged by git SHA:
 
    ```powershell
@@ -98,17 +124,31 @@ public IPv4 rate and the KMS key price are AWS's published flat rates, not read 
 | What | ap-southeast-2 list price | Per hour |
 |---|---|---|
 | EKS control plane, standard support | $0.10 per cluster-hour (extended support would be $0.60; `upgrade_policy` keeps it standard) | $0.10 |
-| 2 x t3.medium, Linux, on demand | $0.0528 per instance-hour | $0.106 |
+| 2 x m7i-flex.large, Linux, on demand | $0.1197 per instance-hour (t3.medium, $0.0528, is not one the free plan launches; `modules/eks/variables.tf` says why this one) | $0.239 |
 | 1 NAT gateway | $0.059 per hour, plus $0.059 per GB it processes | $0.059, plus traffic |
 | The NAT's public IPv4 address | $0.005 per hour | $0.005 |
 | 2 x 20 GiB node root volumes (EBS gp3) | $0.096 per GB-month | about $0.005 |
 | KMS key for Secrets | $1 per key-month, prorated | about $0.001 |
 | ECR | $0.10 per GB-month stored; basic scan on push | pennies a month |
 | State bucket and budget | kilobytes in S3; one budget is inside the allowance AWS publishes | about $0 |
-| **Total** | | **about $0.28 an hour** |
+| **Total** | | **about $0.41 an hour** |
 
-A four-hour demo window is about $1.10, plus traffic. A forgotten weekend is about $17, past
-the budget. A month left running is about $200: twenty times it. Not in the table: load
+A four-hour demo window is about $1.65, plus traffic. A forgotten weekend is about $25, past
+the budget.
+
+**On the free plan a forgotten environment does not become a bill: it closes the account.**
+The credits pay for everything, and $120 of them is about 290 hours, twelve days. AWS's
+words: "Account closes when credits are depleted or when the plan duration ends", and on
+closing you lose access to the account's resources and data, the state bucket included.
+AWS keeps it 90 days, and upgrading in AWS Settings within them restores access. The budget
+counts usage before credits, so its emails come long before that. On the paid plan, a month
+left running is about $300, thirty times the budget. Check the credits before each window:
+
+```powershell
+aws freetier get-account-plan-state --region ap-southeast-2 --profile eventhub --query "[accountPlanType,accountPlanRemainingCredits.amount,accountPlanExpirationDate]" --output text
+```
+
+Not in the table: load
 balancers the controller creates once an Ingress exists (billed per hour plus usage), the
 data layer (next part), and cross-zone traffic. Image layers come from S3 through the free
 gateway endpoint, not through the NAT.
@@ -122,7 +162,8 @@ In this order. Terraform knows nothing about the load balancers the controller c
 they go first, while the controller is still running to delete them.
 
 ```powershell
-$env:AWS_PROFILE = 'eventhub'
+# The renewing profile: the destroy of the first demo took 19 minutes, past the login's 15.
+$env:AWS_PROFILE = 'eventhub-tf'
 aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias eventhub-demo --profile eventhub
 ```
 

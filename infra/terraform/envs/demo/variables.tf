@@ -29,6 +29,17 @@ variable "admin_principal_arn" {
   type        = string
 }
 
+# TRUE BY DEFAULT, because the account is on the free plan and a wrong true fails loudly:
+# the plan is refused, naming the types the account can launch. A wrong false fails the
+# way the first apply did, eighteen minutes in. After upgrading in AWS Settings > Billing,
+# set free_plan = false in terraform.tfvars.
+variable "free_plan" {
+  description = "Whether the AWS account is on the free plan, which launches only Free Tier-eligible instance types. The node group's types are then checked against AWS's list at plan time."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 # Overrides. Each defaults to null, which hands the module its own default, so every
 # default is written in exactly one place: the module.
 
@@ -45,7 +56,7 @@ variable "kubernetes_version" {
 }
 
 variable "node_instance_types" {
-  description = "Node instance types. Null takes modules/eks's default, t3.medium."
+  description = "Node instance types. Null takes modules/eks's default, m7i-flex.large, which says why."
   type        = list(string)
   default     = null
 }

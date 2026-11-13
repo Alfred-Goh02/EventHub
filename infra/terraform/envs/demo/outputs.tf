@@ -21,14 +21,9 @@ output "cluster_certificate_authority_data" {
   value       = module.eks.cluster_certificate_authority_data
 }
 
-output "oidc_provider_arn" {
-  description = "The IAM OIDC provider, for any further IRSA role."
-  value       = module.eks.oidc_provider_arn
-}
-
-output "oidc_provider_url" {
-  description = "The cluster's OIDC issuer URL."
-  value       = module.eks.oidc_provider_url
+output "cluster_arn" {
+  description = "The cluster's ARN, for any further Pod Identity role (modules/pod-identity-role)."
+  value       = module.eks.cluster_arn
 }
 
 output "vpc_id" {
@@ -47,7 +42,7 @@ output "ecr_repository_url" {
 }
 
 output "aws_load_balancer_controller_role_arn" {
-  description = "The eks.amazonaws.com/role-arn annotation for the controller's service account."
+  description = "The role the controller runs as. Pod Identity binds it to kube-system/aws-load-balancer-controller; the service account needs no annotation."
   value       = module.aws_load_balancer_controller_role.role_arn
 }
 
