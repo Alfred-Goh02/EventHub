@@ -47,6 +47,10 @@
  * that could not have failed: fmt -check must refuse a planted misformat, and validate
  * -json must call a planted reference to an undeclared variable invalid.
  *
+ * THEN EACH ROOT'S TERRAFORM TEST, where it has tests/*.tftest.hcl: plans against a mocked
+ * provider, so a guard is judged by what a plan does. Every run block must pass, counted
+ * against the run blocks in the files; "0 passed" is not a pass.
+ *
  * Needs terraform on PATH (CI installs it with hashicorp/setup-terraform); the first run
  * downloads the providers the lock files pin, into TF_PLUGIN_CACHE_DIR (by default
  * eventhub-terraform-plugin-cache in the temp directory), and later runs reuse them. A
@@ -726,11 +730,16 @@ function podIdentityChecks(units) {
       `${id} allows sts:AssumeRole and sts:TagSession: Pod Identity tags every session, and a role without TagSession refuses it (${actions.join(', ') || 'no actions'})`,
     );
     const conditions = blocksOf(s.body, 'condition').map((c) => ({ test: literal(attrOf(c.body, 'test')), variable: literal(attrOf(c.body, 'variable')), values: attrOf(c.body, 'values') }));
-    const unpinned = PINNED.filter((key) => !conditions.some((c) => c.test === 'StringEquals' && c.variable === key && c.values !== undefined));
-    const loose = conditions.filter((c) => PINNED.includes(c.variable) && c.test !== 'StringEquals');
+    // ONE VALUE EACH. A second value is a second namespace, service account or cluster the
+    // role is handed to, and StringEquals on a list matches any of it. Found in review: a
+    // trust policy widened to admit another account's cluster stayed green while this
+    // checked only that each key had some values.
+    const single = (values) => /^\[[^,[\]*?]+\]$/.test(compact(values));
+    const unpinned = PINNED.filter((key) => !conditions.some((c) => c.test === 'StringEquals' && c.variable === key && single(c.values)));
+    const loose = conditions.filter((c) => PINNED.includes(c.variable) && (c.test !== 'StringEquals' || !single(c.values)));
     check(
       unpinned.length === 0 && loose.length === 0,
-      `${id} pins the cluster, the namespace and the service account with StringEquals, so another association to the role gets nothing${unpinned.length ? ` -- not pinned: ${unpinned.join(', ')}` : ''}${loose.length ? ` -- not StringEquals: ${loose.map((c) => `${c.test} ${c.variable}`).join(', ')}` : ''}`,
+      `${id} pins the cluster, the namespace and the service account, each with StringEquals to exactly one value, so another association to the role gets nothing${unpinned.length ? ` -- not pinned: ${unpinned.join(', ')}` : ''}${loose.length ? ` -- not one exact value: ${loose.map((c) => `${c.test} ${c.variable} = ${compact(c.values)}`).join(', ')}` : ''}`,
     );
     // A role trusted for Pod Identity is bound by an association; without one it is bound to nothing.
     const roles = blocksOf(u.items, 'resource', 'aws_iam_role').filter((r) => attrOf(r.body, 'assume_role_policy') === `data.aws_iam_policy_document.${d.labels[1]}.json`);
@@ -756,10 +765,15 @@ function podIdentityChecks(units) {
 }
 
 /**
- * The first apply asked for t3.medium on a free-plan account. EKS said CREATING for half
- * an hour while every RunInstances failed "not eligible for Free Tier", and a dry run had
- * said yes. The precondition moves that failure to the plan, and the list it compares
- * against has to come from AWS, or it is a copy that goes stale.
+ * The first apply asked for t3.medium on a free-plan account. EKS said CREATING for
+ * eighteen minutes, until the destroy, while every RunInstances failed "not eligible for
+ * Free Tier", and a dry run had said yes. The precondition moves that failure to the plan,
+ * and the list it compares against has to come from AWS, or it is a copy that goes stale.
+ *
+ * These read the files, so they cannot tell a precondition that refuses from one that never
+ * can: `!= null`, `>= 0`, free_plan defaulting false, `false ?` in the caller and count = 0
+ * on the data source all stayed green here. What the plan does is judged by the root's
+ * terraform test (testRoot), which these leave to it.
  */
 function nodeTypeChecks(units) {
   section("every node group's instance types are checked at plan time against what the account can launch");
@@ -1008,6 +1022,30 @@ function validateRoot(r) {
     `${r.rel}: terraform validate -json: ${result.valid ? 'valid' : 'invalid'}, ${result.error_count} error(s), ${result.warning_count} warning(s)${result.error_count ? ` -- ${diagnostics.filter((d) => d.startsWith('error')).join('; ')}` : ''}`,
   );
   for (const d of diagnostics.filter((x) => x.startsWith('warning'))) note(`${r.rel}: ${d}`);
+  testRoot(r);
+}
+
+/**
+ * A root's terraform tests: plans against a mocked provider, so a guard is judged by what
+ * a plan does rather than by what its file says. validate does not evaluate preconditions;
+ * five mutations that made the node-type precondition unable to fail passed validate and
+ * every static guard. The run count is the control: "0 passed, 0 failed" is not a pass.
+ */
+function testRoot(r) {
+  const testsDir = join(r.dir, 'tests');
+  const files = existsSync(testsDir) ? readdirSync(testsDir).filter((f) => f.endsWith('.tftest.hcl')) : [];
+  if (files.length === 0) return;
+  const expected = files.reduce((n, f) => n + [...lexHcl(readFileSync(join(testsDir, f), 'utf8')).code.matchAll(/^\s*run\s+"[^"]+"\s*\{/gm)].length, 0);
+  const t = terraform(['test', '-no-color'], r.dir);
+  const out = `${t.stdout}\n${t.stderr}`;
+  const summary = /Success! (\d+) passed, (\d+) failed\.|Failure! (\d+) passed, (\d+) failed(?:, (\d+) skipped)?\./.exec(out);
+  const passed = Number(summary?.[1] ?? summary?.[3] ?? 0);
+  const failed = Number(summary?.[2] ?? summary?.[4] ?? 0) + Number(summary?.[5] ?? 0);
+  const failing = [...out.matchAll(/^\s*run "([^"]+)"\.\.\. (fail|skip)/gm)].map((m) => `${m[1]} (${m[2]})`);
+  check(
+    t.status === 0 && expected > 0 && passed === expected && failed === 0,
+    `${r.rel}: terraform test: ${passed} of ${expected} run(s) passed in ${files.join(', ')}${failing.length ? ` -- ${failing.join('; ')}` : ''}${summary ? '' : ` -- no summary (exit ${t.status}): ${tail(out, 600)}`}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

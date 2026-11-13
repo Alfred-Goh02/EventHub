@@ -118,13 +118,14 @@ resource "aws_eks_node_group" "default" {
     max_unavailable = 1
   }
 
-  # REFUSED AT PLAN TIME, NOT HALF AN HOUR INTO THE APPLY. The first apply asked for a
-  # type the account could not launch. EKS reported the node group CREATING, with no
+  # REFUSED AT PLAN TIME, NOT EIGHTEEN MINUTES INTO THE APPLY. The first apply asked for
+  # a type the account could not launch. EKS reported the node group CREATING, with no
   # health issue, while its Auto Scaling group's every RunInstances failed "not eligible
-  # for Free Tier": the cluster, the NAT and the rest were up and billing for 30 minutes
-  # before anyone looked in CloudTrail. allowed_instance_types is read from AWS by the
-  # root (describe-instance-types), so this compares against the account's own answer,
-  # before anything exists.
+  # for Free Tier": the cluster, the NAT and the rest were up and billing until the
+  # destroy, and the cause was read in CloudTrail only after it. allowed_instance_types is
+  # read from AWS by the root (describe-instance-types), so this compares against the
+  # account's own answer, before anything exists. envs/demo/tests plans it against a
+  # mock and watches it refuse.
   lifecycle {
     precondition {
       condition     = var.allowed_instance_types == null || length(setsubtract(var.node_instance_types, coalesce(var.allowed_instance_types, []))) == 0

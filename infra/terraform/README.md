@@ -24,16 +24,21 @@ to point the services at, so this part stands up the platform only. `10.40.32.0/
 `rds`, `elasticache` and `es` but not `kafka`, so MSK needs the paid plan; Kafka can run in
 the cluster instead.
 
-**What the account allows.** The project's managed SCPs are published in full at
-[Managed policies for your organization](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html).
-Two of them shaped this directory: `iam:*Provider*` is denied on both plans (so no IRSA),
-and on the free plan EC2 launches only the types `describe-instance-types` marks
-`free-tier-eligible`. `free_plan` in `envs/demo` defaults to true; set it false after
-upgrading.
+**What the account allows.** Two limits shaped this directory, from two places:
+
+- **The project's managed SCPs**, published in full at
+  [Managed policies for your organization](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html).
+  They deny `iam:*Provider*` on both plans, so no IAM OIDC provider and no IRSA.
+- **The free plan itself.** EC2 launches only the instance types
+  `aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true` lists, and
+  refuses the rest at `RunInstances`. No SCP says so. `free_plan` in `envs/demo` defaults to
+  true and checks the node group against that list at plan time; set it false after
+  upgrading.
 
 `node scripts/verify-terraform.mjs` checks all of it without an AWS account: formatting,
-`init -backend=false` and `validate` in every root, and the guards each decision above
-rests on. `--static` runs the guards alone.
+`init -backend=false` and `validate` in every root, each root's `terraform test` (plans
+against a mocked provider: `envs/demo/tests` watches the node-type check refuse), and the
+guards each decision above rests on. `--static` runs the guards alone.
 
 ## Before the first apply
 
@@ -129,8 +134,21 @@ public IPv4 rate and the KMS key price are AWS's published flat rates, not read 
 | **Total** | | **about $0.41 an hour** |
 
 A four-hour demo window is about $1.65, plus traffic. A forgotten weekend is about $25, past
-the budget. A month left running is about $300: thirty times it. On the free plan the
-credits pay first, and $120 of them is under 300 hours. Not in the table: load
+the budget.
+
+**On the free plan a forgotten environment does not become a bill: it closes the account.**
+The credits pay for everything, and $120 of them is about 290 hours, twelve days. AWS's
+words: "Account closes when credits are depleted or when the plan duration ends", and on
+closing you lose access to the account's resources and data, the state bucket included.
+AWS keeps it 90 days, and upgrading in AWS Settings within them restores access. The budget
+counts usage before credits, so its emails come long before that. On the paid plan, a month
+left running is about $300, thirty times the budget. Check the credits before each window:
+
+```powershell
+aws freetier get-account-plan-state --region ap-southeast-2 --profile eventhub --query "[accountPlanType,accountPlanRemainingCredits.amount,accountPlanExpirationDate]" --output text
+```
+
+Not in the table: load
 balancers the controller creates once an Ingress exists (billed per hour plus usage), the
 data layer (next part), and cross-zone traffic. Image layers come from S3 through the free
 gateway endpoint, not through the NAT.

@@ -31,7 +31,7 @@ variable "admin_principal_arn" {
 
 # TRUE BY DEFAULT, because the account is on the free plan and a wrong true fails loudly:
 # the plan is refused, naming the types the account can launch. A wrong false fails the
-# way the first apply did, thirty minutes in. After upgrading in AWS Settings > Billing,
+# way the first apply did, eighteen minutes in. After upgrading in AWS Settings > Billing,
 # set free_plan = false in terraform.tfvars.
 variable "free_plan" {
   description = "Whether the AWS account is on the free plan, which launches only Free Tier-eligible instance types. The node group's types are then checked against AWS's list at plan time."
