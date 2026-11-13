@@ -1,5 +1,6 @@
 /**
- * Asserts that a password reset works in the COMPOSE STACK, container to container.
+ * Asserts that a password reset works in the COMPOSE STACK, container to container,
+ * and that its link opens on the subdomain of the tenant it was asked in.
  *
  * Every other notification verifier runs the services natively, with keys from the
  * working tree and a fake SMTP server. This one touches none of that. It asks the
@@ -13,13 +14,21 @@
  *   - The mail leaves over SMTP to the Mailpit container and is read back from it.
  *   - The link in that email resets the password, THE OLD PASSWORD STOPS WORKING,
  *     and the session issued before the reset is revoked.
+ *   - THE LINK OPENS ON THE TENANT'S OWN SUBDOMAIN, from the template compose gives
+ *     Auth. A tenant is its subdomain -- Kong takes the tenant from the Host, and a
+ *     session is bound to it -- so the page a reset opens has to be on the tenant's
+ *     host to sign the reader in. Compose set no link base at all before, and both
+ *     links below opened http://localhost:3000. Asked for the SAME ADDRESS in two
+ *     seeded tenants, acme and globex, the way alice@acme.com is in both: each link
+ *     must open its own tenant's host, and each must reset its own tenant's account
+ *     and not the other's.
  *
  * NO DEPENDENCIES, on purpose: the compose job checks out the repository and starts
  * containers, and installs nothing. Postgres is reached with `docker exec psql`, as
  * scripts/verify-key-custody.mjs reaches the containers, and everything else with
  * fetch.
  *
- * Its user is created for the run and removed at the end, rather than the seeded
+ * Its users are created for the run and removed at the end, rather than the seeded
  * alice: a verifier that changes a seeded account's password leaves the stack
  * different from how it found it, and the next reader's sign-in example stops working.
  *
@@ -33,17 +42,22 @@ const AUTH = process.env['AUTH_URL'] ?? 'http://127.0.0.1:3001';
 const NOTIFICATION = process.env['NOTIFICATION_URL'] ?? 'http://127.0.0.1:3007';
 const MAILPIT = process.env['MAILPIT_URL'] ?? 'http://127.0.0.1:8025';
 const POSTGRES = process.env['POSTGRES_CONTAINER'] ?? 'eventhub-postgres';
-/** The seeded tenant: this adds a user to it and takes it away again. */
-const TENANT = 'tenant_acme';
-/** Its subdomain: Auth takes the tenant from the gateway's X-Tenant-Slug. */
-const TENANT_SLUG = 'acme';
+/**
+ * The seeded tenants, by id and subdomain: Auth takes the tenant from the gateway's
+ * X-Tenant-Slug. This adds a user to each and takes it away again.
+ */
+const TENANTS = [
+  { id: 'tenant_acme', slug: 'acme' },
+  { id: 'tenant_globex', slug: 'globex' },
+];
 const SUBJECT = 'Reset your EventHub password';
 
 const RUN = randomBytes(4).toString('hex');
-const USER_ID = `user_composereset_${RUN}`;
+/** One address in both tenants, as the seed has alice@acme.com in both. */
 const EMAIL = `compose-reset-${RUN}@mailcheck.example`;
+const userIn = (tenant) => `user_composereset_${RUN}_${tenant.slug}`;
 const OLD_PASSWORD = 'hunter2222';
-const NEW_PASSWORD = `new-password-${RUN}`;
+const newPasswordFor = (tenant) => `new-password-${RUN}-${tenant.slug}`;
 
 let failures = 0;
 function check(ok, msg) {
@@ -109,72 +123,110 @@ async function main() {
     return;
   }
 
-  // The seeded account's own hash, so this user has a password without hashing one
+  // The seeded account's own hash, so these users have a password without hashing one
   // here: the compose job has no dependencies, and Auth will replace it below anyway.
-  const seededHash = await psql('eventhub_auth', `SELECT "passwordHash" FROM "User" WHERE email = 'alice@acme.com' AND "tenantId" = '${TENANT}'`);
+  const seededHash = await psql('eventhub_auth', `SELECT "passwordHash" FROM "User" WHERE email = 'alice@acme.com' AND "tenantId" = '${TENANTS[0].id}'`);
   check(seededHash.startsWith('$argon2'), `CONTROL: the seeded account's hash was read (${seededHash.slice(0, 12)}…)`);
+  const seededTenants = await psql('eventhub_auth', `SELECT string_agg(t.slug, ',' ORDER BY t.slug) FROM "Tenant" t WHERE t.id IN (${TENANTS.map((t) => `'${t.id}'`).join(', ')})`);
+  check(seededTenants === TENANTS.map((t) => t.slug).sort().join(','), `CONTROL: both seeded tenants are there, by these slugs (${seededTenants || 'none'})`);
+  // Every seeded alice's hash, each salted on its own, to show at the end that none changed.
+  const seededIn = `email = 'alice@acme.com' AND "tenantId" IN (${TENANTS.map((t) => `'${t.id}'`).join(', ')})`;
+  const seededHashes = await psql('eventhub_auth', `SELECT string_agg(u."passwordHash", ' ' ORDER BY u."tenantId") FROM "User" u WHERE ${seededIn}`);
   if (failures > 0) return;
 
   try {
-    await psql(
-      'eventhub_auth',
-      `INSERT INTO "User" (id, "tenantId", email, "passwordHash", role, "updatedAt")
-       VALUES ('${USER_ID}', '${TENANT}', '${EMAIL}', '${seededHash}', 'ATTENDEE', now())`,
-    );
+    for (const tenant of TENANTS) {
+      await psql(
+        'eventhub_auth',
+        `INSERT INTO "User" (id, "tenantId", email, "passwordHash", role, "updatedAt")
+         VALUES ('${userIn(tenant)}', '${tenant.id}', '${EMAIL}', '${seededHash}', 'ATTENDEE', now())`,
+      );
+    }
 
+    const [acme, globex] = TENANTS;
     console.log('');
     console.log('  the account works before the reset');
-    const before = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
+    const before = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': acme.slug });
     check(before.status === 200 && Boolean(before.body.refreshToken), `CONTROL: it signs in with the old password (${before.status})`);
     const oldRefresh = before.body.refreshToken;
 
+    /** Asks for a reset in one tenant and waits for the email it brings, the one not seen before. */
+    const seen = new Set();
+    async function resetMail(tenant) {
+      const startedAt = Date.now();
+      const asked = await post(AUTH, '/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': tenant.slug });
+      const fresh = await waitFor(async () => {
+        const found = (await inbox(EMAIL)).filter((m) => !seen.has(m.ID));
+        return found.length > 0 ? found : null;
+      }, 120_000, 1_000);
+      // A second copy lands a moment after the first, so it gets the chance to.
+      const extra = fresh ? await waitFor(async () => (await inbox(EMAIL)).filter((m) => !seen.has(m.ID)).length > fresh.length, 3_000, 500) : null;
+      for (const m of (await inbox(EMAIL).catch(() => [])) ?? []) seen.add(m.ID);
+      const full = fresh?.[0] ? await messageById(fresh[0].ID) : null;
+      return { status: asked.status, count: fresh ? (extra ? fresh.length + 1 : fresh.length) : 0, took: Date.now() - startedAt, full, link: resetLinkIn(full?.Text) };
+    }
+
     console.log('');
     console.log('  a reset asked for in the stack arrives in the stack');
-    const startedAt = Date.now();
-    const asked = await post(AUTH, '/forgot-password', { email: EMAIL }, { 'X-Tenant-Slug': TENANT_SLUG });
-    check(asked.status === 202, `/forgot-password answered 202 (${asked.status})`);
-    const delivered = await waitFor(async () => {
-      const found = await inbox(EMAIL);
-      return found.length > 0 ? found : null;
-    }, 120_000, 1_000);
-    const took = Date.now() - startedAt;
-    check(Boolean(delivered), delivered ? `the email arrived ${(took / 1000).toFixed(1)}s later, through relay-auth, Kafka, Notification and Mailpit` : 'no email ever arrived');
-    if (!delivered) return;
-    check(delivered.length === 1, `exactly one (${delivered.length})`);
+    const a = await resetMail(acme);
+    check(a.status === 202, `/forgot-password answered 202 (${a.status})`);
+    check(a.count > 0, a.count > 0 ? `the email arrived ${(a.took / 1000).toFixed(1)}s later, through relay-auth, Kafka, Notification and Mailpit` : 'no email ever arrived');
+    if (a.count === 0) return;
+    check(a.count === 1, `exactly one (${a.count})`);
+    check(a.full?.Subject === SUBJECT, `with the subject a reader expects (${a.full?.Subject})`);
+    check(Boolean(a.link), `and a reset link in it${a.link ? '' : `:\n${(a.full?.Text ?? '').slice(0, 200)}`}`);
+    if (!a.link) return;
 
-    const full = await messageById(delivered[0].ID);
-    check(full?.Subject === SUBJECT, `with the subject a reader expects (${full?.Subject})`);
-    const link = resetLinkIn(full?.Text);
-    check(Boolean(link), `and a reset link in it${link ? '' : `:\n${(full?.Text ?? '').slice(0, 200)}`}`);
-    if (!link) return;
+    console.log('');
+    console.log("  the link opens on the tenant's own subdomain");
+    const aHost = new URL(a.link).host;
+    check(aHost === `${acme.slug}.eventhub.localhost:5173`, `asked for in ${acme.slug}, it opens ${aHost}`);
 
     console.log('');
     console.log('  the link in that email is the live credential');
-    const token = new URL(link).searchParams.get('token') ?? '';
-    const reset = await post(AUTH, '/reset-password', { token, password: NEW_PASSWORD });
+    const token = new URL(a.link).searchParams.get('token') ?? '';
+    const reset = await post(AUTH, '/reset-password', { token, password: newPasswordFor(acme) });
     check(reset.status === 200, `the link read out of the inbox resets the password (${reset.status})`);
-    const withNew = await post(AUTH, '/login', { email: EMAIL, password: NEW_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
+    const withNew = await post(AUTH, '/login', { email: EMAIL, password: newPasswordFor(acme) }, { 'X-Tenant-Slug': acme.slug });
     check(withNew.status === 200, `the new password signs in (${withNew.status})`);
-    const withOld = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': TENANT_SLUG });
+    const withOld = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': acme.slug });
     check(withOld.status === 401, `and the old one no longer does (${withOld.status})`);
     const refreshed = await post(AUTH, '/refresh', { refreshToken: oldRefresh });
     check(refreshed.status === 401, `the session issued before the reset is revoked (${refreshed.status})`);
-    const reused = await post(AUTH, '/reset-password', { token, password: `${NEW_PASSWORD}-again` });
+    const reused = await post(AUTH, '/reset-password', { token, password: `${newPasswordFor(acme)}-again` });
     check(reused.status === 400 || reused.status === 401, `and the link cannot be used twice (${reused.status})`);
 
     console.log('');
-    console.log('  the containers recorded it');
-    const row = await psql(
-      'eventhub_notification',
-      `SELECT status || ' ' || coalesce("providerMessageId", 'no provider id') FROM "NotificationDelivery" WHERE "recipientId" = '${USER_ID}'`,
+    console.log(`  the same address in ${globex.slug}: its own email, on its own subdomain, for its own account`);
+    const otherBefore = await post(AUTH, '/login', { email: EMAIL, password: OLD_PASSWORD }, { 'X-Tenant-Slug': globex.slug });
+    check(otherBefore.status === 200, `CONTROL: in ${globex.slug} the old password still signs in: the ${acme.slug} reset did not touch it (${otherBefore.status})`);
+    const g = await resetMail(globex);
+    check(g.status === 202 && g.count === 1 && Boolean(g.link), `one more email arrived, with a reset link (${g.count})`);
+    if (!g.link) return;
+    const gHost = new URL(g.link).host;
+    check(gHost === `${globex.slug}.eventhub.localhost:5173`, `asked for in ${globex.slug}, it opens ${gHost}`);
+    check(aHost !== gHost, `so one address in two tenants gets two links on two hosts (${aHost} / ${gHost})`);
+    const gReset = await post(AUTH, '/reset-password', { token: new URL(g.link).searchParams.get('token') ?? '', password: newPasswordFor(globex) });
+    const gNew = await post(AUTH, '/login', { email: EMAIL, password: newPasswordFor(globex) }, { 'X-Tenant-Slug': globex.slug });
+    const aStill = await post(AUTH, '/login', { email: EMAIL, password: newPasswordFor(acme) }, { 'X-Tenant-Slug': acme.slug });
+    check(
+      gReset.status === 200 && gNew.status === 200 && aStill.status === 200,
+      `that link resets the ${globex.slug} account and leaves ${acme.slug}'s as it was (reset ${gReset.status}, ${globex.slug} sign-in ${gNew.status}, ${acme.slug} sign-in ${aStill.status})`,
     );
-    check(row.startsWith('SENT'), `the sent-log holds one delivery, SENT (${row || 'no row'})`);
+
+    console.log('');
+    console.log('  the containers recorded it');
+    const rows = await psql(
+      'eventhub_notification',
+      `SELECT string_agg(d.status::text, ',' ORDER BY d.status::text) FROM "NotificationDelivery" d WHERE d."recipientId" IN (${TENANTS.map((t) => `'${userIn(t)}'`).join(', ')})`,
+    );
+    check(rows === 'SENT,SENT', `the sent-log holds one delivery per tenant, each SENT (${rows || 'no row'})`);
     const caughtUp = await waitFor(async () => {
       const metrics = await (await fetch(`${NOTIFICATION}/metrics`)).json();
       return metrics.dispatch?.lag?.total === 0 ? metrics : null;
     }, 30_000, 1_000);
     check(Boolean(caughtUp), `/metrics reports the consumer caught up (lag ${caughtUp?.dispatch?.lag?.total ?? 'unknown'})`);
-    check((caughtUp?.dispatch?.sentTotal ?? 0) >= 1, `and at least one email sent (${caughtUp?.dispatch?.sentTotal ?? 0})`);
+    check((caughtUp?.dispatch?.sentTotal ?? 0) >= 2, `and at least two emails sent (${caughtUp?.dispatch?.sentTotal ?? 0})`);
   } finally {
     const ids = (await inbox(EMAIL).catch(() => [])).map((m) => m.ID);
     if (ids.length > 0) {
@@ -184,19 +236,24 @@ async function main() {
         body: JSON.stringify({ IDs: ids }),
       }).catch(() => {});
     }
-    await psql('eventhub_notification', `DELETE FROM "NotificationDelivery" WHERE "recipientId" = '${USER_ID}'`).catch(() => {});
-    await psql('eventhub_auth', `DELETE FROM "OutboxMessage" WHERE "aggregateId" = '${USER_ID}'`).catch(() => {});
-    await psql('eventhub_auth', `DELETE FROM "PasswordResetToken" WHERE "userId" = '${USER_ID}'`).catch(() => {});
-    await psql('eventhub_auth', `DELETE FROM "RefreshToken" WHERE "userId" = '${USER_ID}'`).catch(() => {});
-    await psql('eventhub_auth', `DELETE FROM "User" WHERE id = '${USER_ID}'`).catch(() => {});
+    const users = TENANTS.map((t) => `'${userIn(t)}'`).join(', ');
+    await psql('eventhub_notification', `DELETE FROM "NotificationDelivery" WHERE "recipientId" IN (${users})`).catch(() => {});
+    await psql('eventhub_auth', `DELETE FROM "OutboxMessage" WHERE "aggregateId" IN (${users})`).catch(() => {});
+    await psql('eventhub_auth', `DELETE FROM "PasswordResetToken" WHERE "userId" IN (${users})`).catch(() => {});
+    await psql('eventhub_auth', `DELETE FROM "RefreshToken" WHERE "userId" IN (${users})`).catch(() => {});
+    await psql('eventhub_auth', `DELETE FROM "User" WHERE id IN (${users})`).catch(() => {});
     const left = {
-      user: await psql('eventhub_auth', `SELECT count(*) FROM "User" WHERE id = '${USER_ID}'`).catch(() => '?'),
-      deliveries: await psql('eventhub_notification', `SELECT count(*) FROM "NotificationDelivery" WHERE "recipientId" = '${USER_ID}'`).catch(() => '?'),
+      users: await psql('eventhub_auth', `SELECT count(*) FROM "User" WHERE id IN (${users})`).catch(() => '?'),
+      deliveries: await psql('eventhub_notification', `SELECT count(*) FROM "NotificationDelivery" WHERE "recipientId" IN (${users})`).catch(() => '?'),
       inbox: (await inbox(EMAIL).catch(() => [])).length,
     };
-    check(left.user === '0' && left.deliveries === '0' && left.inbox === 0, `cleanup: the run's user, delivery and email are gone (${JSON.stringify(left)})`);
-    const seedIntact = await psql('eventhub_auth', `SELECT count(*) FROM "User" WHERE email = 'alice@acme.com' AND "passwordHash" = '${seededHash}'`).catch(() => '?');
-    check(seedIntact === '1', `and the seeded account is untouched, so the README's sign-in still works (${seedIntact})`);
+    check(left.users === '0' && left.deliveries === '0' && left.inbox === 0, `cleanup: the run's users, deliveries and emails are gone (${JSON.stringify(left)})`);
+    const seedNow = await psql('eventhub_auth', `SELECT string_agg(u."passwordHash", ' ' ORDER BY u."tenantId") FROM "User" u WHERE ${seededIn}`).catch(() => '?');
+    const seeded = seededHashes.split(' ').length;
+    check(
+      seedNow === seededHashes && seeded === TENANTS.length,
+      `and the seeded account is untouched in both tenants it is in, so the README's sign-in still works (${seeded} hashes compared)`,
+    );
   }
 
   console.log('');
@@ -205,7 +262,7 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  console.log('a password reset crosses the whole compose stack: sealed by Auth, published by relay-auth, opened by Notification with the volume key, delivered to Mailpit, and the link revokes what came before it');
+  console.log("a password reset crosses the whole compose stack: sealed by Auth, published by relay-auth, opened by Notification with the volume key, delivered to Mailpit, opening on its own tenant's subdomain, and the link revokes what came before it");
 }
 
 main().catch((err) => {

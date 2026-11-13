@@ -102,10 +102,23 @@ export type PayResult =
   | { httpStatus: 200; body: { status: "CONFIRMED"; amountCents: number; [k: string]: unknown } }
   | { httpStatus: 202; body: { status: "PENDING"; paymentId: string; message: string } };
 
+/** POST /auth/register: the account an invitation created. */
+export interface RegisteredUser {
+  id: string;
+  email: string;
+  role: Role;
+}
+
 export interface EventHubApi {
   login(email: string, password: string): Promise<TokenPair>;
   /** Revokes this login's refresh-token family. The caller has already dropped the tokens. */
   logout(refreshToken: string): Promise<void>;
+  /** Always resolves the same way, account or no account: Auth answers 202 to every address. */
+  forgotPassword(email: string): Promise<void>;
+  /** Spends a reset link's token. Every session of that account is signed out. */
+  resetPassword(token: string, password: string): Promise<void>;
+  /** Spends an invitation's token. The tenant and the address come from the invitation. */
+  register(token: string, password: string): Promise<RegisteredUser>;
   listEvents(cursor?: string | null): Promise<Page<Event>>;
   getEvent(id: string): Promise<EventDetail>;
   listTicketTypes(eventId: string): Promise<{ data: TicketType[] }>;

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { withTenant } from '../db.js';
+import { databaseNow, withTenant } from '../db.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { requireAuth, requireRole } from '../auth.js';
 import { ah } from '@eventhub/http';
@@ -253,12 +253,25 @@ const draftFilter = (role: string) =>
 // ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
+/**
+ * ?upcoming=true leaves out every event that has already ended, by the
+ * DATABASE's clock. An event under way is still listed: someone arriving late
+ * is looking for it.
+ *
+ * Not a `from` timestamp the caller sends. That would be the caller's clock,
+ * and a browser twenty minutes slow would be shown events that ended twenty
+ * minutes ago. Nor `new Date()` here, which is this process's.
+ *
+ * The cursor does not carry the filter. A client paging through upcoming events
+ * sends ?upcoming=true with each cursor, as it does ?status.
+ */
 events.get('/', requireAuth, ah(async (req, res) => {
   const query = z
     .object({
       limit: z.coerce.number().int().min(1).max(MAX_PAGE).default(DEFAULT_PAGE),
       cursor: z.string().optional(),
       status: z.enum(['DRAFT', 'PUBLISHED', 'CANCELLED', 'COMPLETED']).optional(),
+      upcoming: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     })
     .safeParse(req.query);
 
@@ -266,14 +279,14 @@ events.get('/', requireAuth, ah(async (req, res) => {
     return res.status(400).json({ error: query.error.flatten() });
   }
 
-  const { limit, cursor, status } = query.data;
+  const { limit, cursor, status, upcoming } = query.data;
 
   const after = cursor ? decodeCursor(cursor) : null;
   if (cursor && !after) {
     return res.status(400).json({ error: 'malformed cursor' });
   }
 
-  const rows = await withTenant(req.auth!.tenantId, (tx) =>
+  const rows = await withTenant(req.auth!.tenantId, async (tx) =>
     tx.event.findMany({
       where: {
         // RLS does NOT filter soft-deleted rows — it only knows about tenants.
@@ -281,6 +294,7 @@ events.get('/', requireAuth, ah(async (req, res) => {
         // likely bug in this file.
         deletedAt: null,
         ...(status ? { status } : {}),
+        ...(upcoming ? { endsAt: { gt: await databaseNow(tx) } } : {}),
         // A caller who cannot publish never sees a DRAFT, including when they
         // ask for one by name -- ?status=DRAFT must not be a way around this.
         ...draftFilter(req.auth!.role),

@@ -15,6 +15,7 @@ import type {
   EventHubApi,
   Page,
   PayResult,
+  RegisteredUser,
   Reservation,
   TicketType,
   TokenPair,
@@ -185,9 +186,26 @@ export const httpApi: EventHubApi = {
       /* the tokens are already gone from this browser */
     }
   },
+  // The three below carry no bearer token, signed in or not. A reset or an invitation
+  // is proved by the token in the link alone.
+  async forgotPassword(email) {
+    const r = await raw("/auth/forgot-password", { method: "POST", body: { email } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+  },
+  async resetPassword(token, password) {
+    const r = await raw("/auth/reset-password", { method: "POST", body: { token, password } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+  },
+  async register(token, password) {
+    const r = await raw("/auth/register", { method: "POST", body: { token, password } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+    return r.body as RegisteredUser;
+  },
   async listEvents(cursor) {
-    return (await authed(`/events?${qs({ status: "PUBLISHED", limit: 20, cursor })}`))
-      .body as Page<Event>;
+    // upcoming: events that have not ended, by the server's clock. The cursor does not
+    // carry it, so it goes with every page.
+    const query = qs({ status: "PUBLISHED", upcoming: "true", limit: 20, cursor });
+    return (await authed(`/events?${query}`)).body as Page<Event>;
   },
   async getEvent(id) {
     return (await authed(`/events/${encodeURIComponent(id)}`)).body as EventDetail;

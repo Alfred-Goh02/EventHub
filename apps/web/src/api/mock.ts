@@ -191,11 +191,35 @@ export const mockApi: EventHubApi = {
   async logout(_refreshToken) {
     await delay(150);
   },
+  // In preview, a link token "expired" is refused, and an invitation token "taken" names
+  // an address that already has an account. Any other token works.
+  async forgotPassword(_email) {
+    await delay();
+  },
+  async resetPassword(token, password) {
+    await delay();
+    if (password.length < 8)
+      throw fail(400, "Please check the highlighted fields.", {
+        fieldErrors: { password: ["String must contain at least 8 character(s)"] },
+      });
+    if (token === "expired") throw fail(400, "invalid or expired reset token");
+  },
+  async register(token, password) {
+    await delay();
+    if (password.length < 8)
+      throw fail(400, "Please check the highlighted fields.", {
+        fieldErrors: { password: ["String must contain at least 8 character(s)"] },
+      });
+    if (token === "expired") throw fail(400, "invalid or expired invite");
+    if (token === "taken") throw fail(409, "email already registered");
+    return { id: "usr_invited", email: "new.member@example.com", role: "ATTENDEE" };
+  },
   async listEvents(cursor) {
     requireAuth();
     await delay();
+    // As the real list does with ?upcoming=true: nothing that has ended.
     const all = db()
-      .events.filter((e) => e.status === "PUBLISHED")
+      .events.filter((e) => e.status === "PUBLISHED" && Date.parse(e.endsAt) > Date.now())
       .sort((a, b) => a.startsAt.localeCompare(b.startsAt));
     const start = cursor ? Number(cursor) : 0;
     const data = all.slice(start, start + 20);
