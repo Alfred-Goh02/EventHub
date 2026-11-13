@@ -9,7 +9,7 @@
       {
         "git": {
           "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
-          "revision": "infra-argocd",
+          "revision": "main",
           "directories": [
             { "path": "charts/*" },
             { "path": "charts/eventhub-common", "exclude": true }
@@ -26,7 +26,7 @@
         "project": "default",
         "source": {
           "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
-          "targetRevision": "infra-argocd",
+          "targetRevision": "main",
           "path": "{{.path.path}}",
           "helm": {
             "releaseName": "{{.path.basename}}",

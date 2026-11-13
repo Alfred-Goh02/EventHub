@@ -201,6 +201,12 @@ const envOf = (chart) =>
 if (GITOPS) {
   step('6. each chart\'s environment, for ArgoCD to find');
   for (const chart of charts) {
+    // THE RELEASE GOES FIRST. A release this script installed owns a Secret of the same
+    // name, `<chart>-env`, and uninstalling it deletes that Secret. Done the other way
+    // round, the first run made each Secret and then lost it: every pod ArgoCD started
+    // sat in CreateContainerConfigError, "secret auth-env not found", for 15 minutes.
+    const owned = spawnSync('helm', ['status', chart, '--kube-context', CONTEXT], { encoding: 'utf8' }).status === 0;
+    if (owned) run('helm', ['uninstall', chart, '--kube-context', CONTEXT, '--wait']);
     const env = envOf(chart);
     const s = {
       apiVersion: 'v1',
@@ -210,8 +216,6 @@ if (GITOPS) {
       stringData: env,
     };
     kubectl(['apply', '-f', '-'], JSON.stringify(s));
-    const owned = spawnSync('helm', ['status', chart, '--kube-context', CONTEXT], { encoding: 'utf8' }).status === 0;
-    if (owned) run('helm', ['uninstall', chart, '--kube-context', CONTEXT, '--wait']);
     console.log(`    ok    ${chart}-env: ${Object.keys(env).length} variable(s) from compose${owned ? '; the Helm release this script made is removed, so ArgoCD owns it' : ''}`);
   }
   console.log('\nthe cluster is ready for ArgoCD: node infra/argocd/bootstrap.mjs installs the charts from git');
