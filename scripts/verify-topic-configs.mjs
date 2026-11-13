@@ -30,7 +30,10 @@ const BROKERS = (process.env['KAFKA_BROKERS'] ?? 'localhost:9092').split(',').ma
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 /**

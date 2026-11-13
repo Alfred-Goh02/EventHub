@@ -47,7 +47,10 @@ const TOPIC = 'events.activity';
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 /** Silent, so a deliberate failure does not print a stack in a passing run. */

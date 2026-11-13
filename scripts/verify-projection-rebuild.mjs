@@ -54,7 +54,10 @@ const TOPIC = process.env['ACTIVITY_TOPIC'] ?? 'events.activity';
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 /** Every message on the topic, in broker offset order, per partition. */

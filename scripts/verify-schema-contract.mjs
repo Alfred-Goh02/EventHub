@@ -60,6 +60,7 @@ function check(label, obj, expectValid) {
   const valid = type.isValid(obj, { errorHook: () => {} });
   const ok = valid === expectValid;
   console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${label}${valid === expectValid ? '' : `  (valid=${valid}, expected ${expectValid})`}`);
+  if (!ok) process.exitCode = 1;
   return ok;
 }
 
@@ -76,6 +77,7 @@ if (JSON.stringify(back) !== JSON.stringify(sample)) {
   console.log('        in :', JSON.stringify(sample));
   console.log('        out:', JSON.stringify(back));
   allOk = false;
+  process.exitCode = 1;
 }
 console.log(`        ${buf.length} bytes encoded (JSON would be ${Buffer.byteLength(JSON.stringify(sample))})`);
 
