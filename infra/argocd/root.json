@@ -10,7 +10,7 @@
     "project": "default",
     "source": {
       "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
-      "targetRevision": "main",
+      "targetRevision": "infra-argocd",
       "path": "infra/argocd/apps",
       "directory": { "include": "*.json" }
     },
