@@ -1,0 +1,28 @@
+name: auth
+image:
+  repository: eventhub/app
+  # A tag names one build. Locally the image compose builds; on EKS the git SHA in ECR.
+  tag: local
+  pullPolicy: IfNotPresent
+replicas: 2
+workingDir: /app/services/auth
+command: ["node", "dist/index.js"]
+port: 3001
+probes:
+  liveness: /health
+  readiness: /ready
+# Auth is the one service that signs, so it gets the private key. See eventhub-common.
+keys: private
+resources:
+  requests:
+    cpu: 50m
+    memory: 192Mi
+  limits:
+    # argon2id takes about 19 MB a hash, per request in flight.
+    memory: 512Mi
+# The grace period holds the preStop wait and then the drain: 5 + 10 < 30.
+preStopSeconds: 5
+terminationGracePeriodSeconds: 30
+# The environment. Empty here on purpose: it carries passwords, and comes from whoever
+# installs -- infra/local/up.mjs from compose's own configuration, or ESO on EKS.
+env: {}

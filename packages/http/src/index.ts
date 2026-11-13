@@ -253,3 +253,81 @@ export function refuseUnstorableText(): RequestHandler {
     next(Object.assign(new Error(type), { status: 400, expose: true, type }));
   };
 }
+
+/**
+ * Readiness: 200 when every check answers within `timeoutMs`, 503 when any does not.
+ *
+ * A probe that hangs is answered by the orchestrator's own timeout, and every probe
+ * period adds another hung query to the pool; bounding each check here keeps a slow
+ * database from using up the connections the requests need. Each check should ask as
+ * this process asks -- Prisma on APP_DATABASE_URL, not some other credential -- or it
+ * can say ready while every request is refused.
+ *
+ * Liveness is a separate route that touches nothing: a database outage must take a pod
+ * out of the load balancer, not restart every replica at once.
+ */
+export function readiness(
+  checks: Record<string, () => Promise<unknown>>,
+  timeoutMs = 1_000,
+): RequestHandler {
+  return (_req, res) => {
+    const names = Object.keys(checks);
+    void Promise.all(
+      names.map((name) =>
+        Promise.race([
+          checks[name]!().then(
+            () => true,
+            () => false,
+          ),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs).unref()),
+        ]),
+      ),
+    ).then((results) => {
+      const answered = Object.fromEntries(names.map((name, i) => [name, results[i]]));
+      const ready = results.every(Boolean);
+      res.status(ready ? 200 : 503).json({ ready, ...answered });
+    });
+  };
+}
+
+/** What drainOnSignal needs of a server: Node's http.Server has it. */
+interface Closable {
+  close(callback?: (err?: Error) => void): unknown;
+}
+
+/**
+ * On SIGTERM or SIGINT: stop taking connections, let the requests in flight finish, run
+ * `cleanup`, and exit 0.
+ *
+ * Kubernetes sends SIGTERM and, after terminationGracePeriodSeconds, SIGKILL. Exiting at
+ * once drops every request a rolling update catches mid-flight; never exiting is killed
+ * anyway. `graceMs` is the backstop, and must be below the grace period, or the kill
+ * arrives first and cleanup never runs. Node's server.close also closes idle keep-alive
+ * connections, so an idle client cannot hold the process open.
+ */
+export function drainOnSignal(
+  server: Closable,
+  opts: {
+    logger: { info(obj: object, msg: string): void; error(obj: object, msg: string): void };
+    cleanup?: () => Promise<unknown>;
+    graceMs?: number;
+  },
+): void {
+  let draining = false;
+  const drain = (signal: string) => {
+    if (draining) return;
+    draining = true;
+    opts.logger.info({ signal }, 'draining: no new connections, finishing requests in flight');
+    setTimeout(() => {
+      opts.logger.error({ signal }, 'drain did not finish in time; exiting');
+      process.exit(1);
+    }, opts.graceMs ?? 10_000).unref();
+    server.close(() => {
+      void Promise.resolve(opts.cleanup?.())
+        .catch((err: unknown) => opts.logger.error({ err }, 'cleanup failed while draining'))
+        .finally(() => process.exit(0));
+    });
+  };
+  process.on('SIGTERM', () => drain('SIGTERM'));
+  process.on('SIGINT', () => drain('SIGINT'));
+}

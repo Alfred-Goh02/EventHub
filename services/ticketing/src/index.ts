@@ -1,9 +1,9 @@
 import express from 'express';
 import { loadBaseEnv } from '@eventhub/config';
 import { createLogger } from '@eventhub/logger';
-import { errorHandler, refuseUnstorableText } from '@eventhub/http';
+import { errorHandler, readiness, refuseUnstorableText } from '@eventhub/http';
 import { requireAuth } from './auth.js';
-import { assertRuntimeRoleCannotBypassRls } from './db.js';
+import { assertRuntimeRoleCannotBypassRls, prisma } from './db.js';
 import { reservations } from './routes/reservations.js';
 import { pay } from './routes/pay.js';
 import { reservationReads } from './routes/reservation-reads.js';
@@ -70,6 +70,9 @@ app.use(refuseUnstorableText());
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'ticketing' });
 });
+
+/** Readiness: the database answers as this process, the app role. See @eventhub/http. */
+app.get('/ready', readiness({ database: () => prisma.$queryRaw`SELECT 1` }));
 
 app.get('/whoami', requireAuth, (req, res) => {
   res.json({ service: 'ticketing', ...req.auth });

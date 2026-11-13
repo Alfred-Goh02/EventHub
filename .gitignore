@@ -31,6 +31,10 @@ build/
 **/keys/
 *.pem
 
+# Helm's packaged dependencies: `helm dependency build` makes them from charts/ and the
+# Chart.lock beside them, which IS committed.
+charts/*/charts/
+
 # Logs and OS noise
 *.log
 npm-debug.log*
