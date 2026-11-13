@@ -109,6 +109,10 @@ export function renderInvitation(params: {
 /** The most of a reply an email quotes. The rest is one click away. */
 const EXCERPT_CHARS = 280;
 
+/** In place of a post link this email has no host for: see renderCommunityReply. */
+const NO_LINK_ONE = 'Sign in to EventHub to read the conversation.';
+const NO_LINK_MANY = 'Sign in to EventHub to read them.';
+
 /**
  * Collapsed whitespace, cut at a CODE POINT rather than a UTF-16 unit, so an emoji at
  * the boundary is dropped whole rather than split into a lone surrogate — which some
@@ -130,12 +134,16 @@ function excerpt(body: string): string {
  * The unsubscribe link is in the body as well as the List-Unsubscribe header: not every
  * client shows the header's button, and the law in more than one place wants it where
  * the reader can see it.
+ *
+ * NO POST LINK when there is no host to put it on (postUrl null): the recipient's card
+ * names no subdomain the gateway routes. The email says where to read the conversation
+ * instead of linking somewhere that cannot open it.
  */
 export function renderCommunityReply(params: {
   /** True for a reply to a comment; false for a comment on a post. */
   toComment: boolean;
   body: string;
-  postUrl: string;
+  postUrl: string | null;
   unsubscribeUrl: string;
 }): RenderedEmail {
   const what = params.toComment ? 'your comment' : 'your post';
@@ -145,8 +153,7 @@ export function renderCommunityReply(params: {
     '',
     `  ${quoted}`,
     '',
-    'Read the conversation:',
-    params.postUrl,
+    ...(params.postUrl ? ['Read the conversation:', params.postUrl] : [NO_LINK_ONE]),
     '',
     'You get these because replies to you are on. To stop them:',
     params.unsubscribeUrl,
@@ -155,7 +162,7 @@ export function renderCommunityReply(params: {
   const html = [
     `<p>Someone replied to ${what}:</p>`,
     `<blockquote>${escapeHtml(quoted)}</blockquote>`,
-    `<p><a href="${escapeHtml(params.postUrl)}">Read the conversation</a></p>`,
+    params.postUrl ? `<p><a href="${escapeHtml(params.postUrl)}">Read the conversation</a></p>` : `<p>${escapeHtml(NO_LINK_ONE)}</p>`,
     `<p style="color:#666;font-size:12px">You get these because replies to you are on. ` +
       `<a href="${escapeHtml(params.unsubscribeUrl)}">Stop emails about replies</a>.</p>`,
   ].join('\n');
@@ -169,10 +176,11 @@ export function renderCommunityReply(params: {
  * COUNTS AND LINKS ONLY, decided 2026-09-27: no reply's words are stored while it
  * waits, so there are none to quote — which also means a reply deleted or hidden in
  * the meantime is never shown here. Each line is one post: how many replies there were,
- * to a comment of yours or to the post itself, and a link to read them.
+ * to a comment of yours or to the post itself, and a link to read them -- or, with no
+ * host to link on (postUrl null, as for a reply), the counts and where to read them.
  */
 export function renderReplyDigest(params: {
-  groups: Array<{ postUrl: string; toComment: boolean; count: number }>;
+  groups: Array<{ postUrl: string | null; toComment: boolean; count: number }>;
   unsubscribeUrl: string;
 }): RenderedEmail {
   const total = params.groups.reduce((sum, g) => sum + g.count, 0);
@@ -181,11 +189,13 @@ export function renderReplyDigest(params: {
       ? `${g.count} ${g.count === 1 ? 'reply' : 'replies'} to your comment`
       : `${g.count} ${g.count === 1 ? 'comment' : 'comments'} on your post`;
   const subject = `${total} more ${total === 1 ? 'reply' : 'replies'} to you`;
+  const unlinked = params.groups.some((g) => !g.postUrl);
 
   const text = [
     `While you were away, people kept talking. ${subject}:`,
     '',
-    ...params.groups.flatMap((g) => [`  ${line(g)}:`, `  ${g.postUrl}`, '']),
+    ...params.groups.flatMap((g) => (g.postUrl ? [`  ${line(g)}:`, `  ${g.postUrl}`, ''] : [`  ${line(g)}`, ''])),
+    ...(unlinked ? [NO_LINK_MANY, ''] : []),
     'You get these because replies to you are on. To stop them:',
     params.unsubscribeUrl,
   ].join('\n');
@@ -193,8 +203,9 @@ export function renderReplyDigest(params: {
   const html = [
     `<p>While you were away, people kept talking. ${escapeHtml(subject)}:</p>`,
     '<ul>',
-    ...params.groups.map((g) => `<li><a href="${escapeHtml(g.postUrl)}">${escapeHtml(line(g))}</a></li>`),
+    ...params.groups.map((g) => (g.postUrl ? `<li><a href="${escapeHtml(g.postUrl)}">${escapeHtml(line(g))}</a></li>` : `<li>${escapeHtml(line(g))}</li>`)),
     '</ul>',
+    ...(unlinked ? [`<p>${escapeHtml(NO_LINK_MANY)}</p>`] : []),
     `<p style="color:#666;font-size:12px">You get these because replies to you are on. ` +
       `<a href="${escapeHtml(params.unsubscribeUrl)}">Stop emails about replies</a>.</p>`,
   ].join('\n');

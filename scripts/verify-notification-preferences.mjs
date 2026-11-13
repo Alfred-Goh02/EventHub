@@ -321,15 +321,15 @@ async function main() {
     // template text would match a looser pattern and name nothing.
     return { exit, named: child.log().match(/Error: refusing to start: (.+?) must be https/)?.[1] ?? '' };
   }
-  const unset = await refusalFor({ PUBLIC_APP_URL: 'https://app.example' }, ['NOTIFICATION_PUBLIC_URL']);
+  const unset = await refusalFor({ APP_URL_TEMPLATE: 'https://{tenant}.app.example' }, ['NOTIFICATION_PUBLIC_URL']);
   check(
     unset.exit !== 'still running' && unset.exit !== 0 && unset.named === 'NOTIFICATION_PUBLIC_URL',
     `NOTIFICATION_PUBLIC_URL left unset, so localhost: it refuses, naming only that one (exit ${unset.exit}: ${unset.named || 'no such message'})`,
   );
-  const plainApp = await refusalFor({ NOTIFICATION_PUBLIC_URL: 'https://notify.example', PUBLIC_APP_URL: 'http://app.example' });
+  const plainApp = await refusalFor({ NOTIFICATION_PUBLIC_URL: 'https://notify.example', APP_URL_TEMPLATE: 'http://{tenant}.app.example' });
   check(
-    plainApp.exit !== 'still running' && plainApp.exit !== 0 && plainApp.named === 'PUBLIC_APP_URL',
-    `PUBLIC_APP_URL on plain http at a real host: it refuses, naming only that one (exit ${plainApp.exit}: ${plainApp.named || 'no such message'})`,
+    plainApp.exit !== 'still running' && plainApp.exit !== 0 && plainApp.named === 'APP_URL_TEMPLATE',
+    `APP_URL_TEMPLATE on plain http at a real host: it refuses, naming only that one (exit ${plainApp.exit}: ${plainApp.named || 'no such message'})`,
   );
 
   const control = start({
@@ -338,7 +338,7 @@ async function main() {
     PORT: String(PORT + 1),
     UNSUBSCRIBE_SECRET: ownSecret,
     NOTIFICATION_PUBLIC_URL: 'https://notify.example',
-    PUBLIC_APP_URL: 'https://app.example',
+    APP_URL_TEMPLATE: 'https://{tenant}.app.example',
   });
   const controlUp = await waitFor(async () => (await fetch(`http://127.0.0.1:${PORT + 1}/health`)).ok, 60_000, 500);
   control.child.kill();

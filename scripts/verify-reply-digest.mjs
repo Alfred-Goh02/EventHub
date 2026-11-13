@@ -19,8 +19,12 @@
  *     both are counted before either can claim — the race made certain rather than hoped
  *     for — and exactly one is sent.
  *   - The digest: one email per person, a line per post with its count, linking to the
- *     post on the web app's origin, with the same one-click unsubscribe, and none of the
- *     replies' words — each reply carries a marker the digest must not.
+ *     post on the RECIPIENT'S TENANT'S OWN SUBDOMAIN, with the same one-click unsubscribe,
+ *     and none of the replies' words — each reply carries a marker the digest must not.
+ *     A digest in each of the two tenants, whose slugs only this run uses: each links
+ *     only to its own tenant's host, so a link on one shared host fails, and both
+ *     unsubscribe links stay on NOTIFICATION_PUBLIC_URL. A card with no slug, from
+ *     before cards carried one, gets its digest with the counts and no links at all.
  *   - Re-asked when the digest goes: someone who turned replies off in the hour, or whose
  *     card went, is sent nothing and their held items are dropped; a suppressed address
  *     is recorded SUPPRESSED and not sent to; a held reply more than a day old is dropped.
@@ -78,7 +82,9 @@ const GROUP = `verify-reply-digest-${RUN}`;
 const GROUPS = notificationGroups(GROUP);
 const WIDE = notificationGroups(`${GROUP}-wide`);
 const PORT = 3987;
-const APP_URL = `https://app-${RUN}.digest.example`;
+/** Each tenant's subdomain, as Auth signs it into a card, and the host its links must open. */
+const SLUGS = { [TENANT]: `digest-${RUN}`, [OTHER]: `digest-other-${RUN}` };
+const hostOf = (tenant) => `${SLUGS[tenant]}.eventhub.localhost:5173`;
 /** In every reply's body, so a digest that quoted any of them would show it. */
 const WORDS = `words-${RUN}-must-not-appear`;
 /** The sweeper's own words for a claim it ended (services/notification/src/sweeper/sweep.ts). */
@@ -107,6 +113,8 @@ const T = who('deferred');
 const Q = who('twopasses');
 const Z = who('scheduled');
 const Z2 = who('scheduledagain');
+/** Their card carries no slug, as every card did before cards named the tenant's subdomain. */
+const NS = who('noslug');
 
 const notificationEnv = serviceEnv(ROOT, 'notification', {
   PORT: String(PORT),
@@ -116,7 +124,7 @@ const notificationEnv = serviceEnv(ROOT, 'notification', {
   DISPATCH_START_FROM: 'latest',
   DISPATCH_RETRY_DELAYS_MS: '3000,3000,3000',
   NOTIFICATION_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
-  PUBLIC_APP_URL: APP_URL,
+  // APP_URL_TEMPLATE is the example's: the digests' links must open its hosts.
   // Three people a batch, so a pass has to work through several.
   DIGEST_BATCH_SIZE: '3',
   AUTH_PUBLIC_KEY_B64: Buffer.from(key('auth', 'public.pem')).toString('base64'),
@@ -174,6 +182,8 @@ const headersOf = async (id) => {
   const res = await fetch(`${MAILPIT}/api/v1/message/${encodeURIComponent(id)}/headers`);
   return res.ok ? res.json() : {};
 };
+/** Every URL in both parts of an email. */
+const urlsIn = (mail) => [...`${mail?.Text ?? ''}\n${mail?.HTML ?? ''}`.matchAll(/https?:\/\/[^\s"<>]+/g)].map((m) => m[0]);
 
 function verifyToken(token) {
   const [v, body, sig] = token.split('.');
@@ -241,10 +251,11 @@ async function main() {
   const kid = await calculateJwkThumbprint(await exportJWK(notificationPublic));
   const authSigning = await importPKCS8(key('auth', 'private.pem'), 'RS256');
 
-  async function storeCard(user) {
+  /** A card as Auth seals one, with the tenant's slug signed in, unless `slug` is null: a card from before it was. */
+  async function storeCard(user, { slug = SLUGS[user.tenant] } = {}) {
     const messageId = randomUUID();
     const occurredAt = '2026-09-27T00:00:00.000Z';
-    const signed = await new SignJWT({ tenantId: user.tenant, email: user.email, occurredAt })
+    const signed = await new SignJWT({ tenantId: user.tenant, email: user.email, occurredAt, ...(slug === null ? {} : { tenantSlug: slug }) })
       .setProtectedHeader({ alg: 'RS256', typ: 'auth-contact+jwt' })
       .setSubject(user.id)
       .setJti(messageId)
@@ -326,7 +337,7 @@ async function main() {
   const waitingBackends = async () =>
     (await owner.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = $1 AND cardinality(pg_blocking_pids(pid)) > 0', [APP_ROLE])).rows[0].n;
 
-  const everyone = [ACTOR, D, D2, F, W1, X1, Y1, G, H, S, J, J2, J3, J4, V1, T, Q, Z, Z2];
+  const everyone = [ACTOR, D, D2, F, W1, X1, Y1, G, H, S, J, J2, J3, J4, V1, T, Q, Z, Z2, NS];
   // The service starts inside the try, once its contact-card group is committed, so a
   // failure there is still cleaned up. Until then this stands in for it.
   let service = { child: { kill: () => {} }, log: () => '', exited: Promise.resolve(null) };
@@ -335,7 +346,8 @@ async function main() {
     const contacts = await contactsFromTheEnd(admin, ROOT, GROUPS);
     service = start(notificationEnv);
     console.log('  the fixture');
-    for (const user of everyone.filter((u) => u !== ACTOR)) await storeCard(user);
+    for (const user of everyone.filter((u) => u !== ACTOR && u !== NS)) await storeCard(user);
+    await storeCard(NS, { slug: null });
     await inTenant(
       owner,
       TENANT,
@@ -453,6 +465,9 @@ async function main() {
     await plantDeliveries(J4, 1, { templateKey: 'community-digest', status: 'FAILED', lastError: ABANDONED, id: took.J4 });
     // V1: a held reply a day and an hour old.
     await plantHeld(V1, { age: '25 hours' });
+    // A reply waiting in the other tenant, and one for a person whose card has no slug.
+    await plantHeld(D2, { postId: `post_${RUN}_b` });
+    await plantHeld(NS, { postId: `post_${RUN}_n` });
     await sleep(1_000);
     check(
       (await digests(D)).length === 0 && (await heldItems(D)).length === 3,
@@ -471,15 +486,15 @@ async function main() {
     const dDigest = dDigests?.[0] ? await message(dDigests[0].ID) : null;
     const dHeaders = dDigests?.[0] ? await headersOf(dDigests[0].ID) : {};
     check(dDigests?.length === 1 && dDigest?.Subject === '3 more replies to you', `one digest for the busy person, and it says how many (${dDigests?.length ?? 0}: ${dDigest?.Subject})`);
-    const post1 = `${APP_URL}/posts/post_${RUN}_1`;
-    const post2 = `${APP_URL}/posts/post_${RUN}_2`;
+    const post1 = `http://${hostOf(TENANT)}/posts/post_${RUN}_1`;
+    const post2 = `http://${hostOf(TENANT)}/posts/post_${RUN}_2`;
     const occurrences = (text, s) => text.split(s).length - 1;
     check(
       Boolean(dDigest) &&
         occurrences(dDigest.Text, '2 replies to your comment') === 1 && dDigest.Text.includes(post1) &&
         occurrences(dDigest.Text, '1 comment on your post') === 1 && dDigest.Text.includes(post2) &&
         dDigest.HTML.includes(`href="${post1}"`) && dDigest.HTML.includes(`href="${post2}"`),
-      'one line per post with its count — two replies on one, one comment on the other — each linking to the post on the web app',
+      "one line per post with its count — two replies on one, one comment on the other — each linking to the post on the recipient's tenant's own subdomain",
     );
     check(
       Boolean(dDigest) && !dDigest.Text.includes(WORDS) && !dDigest.HTML.includes(WORDS),
@@ -491,6 +506,39 @@ async function main() {
       dHeaders['List-Unsubscribe-Post']?.[0] === 'List-Unsubscribe=One-Click' && claims?.t === TENANT && claims?.u === D.id && claims?.c === 'COMMUNITY_REPLY' && dDigest?.Text.includes(unsubscribeUrl),
       'with the same one-click unsubscribe, for this person and replies only, in the headers and the body',
     );
+    const unsubscribeHost = new URL(notificationEnv.NOTIFICATION_PUBLIC_URL).host;
+    const dHosts = [...new Set(urlsIn(dDigest).map((u) => new URL(u).host))].sort();
+    check(
+      Boolean(unsubscribeUrl) && new URL(unsubscribeUrl).origin === notificationEnv.NOTIFICATION_PUBLIC_URL &&
+        dHosts.join(' ') === [hostOf(TENANT), unsubscribeHost].sort().join(' '),
+      `its links open two hosts and no others: the tenant's own for the posts, NOTIFICATION_PUBLIC_URL's for the unsubscribe (${dHosts.join(', ')})`,
+    );
+
+    console.log('');
+    console.log("  in the other tenant, the digest links to that tenant's subdomain");
+    const d2Found = await waitFor(async () => ((await digests(D2)).length >= 1 ? (await digests(D2))[0] : null), 20_000);
+    const d2Digest = d2Found ? await message(d2Found.ID) : null;
+    const d2Post = `http://${hostOf(OTHER)}/posts/post_${RUN}_b`;
+    const d2Hosts = [...new Set(urlsIn(d2Digest).map((u) => new URL(u).host))].sort();
+    check(
+      Boolean(d2Digest) && d2Digest.Text.includes(d2Post) && d2Digest.HTML.includes(`href="${d2Post}"`) && d2Hosts.join(' ') === [hostOf(OTHER), unsubscribeHost].sort().join(' '),
+      `one digest, linking to ${hostOf(OTHER)} and not ${hostOf(TENANT)}, and unsubscribing on the same host as the first tenant's (${d2Hosts.join(', ') || 'no links'})`,
+    );
+
+    console.log('');
+    console.log('  a card that names no subdomain: the digest goes with its counts, and no links');
+    const nsFound = await waitFor(async () => ((await digests(NS)).length >= 1 ? (await digests(NS))[0] : null), 20_000);
+    const nsDigest = nsFound ? await message(nsFound.ID) : null;
+    const nsHosts = [...new Set(urlsIn(nsDigest).map((u) => new URL(u).host))];
+    check(
+      Boolean(nsDigest) &&
+        /1 reply to your comment/.test(nsDigest.Text) && /Sign in to EventHub to read them/.test(nsDigest.Text) && nsDigest.HTML.includes('Sign in to EventHub to read them') &&
+        !urlsIn(nsDigest).some((u) => u.includes('/posts/')) && nsHosts.length === 1 && nsHosts[0] === unsubscribeHost && (await gone(NS)),
+      `one digest, with its count and no post link, the only host in it the unsubscribe one (${nsHosts.join(', ') || 'no links'}), and the held reply settled`,
+    );
+    // Every other card in that pass names its tenant's subdomain, so exactly one.
+    const unlinked = Number(pass.out.match(/(\d+) built without links/)?.[1] ?? -1);
+    check(unlinked === 1, `and the pass says so: digest:once counts one digest built without links (${unlinked === -1 ? 'no such count' : unlinked})`);
     const dDigestRows = await deliveries(D, 'community-digest');
     check(
       (await gone(D)) && dDigestRows.length === 1 && dDigestRows[0].status === 'SENT',

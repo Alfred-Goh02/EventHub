@@ -52,6 +52,12 @@ model User {
   /// When this user's contact card was queued for Notification; NULL if it never
   /// was. See migration 20260926000000.
   contactPublishedAt DateTime?
+  /// The tenant's slug when this user's current contact card was queued, stamped in
+  /// the same statement; NULL if the card predates slugs or there is no card. The card
+  /// carries the slug, signed, when Kong would route it. `contact-cards:publish`
+  /// republishes every card made under a slug that is not the tenant's current one.
+  /// See migration 20261024000000.
+  contactSlug String?
   refreshTokens RefreshToken[]
   passwordResets PasswordResetToken[]
 

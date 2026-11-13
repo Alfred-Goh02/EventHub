@@ -193,6 +193,13 @@ export interface OpenedContactCard {
   tenantId: string;
   userId: string;
   email: string;
+  /**
+   * The tenant's subdomain, as Auth signed it, for the links in a reply email. Null
+   * on a card from before Auth put it there, until the card is republished. A string
+   * here is still only a claim: nothing is put into a link until APP_URL_TEMPLATE's
+   * originFor has checked it against Kong's rule.
+   */
+  tenantSlug: string | null;
 }
 
 /**
@@ -232,6 +239,12 @@ export function createCardOpener(opts: { privateKey: CryptoKey; authPublicKey: C
     if (typeof claims.email !== 'string' || claims.email.length === 0) {
       throw new PoisonMessage('the card carries no address');
     }
-    return { tenantId: claims.tenantId as string, userId: claims.sub as string, email: claims.email };
+    /**
+     * Not a reason to refuse the card: the address is what a card is for, and a card
+     * without a usable slug still reaches its owner, without the link. Refusing it would
+     * stop every reply to them instead of one link in each.
+     */
+    const tenantSlug = typeof claims['tenantSlug'] === 'string' ? claims['tenantSlug'] : null;
+    return { tenantId: claims.tenantId as string, userId: claims.sub as string, email: claims.email, tenantSlug };
   };
 }

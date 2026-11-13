@@ -42,8 +42,14 @@ export interface AuthUserContact {
    * A compact JWE (alg RSA-OAEP-256, enc A256GCM) to Notification's public key,
    * named by kid. Its plaintext is a compact JWS signed by Auth (RS256, typ
    * auth-contact+jwt, aud eventhub-notification, no exp) whose claims carry the
-   * tenant and the address. The typ is what stops a card being accepted as an
-   * email request, which is sealed and signed by the same keys.
+   * tenant, the address and, as tenantSlug, the tenant's subdomain, which a
+   * reply email's links open on. tenantSlug is absent on a card made before it
+   * was added, and for a tenant whose slug the gateway would not route; a
+   * consumer then builds no link rather than one to another host. It is inside
+   * the seal and not a field of this record because this record is plaintext a
+   * producer can edit, and the slug decides which host a link opens. The typ is
+   * what stops a card being accepted as an email request, which is sealed and
+   * signed by the same keys.
    */
   sealed: string;
 }

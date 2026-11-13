@@ -46,7 +46,12 @@ export async function issueInvite(params: {
   email: string;
   role: Role;
   invitedBy: string;
-  /** Where the accept-invite page lives: PUBLIC_APP_URL. */
+  /**
+   * Where the accept-invite page lives: the web app's origin on THIS tenant's
+   * subdomain, APP_URL_TEMPLATE filled with its slug. The invitee has no account and so
+   * no tenant of their own to arrive with; /register takes the tenant from the
+   * invitation, and the page must already be on that tenant's host to sign them in.
+   */
   appUrl: string;
   /** How long it stays good, INVITE_TTL_HOURS: a week unless configured. */
   ttlHours: number;

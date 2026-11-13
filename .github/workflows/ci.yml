@@ -67,6 +67,9 @@ jobs:
       PAYMENT_WEBHOOK_SECRET: dev_webhook_secret
       JWT_ISSUER: https://auth.eventhub.local
       JWT_AUDIENCE: eventhub-api
+      # Where Auth's emailed links open: the tenant's own subdomain. Required, with no
+      # default, so every step below that starts Auth from this environment needs it.
+      APP_URL_TEMPLATE: "http://{tenant}.eventhub.localhost:5173"
       NODE_ENV: test
       PORT: 3001
       LOG_LEVEL: info
@@ -466,6 +469,17 @@ jobs:
       # instance it boots joins the real projection consumer group.
       - name: Assert every service boots from its own .env.example
         run: node scripts/verify-env-example.mjs
+
+      # Every emailed link was built on one tenantless base, PUBLIC_APP_URL, so every
+      # reset, invitation and reply opened http://localhost:3000 -- a host that serves
+      # no tenant, when a tenant is its subdomain and a session is bound to it. The
+      # base is APP_URL_TEMPLATE now, with {tenant} in the host. This holds the rule
+      # that fills it to kong.yml's own, shows that nothing failing the rule is ever
+      # put into a link, and that Auth and Notification each refuse to start with the
+      # template missing, set to the old base, or malformed. The links themselves are
+      # read out of Mailpit, per tenant, by the email verifiers further down.
+      - name: Assert emailed links are built on the tenant's subdomain, from a template both services check
+        run: node scripts/verify-app-url-template.mjs
 
       # A request body the client got wrong is the client's fault. Every service's
       # error middleware answered all errors 500, and express.json() runs before
@@ -1217,7 +1231,7 @@ jobs:
       # Refusing to boot is. Same shape as the relay and ticketing refuse-to-start
       # checks.
       #
-      # PUBLIC_APP_URL is https so that the sink is the only reason left to refuse:
+      # APP_URL_TEMPLATE is https so that the sink is the only reason left to refuse:
       # production also refuses a plain-http origin, and without one this step went
       # green on THAT refusal with the sink's check deleted. The grep names the sink
       # for the same reason. timeout, so a service that starts fails the step rather
@@ -1226,7 +1240,7 @@ jobs:
         working-directory: services/auth
         run: |
           set +e
-          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production PUBLIC_APP_URL=https://app.eventhub.example PORT=3098 \
+          AUTH_DEV_TOKEN_SINK=1 NODE_ENV=production APP_URL_TEMPLATE='https://{tenant}.eventhub.example' PORT=3098 \
             timeout 60 node dist/index.js > /tmp/sink.log 2>&1
           CODE=$?
           set -e
