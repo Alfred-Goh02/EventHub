@@ -15,8 +15,10 @@ import type {
   EventHubApi,
   Page,
   PayResult,
+  Post,
   RegisteredUser,
   Reservation,
+  Thread,
   TicketType,
   TokenPair,
 } from "./types";
@@ -228,5 +230,18 @@ export const httpApi: EventHubApi = {
   async listReservations({ status, cursor }) {
     return (await authed(`/reservations?${qs({ limit: 20, status, cursor })}`))
       .body as Page<Reservation>;
+  },
+  async getPost(id) {
+    return (await authed(`/posts/${encodeURIComponent(id)}`)).body as Post;
+  },
+  async getThread(postId) {
+    return (await authed(`/posts/${encodeURIComponent(postId)}/comments`)).body as Thread;
+  },
+  async addComment(postId, body, parentId) {
+    const r = await authed(`/posts/${encodeURIComponent(postId)}/comments`, {
+      method: "POST",
+      body: parentId ? { body, parentId } : { body },
+    });
+    return r.body as { id: string };
   },
 };
