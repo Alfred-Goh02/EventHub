@@ -15,6 +15,7 @@ import type {
   EventHubApi,
   Page,
   PayResult,
+  RegisteredUser,
   Reservation,
   TicketType,
   TokenPair,
@@ -184,6 +185,21 @@ export const httpApi: EventHubApi = {
     } catch {
       /* the tokens are already gone from this browser */
     }
+  },
+  // The three below carry no bearer token, signed in or not. A reset or an invitation
+  // is proved by the token in the link alone.
+  async forgotPassword(email) {
+    const r = await raw("/auth/forgot-password", { method: "POST", body: { email } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+  },
+  async resetPassword(token, password) {
+    const r = await raw("/auth/reset-password", { method: "POST", body: { token, password } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+  },
+  async register(token, password) {
+    const r = await raw("/auth/register", { method: "POST", body: { token, password } });
+    if (r.status < 200 || r.status >= 300) throw toError(r);
+    return r.body as RegisteredUser;
   },
   async listEvents(cursor) {
     // upcoming: events that have not ended, by the server's clock. The cursor does not
