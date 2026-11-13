@@ -48,7 +48,10 @@ const run = `dlq_${Date.now()}`;
 let failures = 0;
 function check(ok, msg) {
   console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
-  if (!ok) failures += 1;
+  if (!ok) {
+    failures += 1;
+    process.exitCode = 1;
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
