@@ -491,6 +491,27 @@ function backendChecks(units, roots) {
     }
   }
   check(s3 > 0, `CONTROL: ${s3} S3 backend(s) judged`);
+
+  // ONE REGION, WRITTEN IN SEVERAL PLACES. The state bucket is made in bootstrap's region,
+  // each S3 backend names that region to find it, and each root's provider runs in its own
+  // `region` variable. Nothing ties the copies together: a backend left on the old region
+  // fails `init` on the first real apply, which nothing without an account can see. Moving
+  // from ap-southeast-1 to ap-southeast-2 touched three of them.
+  const regions = [];
+  for (const r of roots) {
+    const v = blocksOf(r.items, 'variable', 'region')[0];
+    if (v) regions.push({ at: `${r.rel} variable "region" default`, value: literal(attrOf(v.body, 'default')) });
+    for (const b of backendsOf(r).filter((x) => x.labels[0] === 's3')) {
+      regions.push({ at: `${r.rel} backend "s3" region`, value: literal(attrOf(b.body, 'region')) });
+    }
+  }
+  const distinct = [...new Set(regions.map((x) => x.value))];
+  check(
+    regions.length >= roots.length + s3 && distinct.length === 1 && Boolean(distinct[0]),
+    distinct.length === 1 && distinct[0]
+      ? `every root's region and every backend's region is ${distinct[0]} (${regions.length} place(s))`
+      : `the region is not the same everywhere: ${regions.map((x) => `${x.at} = ${x.value ?? 'not a literal'}`).join('; ')}`,
+  );
 }
 
 function bucketChecks(units) {
@@ -711,6 +732,14 @@ function budgetChecks(units) {
     check(
       missing.length === 0,
       `${u.rel}: aws_budgets_budget.${r.labels[1]} alerts a subscriber at 50, 80 and 100% actual and 100% forecast (${alerts.join(', ') || 'no alerts'})${missing.length ? ` -- missing ${missing.join(', ')}` : ''}`,
+    );
+    // Credits netted off -- AWS's default when cost_types is unset -- and a Free Tier
+    // account's spend reads $0 until the credits are gone: the budget never alerts.
+    const ct = blocksOf(r.body, 'cost_types')[0];
+    const credit = ct ? attrOf(ct.body, 'include_credit') : undefined;
+    check(
+      credit === 'false',
+      `${u.rel}: aws_budgets_budget.${r.labels[1]} counts usage before credits (cost_types include_credit = ${credit ?? 'unset, so AWS nets credits off and a credit-funded spend reads $0'})`,
     );
   }
 }

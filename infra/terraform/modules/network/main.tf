@@ -3,7 +3,7 @@
 
 # Two zones because EKS refuses a cluster whose subnets span fewer, and two is the fewest
 # that survive losing one. Read from the region rather than named, so nothing here is
-# tied to ap-southeast-1; opt-in-not-required leaves out Local Zones.
+# tied to one region; opt-in-not-required leaves out Local Zones.
 data "aws_availability_zones" "available" {
   state = "available"
 

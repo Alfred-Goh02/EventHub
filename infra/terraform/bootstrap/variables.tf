@@ -1,7 +1,7 @@
 variable "region" {
   description = "Where the state bucket lives. envs/*/versions.tf names the same region in its backend block."
   type        = string
-  default     = "ap-southeast-1"
+  default     = "ap-southeast-2"
 }
 
 variable "budget_alert_emails" {

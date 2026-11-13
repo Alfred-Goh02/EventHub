@@ -1,7 +1,9 @@
 variable "region" {
-  description = "The region the demo runs in."
+  # Sydney, not Singapore: the account is on AWS's new experience, whose project Region is
+  # fixed by the contact address (Singapore maps to ap-southeast-2) and cannot be changed.
+  description = "The region the demo runs in: the AWS project's selected Region."
   type        = string
-  default     = "ap-southeast-1"
+  default     = "ap-southeast-2"
 }
 
 variable "aws_account_id" {
