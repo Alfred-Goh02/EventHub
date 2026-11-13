@@ -89,6 +89,16 @@ spec:
               port: http
             periodSeconds: 2
             failureThreshold: 30
+          # SIGTERM and the removal of this pod from the Service's endpoints start at the
+          # same moment, and the removal takes a second or two to reach every node's
+          # kube-proxy. Closing the listener at once refused the connections still routed
+          # here: measured, a rolling restart of Auth under load lost 8 of 690,712
+          # requests (5 ECONNREFUSED, 3 ECONNRESET). So the pod keeps serving for
+          # preStopSeconds, and only then does SIGTERM start the drain.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ $v.preStopSeconds }}"]
           {{- end }}
           resources:
             {{- toYaml $v.resources | nindent 12 }}

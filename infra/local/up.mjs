@@ -9,8 +9,10 @@
  *
  * WHAT IT DOES, in order, each step idempotent:
  *   1. creates the kind cluster from infra/local/kind-cluster.yaml if it is not there;
- *   2. joins its nodes to compose's network, so a pod can reach a compose container;
- *   3. gives every host the services' environment names -- postgres, kafka,
+ *   2. reads compose's resolved configuration, and checks each node is on kind's
+ *      network alone;
+ *   3. joins each data store compose runs to kind's network, and gives every host the
+ *      services' environment names -- postgres, kafka,
  *      schema-registry, ... -- a Service in the cluster whose endpoint is that compose
  *      container. A pod reaches `postgres:5432` here as it will reach the RDS endpoint
  *      on EKS, and the environment is the same string in both places;
@@ -79,20 +81,27 @@ if (!clusters.includes(CLUSTER)) {
 }
 const nodes = run('kind', ['get', 'nodes', '--name', CLUSTER]).split(/\r?\n/).filter(Boolean);
 
-step("2. compose's configuration, and its network");
+step("2. compose's configuration");
 const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
 const services = compose.services;
 const composeNames = new Set(Object.keys(services));
-const postgres = services.postgres?.container_name;
-if (!postgres) fail('compose has no postgres service with a container_name');
-const networks = JSON.parse(run('docker', ['inspect', postgres, '--format', '{{json .NetworkSettings.Networks}}']));
-const network = Object.keys(networks)[0];
-if (!network) fail(`${postgres} is not running; start the stack with docker compose up -d`);
+/**
+ * THE DATA STORES JOIN KIND'S NETWORK; THE NODES NEVER JOIN COMPOSE'S. The first version
+ * did it the other way round, and after Docker's VM restarted two nodes came back
+ * registered under their compose-network address and one under kind's: traffic between
+ * nodes broke, and with it DNS, so a pod on one worker could not resolve `postgres`
+ * while the same pod on another could (measured: EAI_AGAIN on worker2 only). A node
+ * with one network has one address. A container compose recreates loses the extra
+ * network; this step puts it back.
+ */
+const network = 'kind';
+console.log(`    ok    ${Object.keys(services).length} compose service(s); the data stores join the ${network} network`);
 for (const node of nodes) {
-  const r = spawnSync('docker', ['network', 'connect', network, node], { encoding: 'utf8' });
-  if (r.status !== 0 && !/already exists/.test(r.stderr)) fail(`could not join ${node} to ${network}: ${r.stderr}`);
+  const attached = Object.keys(JSON.parse(run('docker', ['inspect', node, '--format', '{{json .NetworkSettings.Networks}}'])));
+  if (attached.length !== 1 || attached[0] !== network) {
+    fail(`${node} is on ${attached.join(', ')}; a node must be on ${network} alone (docker network disconnect the others and restart it)`);
+  }
 }
-console.log(`    ok    ${nodes.length} node(s) joined to ${network}`);
 
 step('3. a Service for every compose host the environment names');
 const bridges = new Map();
@@ -110,6 +119,8 @@ for (const chart of charts) {
 const manifests = [];
 for (const [host, ports] of [...bridges].sort()) {
   const container = services[host].container_name ?? host;
+  const r = spawnSync('docker', ['network', 'connect', network, container], { encoding: 'utf8' });
+  if (r.status !== 0 && !/already exists/.test(r.stderr)) fail(`could not join ${container} to ${network}: ${r.stderr.trim()}`);
   const ip = JSON.parse(run('docker', ['inspect', container, '--format', '{{json .NetworkSettings.Networks}}']))[network]?.IPAddress;
   if (!ip) fail(`${container} has no address on ${network}; is it running?`);
   const portList = [...ports].sort((a, b) => a - b).map((p) => ({ name: `p${p}`, port: p, protocol: 'TCP' }));

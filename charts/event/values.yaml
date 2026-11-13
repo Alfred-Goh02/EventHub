@@ -18,5 +18,6 @@ resources:
     memory: 128Mi
   limits:
     memory: 384Mi
+preStopSeconds: 5
 terminationGracePeriodSeconds: 30
 env: {}

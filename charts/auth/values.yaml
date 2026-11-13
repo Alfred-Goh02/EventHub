@@ -20,6 +20,8 @@ resources:
   limits:
     # argon2id takes about 19 MB a hash, per request in flight.
     memory: 512Mi
+# The grace period holds the preStop wait and then the drain: 5 + 10 < 30.
+preStopSeconds: 5
 terminationGracePeriodSeconds: 30
 # The environment. Empty here on purpose: it carries passwords, and comes from whoever
 # installs -- infra/local/up.mjs from compose's own configuration, or ESO on EKS.

@@ -176,7 +176,17 @@ function main() {
     check(Boolean(res.requests?.cpu && res.requests?.memory && res.limits?.memory), `requests for CPU and memory, and a memory limit (${JSON.stringify(res)})`);
     check(pod.securityContext?.runAsNonRoot === true && c.securityContext?.allowPrivilegeEscalation === false, 'runs as non-root, and cannot escalate');
     const grace = pod.terminationGracePeriodSeconds;
-    check(typeof grace === 'number' && grace * 1000 > drainMs, `terminationGracePeriodSeconds ${grace} s is above the ${drainMs / 1000} s drain backstop`);
+    const preStop = Number(c.lifecycle?.preStop?.exec?.command?.[1] ?? 0);
+    if (port) {
+      check(
+        c.lifecycle?.preStop?.exec?.command?.[0] === 'sleep' && preStop > 0,
+        `it keeps serving ${preStop} s after termination starts, while its endpoint is removed (a rolling restart lost 8 of 690,712 requests without it)`,
+      );
+    }
+    check(
+      typeof grace === 'number' && grace * 1000 > preStop * 1000 + drainMs,
+      `terminationGracePeriodSeconds ${grace} s holds the ${preStop} s preStop wait and the ${drainMs / 1000} s drain backstop`,
+    );
 
     if (deploy.spec.replicas > 1) {
       check(Array.isArray(pod.topologySpreadConstraints) && pod.topologySpreadConstraints.length > 0, `${deploy.spec.replicas} replicas, spread across nodes`);
