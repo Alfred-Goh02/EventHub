@@ -210,9 +210,12 @@ for (const chart of charts) {
       `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`],
     { encoding: 'utf8' },
   );
-  const ok = r.status === 0;
+  // The answer itself, not only the exit code: one run printed "ok event:" with nothing
+  // after it, which a zero exit alone would have called ready.
+  const answer = r.stdout.trim();
+  const ok = r.status === 0 && /^200 /.test(answer);
   ready &&= ok;
-  console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${chart}: ${r.stdout.trim() || r.stderr.trim()}`);
+  console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${chart}: ${answer || r.stderr.trim() || `(no answer, exit ${r.status})`}`);
 }
 if (!ready) process.exitCode = 1;
 console.log(ready ? '\nevery service answers ready from inside the cluster' : '\nFAIL: a service is not ready');
