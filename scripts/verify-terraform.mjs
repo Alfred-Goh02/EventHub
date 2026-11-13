@@ -29,6 +29,13 @@
  *   - every EKS cluster with a public endpoint sets public_access_cidrs, and the
  *     variable it comes from has no 0.0.0.0/0 default at any level it is passed
  *     through, nor in the root's terraform.tfvars.example;
+ *   - no IAM OIDC or SAML provider and no Federated trust: the AWS project's SCPs deny
+ *     iam:*Provider* on both plans, so IRSA fails at apply. Every role a pod assumes
+ *     trusts pods.eks.amazonaws.com with sts:TagSession, pins cluster, namespace and
+ *     service account with StringEquals, and has its association; the agent addon runs;
+ *   - every node group checks its instance types, in a lifecycle precondition, against
+ *     a list its caller reads from AWS (describe-instance-types free-tier-eligible), so
+ *     a type the account cannot launch refuses the plan instead of stalling the apply;
  *   - every ECR repository is IMMUTABLE;
  *   - every root's aws provider sets default_tags with Project, and no module configures
  *     a provider of its own (one would not carry the root's tags);
@@ -680,6 +687,112 @@ function eksChecks(units) {
   }
 }
 
+/** The string literals in an expression: ["a", "b"] gives a, b. */
+const strings = (value) => [...String(value ?? '').matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+
+/**
+ * THE FIRST APPLY MET BOTH OF THESE, and neither can be seen without an account. The
+ * project's SCPs deny iam:*Provider* on the free plan and the paid one alike, so the IRSA
+ * design failed on iam:CreateOpenIDConnectProvider with the cluster already up. Pod
+ * Identity needs no provider; what keeps it as tight as IRSA was is the trust policy,
+ * pinned to one service account in one cluster through the session tags it sets.
+ */
+function podIdentityChecks(units) {
+  section('pods get AWS roles through Pod Identity, pinned to one service account in one cluster');
+  const providers = units.flatMap((u) =>
+    ['aws_iam_openid_connect_provider', 'aws_iam_saml_provider'].flatMap((t) => blocksOf(u.items, 'resource', t).map((r) => `${t}.${r.labels[1]} at ${where(r)}`)),
+  );
+  check(providers.length === 0, `no IAM identity provider: the AWS project's SCPs deny iam:*Provider* on both plans, so one fails at apply, after the cluster is up${providers.length ? ` -- ${providers.join('; ')}` : ''}`);
+
+  const documents = units.flatMap((u) => blocksOf(u.items, 'data', 'aws_iam_policy_document').map((d) => ({ u, d })));
+  const statements = documents.flatMap(({ u, d }) => blocksOf(d.body, 'statement').map((s) => ({ u, d, s })));
+  const federated = statements.filter(({ s }) => blocksOf(s.body, 'principals').some((p) => literal(attrOf(p.body, 'type')) === 'Federated'));
+  check(
+    federated.length === 0,
+    `no trust statement names a Federated principal, the shape of an IRSA role${federated.length ? ` -- ${federated.map(({ u, d, s }) => `${u.rel}: aws_iam_policy_document.${d.labels[1]} at ${where(s)}`).join('; ')}` : ''}`,
+  );
+
+  const podTrust = statements.filter(({ s }) =>
+    blocksOf(s.body, 'principals').some((p) => literal(attrOf(p.body, 'type')) === 'Service' && strings(attrOf(p.body, 'identifiers')).includes('pods.eks.amazonaws.com')),
+  );
+  check(podTrust.length > 0, `CONTROL: ${podTrust.length} trust statement(s) for pods.eks.amazonaws.com found to judge`);
+  const PINNED = ['aws:RequestTag/eks-cluster-arn', 'aws:RequestTag/kubernetes-namespace', 'aws:RequestTag/kubernetes-service-account'];
+  for (const { u, d, s } of podTrust) {
+    const id = `${u.rel}: aws_iam_policy_document.${d.labels[1]}`;
+    const actions = strings(attrOf(s.body, 'actions'));
+    const lacking = ['sts:AssumeRole', 'sts:TagSession'].filter((a) => !actions.includes(a));
+    check(
+      literal(attrOf(s.body, 'effect')) !== 'Deny' && lacking.length === 0,
+      `${id} allows sts:AssumeRole and sts:TagSession: Pod Identity tags every session, and a role without TagSession refuses it (${actions.join(', ') || 'no actions'})`,
+    );
+    const conditions = blocksOf(s.body, 'condition').map((c) => ({ test: literal(attrOf(c.body, 'test')), variable: literal(attrOf(c.body, 'variable')), values: attrOf(c.body, 'values') }));
+    const unpinned = PINNED.filter((key) => !conditions.some((c) => c.test === 'StringEquals' && c.variable === key && c.values !== undefined));
+    const loose = conditions.filter((c) => PINNED.includes(c.variable) && c.test !== 'StringEquals');
+    check(
+      unpinned.length === 0 && loose.length === 0,
+      `${id} pins the cluster, the namespace and the service account with StringEquals, so another association to the role gets nothing${unpinned.length ? ` -- not pinned: ${unpinned.join(', ')}` : ''}${loose.length ? ` -- not StringEquals: ${loose.map((c) => `${c.test} ${c.variable}`).join(', ')}` : ''}`,
+    );
+    // A role trusted for Pod Identity is bound by an association; without one it is bound to nothing.
+    const roles = blocksOf(u.items, 'resource', 'aws_iam_role').filter((r) => attrOf(r.body, 'assume_role_policy') === `data.aws_iam_policy_document.${d.labels[1]}.json`);
+    for (const r of roles) {
+      const bound = blocksOf(u.items, 'resource', 'aws_eks_pod_identity_association').filter((a) => attrOf(a.body, 'role_arn') === `aws_iam_role.${r.labels[1]}.arn`);
+      check(bound.length > 0, `${u.rel}: aws_iam_role.${r.labels[1]} has the aws_eks_pod_identity_association that binds it (${bound.length})`);
+    }
+    check(roles.length > 0, `CONTROL: ${id} is the trust policy of ${roles.length} role(s)`);
+  }
+
+  // The associations do nothing on a node without the agent that answers the pods.
+  const associations = units.flatMap((u) => blocksOf(u.items, 'resource', 'aws_eks_pod_identity_association'));
+  const addons = units.flatMap((u) =>
+    blocksOf(u.items, 'resource', 'aws_eks_addon').flatMap((a) => {
+      const name = attrOf(a.body, 'addon_name');
+      return name === 'each.key' || name === 'each.value' ? strings(attrOf(a.body, 'for_each')) : [literal(name)];
+    }),
+  );
+  check(
+    associations.length === 0 || addons.includes('eks-pod-identity-agent'),
+    `${associations.length} Pod Identity association(s), and the eks-pod-identity-agent addon among the cluster's addons (${addons.filter(Boolean).join(', ') || 'none'})`,
+  );
+}
+
+/**
+ * The first apply asked for t3.medium on a free-plan account. EKS said CREATING for half
+ * an hour while every RunInstances failed "not eligible for Free Tier", and a dry run had
+ * said yes. The precondition moves that failure to the plan, and the list it compares
+ * against has to come from AWS, or it is a copy that goes stale.
+ */
+function nodeTypeChecks(units) {
+  section("every node group's instance types are checked at plan time against what the account can launch");
+  const groups = units.flatMap((u) => blocksOf(u.items, 'resource', 'aws_eks_node_group').map((r) => ({ u, r })));
+  check(groups.length > 0, `CONTROL: ${groups.length} aws_eks_node_group(s) found to judge`);
+  for (const { u, r } of groups) {
+    const id = `${u.rel}: aws_eks_node_group.${r.labels[1]}`;
+    const types = attrOf(r.body, 'instance_types');
+    const conditions = blocksOf(r.body, 'lifecycle')
+      .flatMap((l) => blocksOf(l.body, 'precondition'))
+      .map((p) => attrOf(p.body, 'condition') ?? '');
+    const guarding = conditions.filter((c) => c.includes('var.allowed_instance_types') && types !== undefined && c.includes(types));
+    check(
+      guarding.length > 0,
+      `${id} has a lifecycle precondition comparing instance_types (${types ?? 'not set'}) with var.allowed_instance_types${conditions.length ? '' : ' -- no precondition at all'}`,
+    );
+    for (const caller of units) {
+      for (const c of moduleCalls(caller, units).filter((x) => x.unit === u)) {
+        const arg = attrOf(c.block.body, 'allowed_instance_types');
+        const source = /\bdata\.aws_ec2_instance_types\.([\w-]+)\b/.exec(arg ?? '')?.[1];
+        const data = source ? blocksOf(caller.items, 'data', 'aws_ec2_instance_types', source)[0] : undefined;
+        const asks = data
+          ? blocksOf(data.body, 'filter').some((f) => literal(attrOf(f.body, 'name')) === 'free-tier-eligible' && compact(attrOf(f.body, 'values')) === '["true"]')
+          : false;
+        check(
+          asks,
+          `${caller.rel}: module "${c.name}" passes allowed_instance_types from AWS, a data "aws_ec2_instance_types" filtered free-tier-eligible = true (${arg === undefined ? 'not passed, so the precondition checks nothing' : !data ? `${arg}: no such data source` : `data.aws_ec2_instance_types.${source}, ${asks ? 'free-tier-eligible' : 'some other filter'}`})`,
+        );
+      }
+    }
+  }
+}
+
 function ecrChecks(units) {
   section('every ECR repository has immutable tags');
   const repos = units.flatMap((u) => blocksOf(u.items, 'resource', 'aws_ecr_repository').map((r) => ({ u, r })));
@@ -925,6 +1038,8 @@ function main() {
   natChecks(units, roots);
   credentialChecks(tfDir);
   eksChecks(units);
+  podIdentityChecks(units);
+  nodeTypeChecks(units);
   ecrChecks(units);
   tagChecks(units, roots, modules);
   budgetChecks(units);

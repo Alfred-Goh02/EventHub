@@ -72,11 +72,33 @@ variable "admin_principal_arn" {
   }
 }
 
+# M7I-FLEX.LARGE, BECAUSE IT IS WHAT THIS ACCOUNT CAN LAUNCH. The default was t3.medium,
+# and the first apply never got a node: every launch failed "The specified instance type
+# is not eligible for Free Tier" (CloudTrail, 2026-11-13). A dry run of the same launch
+# had answered DryRunOperation, because a dry run checks permissions, not what the
+# account's plan will launch.
+#
+# What the free plan launches in ap-southeast-2, asked on 2026-11-13 with
+#   aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true
+# is t3, t4g and t8i in micro and small, c7i-flex.large and m7i-flex.large. t4g is Arm and
+# the AMI type here is x86. The micro and small types hold 4 and 11 pods a node under the
+# VPC CNI, and 1 or 2 GiB. That leaves the two large ones, 2 vCPU and 29 pods each:
+# c7i-flex.large with 4 GiB at $0.1107 an hour, m7i-flex.large with 8 GiB at $0.1197
+# (Price List API, Sydney). The charts request about 2 GiB for one copy of every process,
+# before ArgoCD or any data store, so twice the memory for under a cent an hour.
 variable "node_instance_types" {
   description = "Instance types for the managed node group. x86_64 only: the AMI type is AL2023_x86_64_STANDARD."
   type        = list(string)
-  default     = ["t3.medium"]
+  default     = ["m7i-flex.large"]
   nullable    = false
+}
+
+# The check that would have stopped the first apply before it began. The root reads the
+# list from AWS; null turns the check off, for an account that launches any type.
+variable "allowed_instance_types" {
+  description = "When set, the instance types this account can launch: node_instance_types must be among them, checked at plan time. Null checks nothing."
+  type        = list(string)
+  default     = null
 }
 
 variable "node_min_size" {

@@ -7,10 +7,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.73"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.4"
-    }
   }
 
   # STATE IN THE BOOTSTRAP BUCKET, LOCKED BY S3 ITSELF. use_lockfile takes the lock with

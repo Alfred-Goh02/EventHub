@@ -16,6 +16,10 @@ admin_principal_arn = "arn:aws:iam::123456789012:role/eventhub-admin"
 # The only account this may be applied to; anything else is refused before a plan.
 aws_account_id = "123456789012"
 
+# The account is on the free plan, so the node types are checked against what it can
+# launch. After upgrading in AWS Settings > Billing:
+# free_plan = false
+
 # Optional overrides. Leave them out to take each module's default.
 # node_desired_size = 2
 # kubernetes_version = "1.37"

@@ -3,14 +3,19 @@ variable "name" {
   type        = string
 }
 
-variable "oidc_provider_arn" {
-  description = "The cluster's IAM OIDC provider (modules/eks output oidc_provider_arn)."
+variable "cluster_name" {
+  description = "The EKS cluster the association is made in (modules/eks output cluster_name)."
   type        = string
 }
 
-variable "oidc_provider_url" {
-  description = "The cluster's OIDC issuer URL (modules/eks output oidc_provider_url). https:// is optional."
+variable "cluster_arn" {
+  description = "The same cluster's ARN (modules/eks output cluster_arn): the trust policy admits sessions tagged with it and no other."
   type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws:eks:[a-z0-9-]+:[0-9]{12}:cluster/.+$", var.cluster_arn))
+    error_message = "cluster_arn is an EKS cluster ARN: arn:aws:eks:<region>:<account>:cluster/<name>."
+  }
 }
 
 variable "namespace" {

@@ -75,13 +75,17 @@ resource "aws_eks_cluster" "this" {
 }
 
 # THE CORE ADDONS. vpc-cni and kube-proxy before the nodes, because a node without a CNI
-# never becomes Ready. coredns after them, because it is a Deployment: with no node to
-# schedule on it stays degraded, and Terraform would wait on it until it timed out.
+# never becomes Ready. eks-pod-identity-agent with them, so that every node runs the agent
+# from its first minute and no pod that needs an AWS role starts before there is one to
+# ask (it is a DaemonSet, like the other two, so it does not wait for a node). coredns
+# after them all, because it is a Deployment: with no node to schedule on it stays
+# degraded, and Terraform would wait on it until it timed out.
 #
 # No addon_version: EKS installs the default version for the cluster's Kubernetes
-# version. Pinning one is a deliberate upgrade, done here, when one is wanted.
+# version (for 1.37 on 2026-11-13, eks-pod-identity-agent v1.4.1-eksbuild.3). Pinning one
+# is a deliberate upgrade, done here, when one is wanted.
 resource "aws_eks_addon" "before_nodes" {
-  for_each = toset(["vpc-cni", "kube-proxy"])
+  for_each = toset(["vpc-cni", "kube-proxy", "eks-pod-identity-agent"])
 
   cluster_name                = aws_eks_cluster.this.name
   addon_name                  = each.key
@@ -112,6 +116,20 @@ resource "aws_eks_node_group" "default" {
 
   update_config {
     max_unavailable = 1
+  }
+
+  # REFUSED AT PLAN TIME, NOT HALF AN HOUR INTO THE APPLY. The first apply asked for a
+  # type the account could not launch. EKS reported the node group CREATING, with no
+  # health issue, while its Auto Scaling group's every RunInstances failed "not eligible
+  # for Free Tier": the cluster, the NAT and the rest were up and billing for 30 minutes
+  # before anyone looked in CloudTrail. allowed_instance_types is read from AWS by the
+  # root (describe-instance-types), so this compares against the account's own answer,
+  # before anything exists.
+  lifecycle {
+    precondition {
+      condition     = var.allowed_instance_types == null || length(setsubtract(var.node_instance_types, coalesce(var.allowed_instance_types, []))) == 0
+      error_message = "node_instance_types asks for ${join(", ", setsubtract(var.node_instance_types, coalesce(var.allowed_instance_types, [])))}, which this account cannot launch. It can launch: ${join(", ", coalesce(var.allowed_instance_types, []))}."
+    }
   }
 
   # With authentication mode API, EKS creates the node role's access entry itself

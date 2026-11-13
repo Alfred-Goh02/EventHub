@@ -23,14 +23,9 @@ output "cluster_security_group_id" {
   value       = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
 }
 
-output "oidc_provider_arn" {
-  description = "The IAM OIDC provider for IRSA: the Federated principal of every service-account role."
-  value       = aws_iam_openid_connect_provider.this.arn
-}
-
-output "oidc_provider_url" {
-  description = "The cluster's OIDC issuer URL, https:// included."
-  value       = aws_eks_cluster.this.identity[0].oidc[0].issuer
+output "cluster_arn" {
+  description = "The cluster's ARN: what a Pod Identity role's trust policy pins (modules/pod-identity-role)."
+  value       = aws_eks_cluster.this.arn
 }
 
 output "node_role_arn" {

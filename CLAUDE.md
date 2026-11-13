@@ -808,3 +808,24 @@ reservations, which `verify-inventory-reconciliation.mjs` asks of every tenant. 
 through the provider's webhook, assert nothing is unsettled and the counters agree, and
 delete only the money-free rows made by SQL, counted. `verify-reservation-reads.mjs` is the
 model.
+
+## A dry run answers whether you may, not whether it will
+
+`run-instances --dry-run` of t3.medium answered `DryRunOperation`, and #179 wrote that the
+free plan allowed the node size. It did not. In the first real apply, every launch the node
+group's Auto Scaling group made failed with "not eligible for Free Tier". A dry run checks
+IAM permissions; what the account's plan will launch is decided on the real call. All the
+while, EKS reported the node group CREATING, with no health issue, for thirty minutes, with
+the cluster and the NAT billing.
+
+The error was in CloudTrail from the first minute, on calls neither Terraform nor EKS showed:
+`lookup-events` for `RunInstances` named it in one line. When a managed service sits in a
+pending state, read the calls it makes on your behalf before waiting longer. Then move the
+check to where it fails first. The node group now has a precondition against the list
+`describe-instance-types` gives for `free-tier-eligible`, read at plan time, and a plan
+asking for t3.medium is refused before anything exists.
+
+The same apply met the account's SCP (`iam:*Provider*` is denied, so no IRSA) on a call
+that a read of the published policy would have ruled out. Read the published SCPs before
+designing against an account you do not run. That is the account's version of reading the
+library at the version you run.
