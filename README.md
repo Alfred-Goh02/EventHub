@@ -90,7 +90,8 @@ an exemption nobody wrote down is indistinguishable from a policy somebody forgo
 | `db/init/` | Six databases and nineteen roles, with `CONNECT` revoked from `PUBLIC` |
 | `charts/` | The services' Helm charts: `eventhub-common`, a library chart holding the Deployment, Service, PodDisruptionBudget and environment Secret every service shares, and one thin chart for each of the fifteen processes compose runs -- the eight services, Ticketing's sweeper and reconciler, Analytics' ingest and the four outbox relays. Probes are split -- liveness on `/health`, readiness on `/ready` -- and `verify-helm-charts.mjs` checks each path against the routes the service registers, and every chart against the process compose runs |
 | `infra/local/` | A local kind cluster (one control plane, two workers) that runs the charts against the data stores compose runs. `node infra/local/up.mjs` creates it, bridges compose's Postgres, Kafka and the rest in as Services, and installs every chart; versions and commands are in `infra/TOOLVERSIONS.md` |
-| `scripts/verify-*.mjs` | 104 executable proofs of the invariants above |
+| `infra/terraform/` | The AWS demo environment in Terraform, every resource written out with no registry modules: a bootstrap root (the S3 state bucket and a $10 monthly budget), then a VPC with one NAT gateway, an EKS cluster with one managed node group and IRSA, the ECR repository, and the Load Balancer Controller's role. State locks in S3 itself (`use_lockfile`). Terraform stops at the cluster boundary; the apply order, an hour's cost and the teardown runbook are in `infra/terraform/README.md`, and `verify-terraform.mjs` checks it all without an AWS account |
+| `scripts/verify-*.mjs` | 105 executable proofs of the invariants above |
 
 Six separate Postgres databases with their own credentials. CI reads every
 database and login role from `db/init` and asserts that no role can even open a

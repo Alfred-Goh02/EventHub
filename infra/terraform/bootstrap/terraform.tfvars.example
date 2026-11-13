@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (git ignores it) and fill in:
+#   Copy-Item infra/terraform/bootstrap/terraform.tfvars.example infra/terraform/bootstrap/terraform.tfvars
+
+# Who gets the budget alerts. AWS Budgets emails these addresses directly; there is no
+# subscription to confirm.
+budget_alert_emails = ["you@example.com"]
