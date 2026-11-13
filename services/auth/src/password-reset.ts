@@ -1,4 +1,4 @@
-import { prisma } from './db.js';
+import { databaseNow, prisma } from './db.js';
 import type { Prisma } from './generated/prisma/client.js';
 import { hashSecretToken, newSecretToken } from './secret-token.js';
 
@@ -11,6 +11,25 @@ import { hashSecretToken, newSecretToken } from './secret-token.js';
  * else can read.
  */
 const RESET_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Revokes every live reset token a user has, in the caller's transaction, on the
+ * database's clock.
+ *
+ * Nothing compares a revokedAt with a time -- every reader asks only whether it is
+ * set -- so a stamp from this process would do no harm today. It is the database's
+ * anyway, in the statement that sets it, so that every time on this row is on one
+ * clock and the next reader of it does not have to know which columns are safe.
+ *
+ * Called when a reset is issued, so at most one is ever live, and when one is
+ * completed, so a link harvested before the user noticed anything dies with their
+ * own recovery.
+ */
+export async function revokeLiveResets(tx: Prisma.TransactionClient, userId: string): Promise<number> {
+  return tx.$executeRaw`
+    UPDATE "PasswordResetToken" SET "revokedAt" = now() AT TIME ZONE 'UTC'
+     WHERE "userId" = ${userId} AND "usedAt" IS NULL AND "revokedAt" IS NULL`;
+}
 
 /**
  * Issues a reset token and revokes the user's earlier ones, in the caller's
@@ -26,6 +45,12 @@ const RESET_TTL_MS = 30 * 60 * 1000;
  * has noticed the intrusion and completed their own reset. The user does the one
  * thing they are told to do and it buys them nothing.
  *
+ * THE EXPIRY IS THE DATABASE'S, and so is the expiresAt returned, which the email's
+ * seal and its envelope carry. It was `new Date(Date.now() + RESET_TTL_MS)`, this
+ * process's clock, while every judgement of it is made against now(): measured with
+ * Auth an hour fast, a thirty-minute link was stored to expire 5400 s after the
+ * database's now(), and told Notification the same.
+ *
  * Returns the raw token EXACTLY ONCE. Only the hash is stored, so it cannot be
  * recovered afterwards — a lost link must be reissued, not looked up.
  */
@@ -33,13 +58,10 @@ export async function issueResetToken(
   tx: Prisma.TransactionClient,
   params: { userId: string; tenantId: string },
 ): Promise<{ token: string; expiresAt: Date }> {
-  await tx.passwordResetToken.updateMany({
-    where: { userId: params.userId, usedAt: null, revokedAt: null },
-    data: { revokedAt: new Date() },
-  });
+  await revokeLiveResets(tx, params.userId);
 
   const token = newSecretToken();
-  const expiresAt = new Date(Date.now() + RESET_TTL_MS);
+  const expiresAt = await databaseNow(tx, RESET_TTL_MS);
 
   await tx.passwordResetToken.create({
     data: {
@@ -68,20 +90,34 @@ export type ResetLookup =
  * It runs on the module client rather than a transaction client for the same
  * reason: withTenant would need the tenant this call exists to discover.
  *
+ * EXPIRED IS THE DATABASE'S ANSWER, as lookupInvite's is. This compared
+ * `record.expiresAt < new Date()` in JavaScript, on this process's clock, so a
+ * replica an hour fast refused a link the database said had thirty minutes left,
+ * and one an hour slow honoured a link for ninety. Measured with Auth an hour fast.
+ *
  * IMPORTANT: this resolves identity only. It is NOT the authority on whether the
  * token may be spent — the reasons it returns are stale the moment it returns
  * them, because nothing is locked. Spending is decided by the guarded UPDATE in
- * the reset handler, which re-checks the same conditions as part of the write.
+ * the reset handler, which re-checks all three conditions, expiry included, as
+ * part of the write. It did not always: the claim checked usedAt and revokedAt
+ * only, so a token that ran out between this read and the claim -- an argon2 hash
+ * sits between them -- was still spent.
  */
 export async function lookupResetToken(token: string): Promise<ResetLookup> {
-  const record = await prisma.passwordResetToken.findUnique({
-    where: { tokenHash: hashSecretToken(token) },
-  });
+  const [record] = await prisma.$queryRaw<
+    Array<{ id: string; userId: string; tenantId: string; revoked: boolean; used: boolean; expired: boolean }>
+  >`
+    SELECT t.id, t."userId", t."tenantId",
+           t."revokedAt" IS NOT NULL AS revoked,
+           t."usedAt" IS NOT NULL AS used,
+           t."expiresAt" <= (now() AT TIME ZONE 'UTC') AS expired
+      FROM "PasswordResetToken" t
+     WHERE t."tokenHash" = ${hashSecretToken(token)}`;
 
   if (!record) return { ok: false, reason: 'invalid' };
-  if (record.revokedAt) return { ok: false, reason: 'revoked' };
-  if (record.usedAt) return { ok: false, reason: 'used' };
-  if (record.expiresAt < new Date()) return { ok: false, reason: 'expired' };
+  if (record.revoked) return { ok: false, reason: 'revoked' };
+  if (record.used) return { ok: false, reason: 'used' };
+  if (record.expired) return { ok: false, reason: 'expired' };
 
   return { ok: true, id: record.id, userId: record.userId, tenantId: record.tenantId };
 }
