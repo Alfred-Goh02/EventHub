@@ -21,6 +21,10 @@ resource "aws_budgets_budget" "monthly" {
   # credit, so a budget that counts them sees about $0 and never alerts -- while the $120
   # it would have warned about runs down. Counting usage gross is what makes the alert
   # fire. Found reading the first real plan, whose cost_types were unset.
+  cost_types {
+    include_credit = false
+    include_refund = false
+  }
 
   notification {
     comparison_operator        = "GREATER_THAN"
