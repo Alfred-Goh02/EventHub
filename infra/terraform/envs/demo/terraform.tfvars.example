@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars (git ignores it) and fill in:
+#   Copy-Item infra/terraform/envs/demo/terraform.tfvars.example infra/terraform/envs/demo/terraform.tfvars
+# None of it is secret, but your address and account are nobody else's business.
+
+# Who may reach the cluster's public API endpoint: your own address as a /32. Find it with
+#   (Invoke-RestMethod https://checkip.amazonaws.com).Trim()
+# 0.0.0.0/0 is refused. If your address changes, re-apply with the new one.
+eks_public_access_cidrs = ["203.0.113.10/32"]
+
+# The IAM user or role kubectl runs as, made cluster admin through an access entry. The
+# role's own ARN (arn:aws:iam::<account>:role/<name>), not the assumed-role ARN that
+#   aws sts get-caller-identity --profile eventhub
+# prints for a role session.
+admin_principal_arn = "arn:aws:iam::123456789012:role/eventhub-admin"
+
+# The only account this may be applied to; anything else is refused before a plan.
+aws_account_id = "123456789012"
+
+# Optional overrides. Leave them out to take each module's default.
+# node_desired_size = 2
+# kubernetes_version = "1.37"

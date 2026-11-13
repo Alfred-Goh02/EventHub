@@ -46,3 +46,10 @@ services/*/src/generated
 # The web app is built and served on its own (apps/web has its own lockfile and CI job);
 # nothing in the backend image runs it.
 apps
+
+# TERRAFORM, THE WHOLE DIRECTORY. Nothing in the image runs it, and once anyone has run
+# `terraform init` or applied the bootstrap root, it holds what must never be in a layer:
+# the bootstrap's local terraform.tfstate, terraform.tfvars with real values, and
+# hundreds of megabytes of provider binaries under .terraform/. `COPY . .` would take
+# all of it. Excluding the directory covers every name those files take.
+infra/terraform
