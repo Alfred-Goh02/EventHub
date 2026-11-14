@@ -9,8 +9,8 @@
  *     the function infra/local/up.mjs bridges with), each a ClusterIP Service of that
  *     name on every port the apps dial, and no Service anywhere is a LoadBalancer or
  *     NodePort;
- *   - each image is compose's image and tag, pinned by digest, and the digest is the one
- *     this machine pulled for that tag when docker can say;
+ *   - compose pins each store image by digest, and the chart's image is exactly compose's
+ *     reference, so compose, CI and EKS all run the same bits;
  *   - each environment variable is compose's, value for value. A password is read from a
  *     Secret, never written. The deliberate differences -- an override or an addition --
  *     are declared below with the reason, and a declaration that no longer differs from
@@ -29,7 +29,7 @@
  *     heap below that limit.
  *
  * Needs helm and docker on PATH (CI has both, and runs this after starting the stores, so
- * their images are there to compare digests with).
+ * their images are there to ask which user each runs as).
  *   node scripts/verify-store-chart.mjs          against this tree
  *   node scripts/verify-store-chart.mjs [root]   against another: <root>/infra/stores and
  *                                                <root>/docker-compose.yml -- how a planted
@@ -187,16 +187,14 @@ function main() {
     }
     check(pod.containers.length === 1, `${name}: one container (${pod.containers.length})`);
 
-    const pinned = new RegExp(`^${svc.image.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@sha256:[0-9a-f]{64}$`).test(c.image);
-    check(pinned, `${name}: image is compose's ${svc.image}, pinned by digest, so EKS runs the bits compose was tested on (${c.image})`);
-    const local = docker(['image', 'inspect', svc.image, '--format', '{{json .RepoDigests}}']);
-    if (local.status === 0) {
-      const digests = JSON.parse(local.stdout.trim() || '[]').map((d) => d.split('@')[1]);
-      const ours = c.image.split('@')[1];
-      check(digests.includes(ours), `${name}: the pinned digest is the one this machine pulled for ${svc.image} (${digests.join(', ') || 'none recorded'})`);
-    } else {
-      note(`${name}: ${svc.image} is not on this machine, so its digest is not compared (CI pulls it before this step)`);
-    }
+    // THE SAME REFERENCE, DIGEST AND ALL. The first version pinned the chart and compared
+    // its digest with whatever docker had pulled for compose's tag. CI refused it: compose
+    // said postgres:16, a tag that moves, and the runner, pulling months after this
+    // machine, had different bits under the same name. So compose pins too, and the chart
+    // must be exactly compose's reference: one string, one image, wherever it is pulled.
+    const digestPinned = (ref) => /@sha256:[0-9a-f]{64}$/.test(String(ref ?? ''));
+    check(digestPinned(svc.image), `${name}: compose pins its image by digest, so every machine that pulls it gets the same bits (${svc.image})`);
+    check(c.image === svc.image, `${name}: the chart's image is exactly compose's${c.image === svc.image ? '' : ` -- chart ${c.image}, compose ${svc.image}`}`);
 
     // The environment, variable by variable.
     const env = new Map((c.env ?? []).map((e) => [e.name, e]));
