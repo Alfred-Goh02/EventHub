@@ -1,0 +1,42 @@
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "ApplicationSet",
+  "metadata": { "name": "services", "namespace": "argocd" },
+  "spec": {
+    "goTemplate": true,
+    "goTemplateOptions": ["missingkey=error"],
+    "generators": [
+      {
+        "git": {
+          "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
+          "revision": "main",
+          "directories": [
+            { "path": "charts/*" },
+            { "path": "charts/eventhub-common", "exclude": true }
+          ]
+        }
+      }
+    ],
+    "template": {
+      "metadata": {
+        "name": "{{.path.basename}}",
+        "labels": { "app.kubernetes.io/part-of": "eventhub" }
+      },
+      "spec": {
+        "project": "default",
+        "source": {
+          "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
+          "targetRevision": "main",
+          "path": "{{.path.path}}",
+          "helm": {
+            "releaseName": "{{.path.basename}}",
+            "valueFiles": ["values.yaml", "../../infra/argocd/env/eks.yaml"],
+            "parameters": [{ "name": "image.tag", "value": "$ARGOCD_APP_REVISION_SHORT" }]
+          }
+        },
+        "destination": { "server": "https://kubernetes.default.svc", "namespace": "default" },
+        "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
+      }
+    }
+  }
+}

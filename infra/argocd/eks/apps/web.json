@@ -1,0 +1,28 @@
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {
+    "name": "web",
+    "namespace": "argocd",
+    "labels": { "app.kubernetes.io/part-of": "eventhub" },
+    "finalizers": ["resources-finalizer.argocd.argoproj.io"]
+  },
+  "spec": {
+    "project": "default",
+    "source": {
+      "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
+      "targetRevision": "main",
+      "path": "infra/web",
+      "helm": {
+        "releaseName": "web",
+        "valueFiles": ["values.yaml"],
+        "parameters": [
+          { "name": "image.repository", "value": "ghcr.io/alfred-goh02/eventhub/web" },
+          { "name": "image.tag", "value": "$ARGOCD_APP_REVISION_SHORT" }
+        ]
+      }
+    },
+    "destination": { "server": "https://kubernetes.default.svc", "namespace": "default" },
+    "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
+  }
+}

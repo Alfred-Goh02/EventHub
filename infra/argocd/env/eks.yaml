@@ -1,0 +1,14 @@
+# What differs on the EKS cluster, for every service chart: the image is the one CI published
+# for the commit Argo CD deploys (.github/workflows/publish.yml), and one replica each, since
+# pods, not memory, are that cluster's tight limit (29 a node).
+#
+# The tag is not here. Each Application passes image.tag = $ARGOCD_APP_REVISION_SHORT, the
+# first seven hex digits of the commit it deploys -- exactly the tag CI pushed it under. A
+# tag written into this file would be a deploy that git does not describe.
+#
+# The registry is private: the installer attaches a read-only pull Secret to the namespace's
+# default service account, which every pod here runs as (infra/eks/up.mjs --gitops).
+image:
+  repository: ghcr.io/alfred-goh02/eventhub/app
+  pullPolicy: IfNotPresent
+replicas: 1

@@ -123,6 +123,30 @@ kubectl version --client
    kubectl --context eventhub-demo get pods,pvc
    ```
 
+   **Or with Argo CD: `--gitops`**, which deploys main as CI published it, and keeps the
+   cluster on main from then on. The installer still makes the credentials, every Secret
+   and the stores; then it installs Argo CD (the version kind runs), hands it the
+   repository through the read-only deploy key kind uses (`%USERPROFILE%\.eventhub\argocd-deploy-key`),
+   and applies `infra/argocd/eks/root.json`. Every service, the gateway, the web app and
+   setup are then Argo CD's, each on the images `publish.yml` pushed to GitHub's container
+   registry for the commit it deploys. The checkout must be main itself, and CI must have
+   published main's images.
+
+   The registry is private, so the cluster pulls with a token of yours that can only read
+   packages. Make it once: GitHub, Settings, Developer settings, Personal access tokens,
+   Tokens (classic), Generate new token (classic), with an expiry and **only** the
+   `read:packages` scope. Then, in the same PowerShell window, paste it where the prompt
+   asks, so it is in no file and no history:
+
+   ```powershell
+   $env:GHCR_TOKEN = Read-Host -Prompt 'read:packages token'
+   git switch main; git pull
+   node infra/eks/up.mjs --context eventhub-demo --gitops
+   ```
+
+   `--down` removes Argo CD's Applications first (with self-heal on, Argo CD would put back
+   anything taken off before it), then Argo CD, then the stores and their disks.
+
    The gateway and the web app are ClusterIP until the domain is decided. To open the app
    from this machine, stop compose's Kong first: the page calls the API on port 8000 of its
    own host, where compose's Kong otherwise answers. Each port-forward runs in its own
