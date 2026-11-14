@@ -4,9 +4,10 @@
 # somewhere to spread to: a single-node cluster hides every scheduling problem.
 #
 # The data stores are NOT in here. Postgres, Kafka, Redis and the rest keep running
-# in compose, as RDS, MSK and ElastiCache will sit outside EKS; infra/local/kind-up.ps1
-# joins these nodes to compose's network and gives each store a Service, so a pod
-# reaches `postgres:5432` here as it will reach the RDS endpoint there.
+# in compose, as RDS, MSK and ElastiCache will sit outside EKS; infra/local/up.mjs
+# joins each store to kind's network -- never these nodes to compose's -- and gives
+# each one an ExternalName Service naming its container, so a pod reaches
+# `postgres:5432` here as it will reach the RDS endpoint there.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: eventhub
