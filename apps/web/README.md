@@ -35,12 +35,24 @@ any other host (Lovable's preview, for instance) the app uses the sample data in
 pnpm run typecheck   # tsc, with the strict settings in tsconfig.json
 pnpm run lint        # eslint + prettier
 pnpm run test        # vitest
-pnpm run build       # TanStack Start, via Lovable's Vite config
+pnpm run build       # TanStack Start, via Lovable's Vite config, for a Node server
 ```
 
 It is not a member of the root pnpm workspace: it imports nothing from the services, and
 as a member it would be copied into the backend image. It installs from its own
 `pnpm-lock.yaml`.
+
+## Its image
+
+`docker build apps/web` builds the image the EKS cluster runs (`infra/web`): nitro's
+`node-server` output and nothing else, served by `node .output/server/index.mjs` on port
+3000, as the `node` user. The build targets Node because `vite.config.ts` says so; the shared
+Lovable config would otherwise build for Cloudflare. `infra/eks/up.mjs` builds it, tags it
+with the commit, and pushes it to its own ECR repository.
+
+The page calls the API at the same host on port 8000, so in production the web app is
+served on 443 and the gateway on 8000, under the same tenant host; the gateway's CORS rule
+allows exactly that origin.
 
 ## Stack
 

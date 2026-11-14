@@ -1,0 +1,9 @@
+{{- $v := .Values -}}
+{{- if not $v.image.repository }}{{ fail "image.repository is required: the eventhub/web repository in ECR (infra/eks/up.mjs sets it)" }}{{ end -}}
+{{- if not $v.image.tag }}{{ fail "image.tag is required: the git SHA the image was built from" }}{{ end -}}
+{{- if eq (toString $v.image.tag) "latest" }}{{ fail "image.tag must not be latest: a tag names one build" }}{{ end -}}
+{{- include "web.emit" (list . "web.deployment") }}
+{{- include "web.emit" (list . "web.service") }}
+{{- if gt (int $v.replicas) 1 }}
+{{- include "web.emit" (list . "web.pdb") }}
+{{- end }}

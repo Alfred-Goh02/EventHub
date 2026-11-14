@@ -1,0 +1,5 @@
+apiVersion: v2
+name: web
+description: "EventHub's web app inside the EKS cluster: apps/web's own image, nitro's Node server, beside the gateway it calls."
+type: application
+version: 0.1.0

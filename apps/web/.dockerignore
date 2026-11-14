@@ -1,0 +1,16 @@
+# The build context is apps/web alone. What the install makes, the build makes, and anything
+# local stays out: the image installs from pnpm-lock.yaml and builds from source.
+node_modules
+.output
+.nitro
+.tanstack
+dist
+dist-ssr
+.vinxi
+.wrangler
+*.log
+*.local
+.env
+.env.*
+Dockerfile
+.dockerignore
