@@ -23,8 +23,8 @@
  *     compose publishes to the host's loopback, nor the Admin API, which listens on the
  *     container's own loopback.
  *
- * Needs helm and docker on PATH (CI runs it after the step that parses kong.yml with Kong's
- * image, so the image is there to ask which user it runs as).
+ * Needs helm and docker on PATH, and Kong's image pulled, to ask it which user it runs as (the
+ * CI step pulls it by compose's reference first).
  *   node scripts/verify-gateway-chart.mjs          against this tree
  *   node scripts/verify-gateway-chart.mjs [root]   against another (a red run in a copy)
  */
@@ -210,7 +210,7 @@ function main() {
     const uid = id.status === 0 ? Number(id.stdout.trim()) : Number.NaN;
     check(sc.runAsNonRoot === true && uid > 0 && sc.runAsUser === uid, `runs as the image's own user, ${user.stdout.trim()} (uid ${uid}), non-root (runAsNonRoot ${sc.runAsNonRoot}, runAsUser ${sc.runAsUser})`);
   } else if (process.env.CI) {
-    check(false, `${kong.image} is not on the runner, so who it runs as cannot be checked; this step must run after the step that parses kong.yml with it`);
+    check(false, `${kong.image} is not on the runner, so who it runs as cannot be checked; the CI step pulls it first, since "Free runner disk" prunes every image`);
   } else {
     note(`${kong.image} is not on this machine, so the uid is not checked against the image`);
     check(sc.runAsNonRoot === true && sc.runAsUser > 0, `runs non-root (runAsNonRoot ${sc.runAsNonRoot}, runAsUser ${sc.runAsUser})`);
