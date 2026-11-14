@@ -1,0 +1,48 @@
+name: publish
+
+# THE IMAGES THE CLUSTER RUNS, FOR EVERY COMMIT ON MAIN, in GitHub's container registry.
+# Argo CD on EKS deploys main and names each image by the commit it deploys
+# ($ARGOCD_APP_REVISION_SHORT), so every commit there needs its images here.
+#
+# Main only takes a change through a pull request whose CI is green, so this does not wait
+# for CI's run on main: it starts at once, and a deploy waits minutes, not the whole suite.
+#
+# NO STORED CREDENTIAL. The run's own GITHUB_TOKEN pushes, with packages:write for this
+# workflow alone. (AWS was the other way, and its SCP denies the OIDC provider a keyless
+# login from GitHub would need.)
+on:
+  push:
+    branches: [main]
+
+# One run per commit, never cancelled: a cancelled run is a commit Argo CD cannot deploy.
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    name: publish the images main is built from
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      # Through the environment, never interpolated into the script: an expression pasted
+      # into `run` is shell source.
+      - name: Log in to ghcr.io with this run's token
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      # scripts/publish-images.mjs says which images (infra/eks/up.mjs's IMAGES) and why the
+      # tag is the commit's first seven hex digits.
+      - name: Build and push every image, tagged with the commit
+        run: node scripts/publish-images.mjs

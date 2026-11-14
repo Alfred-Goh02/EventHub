@@ -139,6 +139,14 @@ jobs:
       - name: Assert every service chart renders a workload Kubernetes can run
         run: node scripts/verify-helm-charts.mjs
 
+      # The other workflow, publish.yml, which pushes the cluster's images for every commit
+      # on main to GitHub's container registry: only on main, never on a pull request; a
+      # token that writes packages and nothing else, and no stored secret; one run per
+      # commit, never cancelled; exactly the installer's IMAGES, tagged with the commit's
+      # first seven digits, the tag Argo CD asks for. Reads files only.
+      - name: Assert main publishes the cluster's images under the tag Argo CD asks for, and nothing else can
+        run: node scripts/verify-image-publish.mjs
+
       # ArgoCD (infra/argocd) runs the cluster from git, and GitOps fails quietly: an
       # ApplicationSet whose generator misses a chart never creates that Application,
       # and one reading the wrong branch stays Synced and Healthy on old code. So the
