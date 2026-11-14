@@ -1,0 +1,4 @@
+# The chart packages this directory, and compose mounts the same directory into its Kong
+# container. The chart needs only kong.yml and render-consumer.lua beside its templates.
+*.md
+.DS_Store

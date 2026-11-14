@@ -15,14 +15,17 @@ the teardown runbook below is part of using it.
 | `modules/eks/` | The cluster (Kubernetes 1.37, access entries only, private and restricted public endpoint, Secrets envelope-encrypted with KMS, standard support only), its IAM role, one managed node group (2 x m7i-flex.large, AL2023, private subnets, its types checked at plan time against what the account can launch), the vpc-cni, kube-proxy, eks-pod-identity-agent and coredns addons, and one cluster-admin access entry |
 | `modules/pod-identity-role/` | An IAM role exactly one service account in one cluster can assume through EKS Pod Identity, and the association that binds it. Not IRSA: the AWS project's SCPs deny `iam:*Provider*`, so an OIDC provider cannot be created |
 | `modules/ecr/` | `eventhub/app`, with immutable tags (images are tagged by git SHA), scan on push, and a keep-the-last-N lifecycle policy |
-| `envs/demo/` | The modules wired together, with state in the bootstrap bucket, locked by S3 itself (`use_lockfile`) |
+| `envs/demo/` | The modules wired together, with state in the bootstrap bucket, locked by S3 itself (`use_lockfile`), plus the EBS CSI driver add-on and its Pod Identity role (`AmazonEBSCSIDriverPolicyV2`), which every data store's disk comes from |
 | `policies/` | The Load Balancer Controller's IAM policy: a reviewed copy of upstream's, at v3.6.3 (`envs/demo/main.tf` says where from) |
 
-**Not here yet: the data layer.** It is the next part. Until then the cluster has nothing
-to point the services at, so this part stands up the platform only. `10.40.32.0/19` and
-`10.40.192.0/18` are left free in the VPC for it. On the free plan the project's SCP allows
-`rds`, `elasticache` and `es` but not `kafka`, so MSK needs the paid plan; Kafka can run in
-the cluster instead.
+**The data layer runs inside the cluster**, from `infra/stores`, a Helm chart: Postgres,
+Redis, OpenSearch, ClickHouse, Kafka, Schema Registry and Mailpit, each as compose runs it,
+the four that keep data on encrypted gp3 disks from the EBS CSI driver this root installs.
+Not RDS, ElastiCache or OpenSearch Service, by decision (2026-11-14): the free plan's SCP
+leaves out `kafka`, so MSK was never an option, and the stores fit on the two nodes.
+`10.40.32.0/19` and `10.40.192.0/18` stay free in the VPC should a managed store come later.
+`infra/eks/up.mjs` installs the rest on top of them: the image, the services' Secrets,
+setup as a Job (`infra/setup`), the fifteen services, and the gateway (`infra/kong`).
 
 **What the account allows.** Two limits shaped this directory, from two places:
 
@@ -100,20 +103,35 @@ kubectl version --client
    kubectl get nodes
    ```
 
-   The Load Balancer Controller's chart takes `clusterName` (`cluster_name`), `region`,
-   `vpcId` (`vpc_id`), and a service account named `aws-load-balancer-controller` in
-   `kube-system`, with **no** role annotation: Terraform's Pod Identity association binds
-   `aws_load_balancer_controller_role_arn` to that name. Install the chart release that
-   ships controller v3.6.3, the version the IAM policy is copied from. Images go to
-   `ecr_repository_url`, tagged by git SHA:
+   Then EventHub itself, with one command, from a clean working tree (the image is tagged
+   with the commit it is built from). It builds and pushes the image to
+   `ecr_repository_url` by git SHA; installs the stores (`infra/stores`) and waits for
+   them; makes every Secret the services read, from compose and the local keypairs; runs
+   setup, compose's own setup command as a Job; installs the fifteen charts one replica
+   each, then Kong in front of them; asks each service's `/ready` from inside the cluster;
+   and sends requests through Kong that only a working gateway answers as they come back
+   (Auth reached, the rate limit counted in Redis, a missing token refused at the edge).
+   Every step is idempotent, so a failed run is re-run. No value is printed.
 
    ```powershell
-   $repo = terraform -chdir=infra/terraform/envs/demo output -raw ecr_repository_url
-   $sha = git rev-parse --short HEAD
-   aws ecr get-login-password --region ap-southeast-2 --profile eventhub | docker login --username AWS --password-stdin $repo.Split('/')[0]
-   docker tag "eventhub/app:$sha" "${repo}:$sha"
-   docker push "${repo}:$sha"
+   node infra/eks/up.mjs --context eventhub-demo
+   kubectl --context eventhub-demo get pods,pvc
    ```
+
+   The gateway is ClusterIP until the domain is decided. From this machine, through a
+   port-forward (18000, because compose's own Kong holds 8000 here):
+
+   ```powershell
+   kubectl --context eventhub-demo port-forward svc/kong 18000:8000
+   curl.exe -i http://acme.eventhub.localhost:18000/auth/me
+   ```
+
+   The Load Balancer Controller's chart, when the cluster gets a public way in, takes
+   `clusterName` (`cluster_name`), `region`, `vpcId` (`vpc_id`), and a service account
+   named `aws-load-balancer-controller` in `kube-system`, with **no** role annotation:
+   Terraform's Pod Identity association binds `aws_load_balancer_controller_role_arn` to
+   that name. Install the chart release that ships controller v3.6.3, the version the IAM
+   policy is copied from.
 
 ## What an hour costs
 
@@ -128,6 +146,7 @@ public IPv4 rate and the KMS key price are AWS's published flat rates, not read 
 | 1 NAT gateway | $0.059 per hour, plus $0.059 per GB it processes | $0.059, plus traffic |
 | The NAT's public IPv4 address | $0.005 per hour | $0.005 |
 | 2 x 20 GiB node root volumes (EBS gp3) | $0.096 per GB-month | about $0.005 |
+| 4 x 10 GiB store disks (EBS gp3: Postgres, OpenSearch, ClickHouse, Kafka) | $0.096 per GB-month; the EBS CSI driver itself is free | about $0.005 |
 | KMS key for Secrets | $1 per key-month, prorated | about $0.001 |
 | ECR | $0.10 per GB-month stored; basic scan on push | pennies a month |
 | State bucket and budget | kilobytes in S3; one budget is inside the allowance AWS publishes | about $0 |
@@ -148,10 +167,10 @@ left running is about $300, thirty times the budget. Check the credits before ea
 aws freetier get-account-plan-state --region ap-southeast-2 --profile eventhub --query "[accountPlanType,accountPlanRemainingCredits.amount,accountPlanExpirationDate]" --output text
 ```
 
-Not in the table: load
-balancers the controller creates once an Ingress exists (billed per hour plus usage), the
-data layer (next part), and cross-zone traffic. Image layers come from S3 through the free
-gateway endpoint, not through the NAT.
+Not in the table: load balancers the controller creates once an Ingress exists (billed per
+hour plus usage), and cross-zone traffic. Image layers from ECR come from S3 through the
+free gateway endpoint, not through the NAT; the stores' images come from Docker Hub and
+do go through it, about 4 GB the first time on each node.
 
 The budget is a backstop, not a timer. AWS refreshes cost data a few times a day, so an
 alert can arrive hours after the spend. The runbook is the control.
@@ -192,16 +211,33 @@ aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias e
    aws ec2 describe-security-groups --region ap-southeast-2 --profile eventhub --filters "Name=tag-key,Values=elbv2.k8s.aws/cluster" --query "SecurityGroups[].[GroupId,GroupName,VpcId]" --output table
    ```
 
-3. **Destroy the demo environment.** Read the plan it shows: everything in it should be
+3. **Delete the stores, and with them their disks, while the EBS CSI driver still runs.**
+   Terraform made neither the claims nor the volumes behind them, and destroys the driver
+   that could delete them: a volume whose claim outlives the driver stays in the account,
+   unattached, billing. Each StatefulSet takes its claim with it
+   (`persistentVolumeClaimRetentionPolicy`), and each claim its volume (reclaim `Delete`).
+   Wait until both lists are empty, then ask AWS: every volume the driver made carries
+   `ebs.csi.aws.com/cluster=true`, and none should be left.
+
+   `--down` does it in that order -- the services and setup, then the stores -- and then
+   waits for both lists to be empty and asks AWS, failing if anything is left:
+
+   ```powershell
+   node infra/eks/up.mjs --context eventhub-demo --down
+   aws ec2 describe-volumes --region ap-southeast-2 --profile eventhub --filters "Name=tag:ebs.csi.aws.com/cluster,Values=true" --query "Volumes[].[VolumeId,State,Size]" --output table
+   ```
+
+4. **Destroy the demo environment.** Read the plan it shows: everything in it should be
    the demo's, and nothing from bootstrap.
 
    ```powershell
    terraform -chdir=infra/terraform/envs/demo destroy
    ```
 
-4. **Look for what outlived it**: unattached EBS volumes, network interfaces, and
+5. **Look for what outlived it**: unattached EBS volumes, network interfaces, and
    addresses. A volume or interface tagged `kubernetes.io/cluster/eventhub-demo` is the
-   cluster's leftover; delete it with `aws ec2 delete-volume --volume-id <id>` or
+   cluster's leftover, and so is a volume tagged `ebs.csi.aws.com/cluster=true` or
+   `Project=eventhub` that step 3 missed; delete it with `aws ec2 delete-volume --volume-id <id>` or
    `aws ec2 delete-network-interface --network-interface-id <id>` (same `--region` and
    `--profile`). An address with no association is billing for nothing.
 
@@ -214,7 +250,7 @@ aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias e
 
    The KMS key is not deleted at once: `destroy` schedules it, seven days out.
 
-5. **Keep the bootstrap bucket and budget.** They cost close to nothing, the budget keeps
+6. **Keep the bootstrap bucket and budget.** They cost close to nothing, the budget keeps
    watching the account, and the next demo window needs the bucket. Only when finished
    with AWS for good, and last of all: empty every version from the bucket, remove the
    `lifecycle { prevent_destroy = true }` block from `bootstrap/state.tf` (a deliberate

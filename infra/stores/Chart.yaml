@@ -1,0 +1,5 @@
+apiVersion: v2
+name: eventhub-stores
+description: "EventHub's data stores inside the EKS cluster: Postgres, Redis, OpenSearch, ClickHouse, Kafka, Schema Registry and Mailpit, each as compose runs it, on EBS disks."
+type: application
+version: 0.1.0

@@ -1,0 +1,110 @@
+{{- /*
+Written once as YAML, emitted as an object: toYaml, or toJson when render=json, which is how
+scripts/verify-eks-install.mjs reads it without a YAML parser (as charts/eventhub-common and
+infra/stores do).
+*/ -}}
+{{- $v := .Values -}}
+{{- if not $v.image.repository }}{{ fail "image.repository is required: the app image in ECR (infra/eks/up.mjs sets it)" }}{{ end -}}
+{{- if not $v.image.tag }}{{ fail "image.tag is required: the git SHA the image was built from" }}{{ end -}}
+{{- if eq (toString $v.image.tag) "latest" }}{{ fail "image.tag must not be latest: a tag names one build" }}{{ end -}}
+{{- if not $v.command }}{{ fail "command is required: compose's setup command, which infra/eks/up.mjs reads from docker compose config" }}{{ end -}}
+{{- define "setup.job" -}}
+{{- $v := .Values -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Named for the build: a new image is a new Job, and so a fresh run of every step; the
+  # same image installed again is the same Job, unchanged, which is what compose does too
+  # (setup is idempotent, and runs once per start).
+  name: setup-{{ $v.image.tag }}
+  labels:
+    app.kubernetes.io/name: setup
+    app.kubernetes.io/part-of: eventhub
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  backoffLimit: {{ $v.backoffLimit }}
+  activeDeadlineSeconds: {{ $v.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: setup
+        app.kubernetes.io/part-of: eventhub
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      # The image's own user, node (uid 1000), as compose runs it; fsGroup so the emptyDirs
+      # are its own to write.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        # Seeds each key directory from its Secret, as files, not the Secret volume's
+        # symlinks; private halves 0600, as generate-keys writes them.
+        - name: seed-keys
+          image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              {{- range $v.workDirs }}
+              {{- if has .volume $v.seedFrom }}
+              cp -L /run/eventhub/secrets/{{ .volume }}/* {{ .path }}/
+              if [ -f {{ .path }}/private.pem ]; then chmod 600 {{ .path }}/private.pem; fi
+              echo "seeded {{ .path }} from Secret {{ .volume }}: $(ls {{ .path }} | tr '\n' ' ')"
+              {{- end }}
+              {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            {{- range $v.workDirs }}
+            - name: work-{{ .volume }}
+              mountPath: {{ .path }}
+            {{- if has .volume $v.seedFrom }}
+            - name: secret-{{ .volume }}
+              mountPath: /run/eventhub/secrets/{{ .volume }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+      containers:
+        - name: setup
+          image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          workingDir: /app
+          command:
+            {{- range $v.command }}
+            - {{ . | quote }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ $v.envSecret }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+          volumeMounts:
+            {{- range $v.workDirs }}
+            - name: work-{{ .volume }}
+              mountPath: {{ .path }}
+            {{- end }}
+      volumes:
+        {{- range $v.workDirs }}
+        - name: work-{{ .volume }}
+          emptyDir: {}
+        {{- if has .volume $v.seedFrom }}
+        - name: secret-{{ .volume }}
+          secret:
+            secretName: {{ .volume }}
+        {{- end }}
+        {{- end }}
+{{- end -}}
+{{- $obj := include "setup.job" . | fromYaml -}}
+{{- if hasKey $obj "Error" }}{{ fail (printf "setup.job did not render as YAML: %s" $obj.Error) }}{{ end }}
+---
+{{ if eq ($v.render | default "yaml") "json" }}{{ toJson $obj }}{{ else }}{{ toYaml $obj }}{{ end }}

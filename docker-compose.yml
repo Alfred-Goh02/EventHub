@@ -55,8 +55,13 @@ x-app: &app
 # kong:8000 is the one way in from anywhere else. verify-compose-gateway.mjs reads
 # every running container's bindings and fails on any other.
 services:
+  # EVERY STORE IMAGE IS PINNED BY DIGEST, the tag kept for the reader. postgres:16 and
+  # redis:7-alpine are tags that move: this machine pulled 16.14 and CI, pulling the same
+  # tag months later, got another image -- found when infra/stores, which runs these same
+  # images on EKS, compared the two. A tag says which line; the digest says which bits.
+  # scripts/verify-store-chart.mjs requires the chart's image to be exactly this one.
   postgres:
-    image: postgres:16
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
     container_name: eventhub-postgres
     restart: unless-stopped
     # The image stops with SIGINT, a fast shutdown: it ends sessions and writes a
@@ -97,7 +102,7 @@ services:
   # in Postgres, and the replayable copy is on Kafka's live.interactions topic.
   # ---------------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     container_name: eventhub-redis
     restart: unless-stopped
     # Nothing to write on the way down, with persistence off.
@@ -136,7 +141,7 @@ services:
   #   wsl -d docker-desktop -e sh -c "sysctl -w vm.max_map_count=262144"
   # ---------------------------------------------------------------------------
   opensearch:
-    image: opensearchproject/opensearch:2.19.0
+    image: opensearchproject/opensearch:2.19.0@sha256:1f8b88245a6af61e7aa500afe0e87d43401e4b33140bb47230a919428ce3f7cb
     container_name: eventhub-opensearch
     restart: unless-stopped
     # Closes its shards on the way down. Killed first, the next start recovers each
@@ -229,7 +234,7 @@ services:
   # like corruption and is not.
   # ---------------------------------------------------------------------------
   clickhouse:
-    image: clickhouse/clickhouse-server:25.8
+    image: clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
     container_name: eventhub-clickhouse
     restart: unless-stopped
     # Waits up to shutdown_wait_unfinished (5 s on this image, read from
@@ -260,7 +265,7 @@ services:
   # than about 2024 still shows a second container for it, and you do not need it.
   # ---------------------------------------------------------------------------
   kafka:
-    image: confluentinc/cp-kafka:7.8.0
+    image: confluentinc/cp-kafka:7.8.0@sha256:adc392d28a1e99e8c9a1ec7f087e9e91041837b35b8b7cc8b8a691b82dd581b0
     container_name: eventhub-kafka
     restart: unless-stopped
     # Closes every partition log and writes the clean shutdown file last. Killed a
@@ -325,7 +330,7 @@ services:
   # database of its own. It works against KRaft Kafka; it never needed ZooKeeper.
   # ---------------------------------------------------------------------------
   schema-registry:
-    image: confluentinc/cp-schema-registry:7.8.0
+    image: confluentinc/cp-schema-registry:7.8.0@sha256:ae0695b092314be82fe32058c276d99224855090a77ec169423cf82e02d5e3ac
     container_name: eventhub-schema-registry
     restart: unless-stopped
     # Its schemas live in Kafka. Long enough to leave its group rather than be timed
@@ -359,7 +364,7 @@ services:
   # limits. Notification sends here in compose. Pinned, like every other image.
   # ---------------------------------------------------------------------------
   mailpit:
-    image: axllent/mailpit:v1.31.1
+    image: axllent/mailpit:v1.31.1@sha256:98b916bd3c8d61f7633a52d3ea2f58d00620cb01ca57ab59edde68c347a95365
     container_name: eventhub-mailpit
     restart: unless-stopped
     # A local inbox with nothing that depends on it surviving a restart.
@@ -1115,7 +1120,11 @@ services:
   # Browsers and curl resolve any *.localhost name to loopback by themselves.
   # ---------------------------------------------------------------------------
   kong:
-    image: kong:3.9
+    # Pinned by digest, as the stores are: infra/kong runs this same image on EKS, and CI
+    # parses kong.yml with it. scripts/verify-gateway-chart.mjs requires the chart's image
+    # to be exactly this one: 3.9.3, the kong:3.9 this machine has run since the gateway
+    # came in (#147).
+    image: kong:3.9@sha256:12972ce1ab6396083e56e7d46fce084836c98cc819344bef44a1f583ec3ab191
     container_name: eventhub-kong
     restart: unless-stopped
     stop_grace_period: 15s

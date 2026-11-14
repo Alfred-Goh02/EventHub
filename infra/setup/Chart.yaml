@@ -1,0 +1,5 @@
+apiVersion: v2
+name: eventhub-setup
+description: "EventHub's one-shot setup on EKS, as a Job: compose's own setup command, run once per image against the stores in the cluster."
+type: application
+version: 0.1.0

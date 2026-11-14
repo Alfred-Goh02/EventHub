@@ -53,3 +53,11 @@ apps
 # hundreds of megabytes of provider binaries under .terraform/. `COPY . .` would take
 # all of it. Excluding the directory covers every name those files take.
 infra/terraform
+
+# THE AGENT'S WORKING TREES. .claude/worktrees holds a whole checkout of the repository per
+# branch in progress, and `COPY . .` took every one: 100 MB of other branches' source was
+# inside eventhub/app:local, found by listing /app in the image (2026-11-14) before its
+# first push to ECR. The patterns above happened to keep their keys and .env files out, but
+# a worktree's own infra/terraform is not infra/terraform, and a tfvars there would have
+# gone in. Nothing in .claude belongs in an image.
+.claude

@@ -219,10 +219,16 @@ jobs:
       # render-consumer.lua adds at start, rendered here with a throwaway key. Parsing
       # the template alone said nothing about a render that broke the YAML, or a
       # template the render refuses.
+      #
+      # With compose's own image reference, digest and all, read from compose rather
+      # than written here: the Kong that parses is the Kong that runs, in compose and on
+      # EKS (infra/kong).
       - name: Assert the gateway's declarative config parses
         run: |
           set -euo pipefail
-          docker run --rm -e KONG_DATABASE=off -v "$PWD/infra/kong:/cfg:ro" kong:3.9 kong config parse /cfg/kong.yml
+          kong_image=$(docker compose config --format json | jq -er .services.kong.image)
+          echo "parsing with $kong_image"
+          docker run --rm -e KONG_DATABASE=off -v "$PWD/infra/kong:/cfg:ro" "$kong_image" kong config parse /cfg/kong.yml
           keys=$(mktemp -d)
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$keys/private.pem" 2>/dev/null
           openssl pkey -in "$keys/private.pem" -pubout -out "$keys/public.pem"
@@ -230,7 +236,7 @@ jobs:
           chmod 755 "$keys" && chmod 644 "$keys/public.pem"
           docker run --rm -e KONG_DATABASE=off -e AUTH_PUBLIC_KEY_FILE=/keys/public.pem \
             -e JWT_ISSUER=https://auth.eventhub.local -e KONG_DECLARATIVE_CONFIG=/tmp/kong.yml \
-            -v "$PWD/infra/kong:/kong/declarative:ro" -v "$keys:/keys:ro" --entrypoint sh kong:3.9 \
+            -v "$PWD/infra/kong:/kong/declarative:ro" -v "$keys:/keys:ro" --entrypoint sh "$kong_image" \
             -c 'resty /kong/declarative/render-consumer.lua && kong config parse /tmp/kong.yml'
 
       # FREE THE RUNNER'S DISK before the stack is pulled. The run that added
@@ -279,6 +285,41 @@ jobs:
 
       - name: Show what came up
         run: docker compose ps
+
+      # The data stores' chart for EKS (infra/stores). Written by hand, because Helm cannot
+      # read compose, so it is checked against compose's own resolved configuration: the
+      # stores are exactly the hosts the apps dial, each image is exactly compose's
+      # digest-pinned reference, each variable is compose's unless declared otherwise with
+      # a reason, and the disks are encrypted gp3 that go with their StatefulSet. HERE,
+      # after the stores start, so their images are on the runner to ask which user each
+      # one runs as.
+      - name: Assert the store chart runs on EKS what compose runs, on disks EBS can give it
+        run: node scripts/verify-store-chart.mjs
+
+      # The gateway's chart for EKS (infra/kong), which is the directory compose mounts
+      # into Kong: compose's digest-pinned image, its command, its environment as
+      # kong-env, kong.yml and render-consumer.lua byte for byte; every upstream kong.yml
+      # routes to is a Service a chart makes, and its rate limit's Redis one the stores
+      # make; no service links, the image's own uid, a graceful stop inside the grace
+      # period; and the Service serves the proxy alone, ClusterIP, with the Admin API on
+      # the container's loopback. The image is pulled here, by compose's reference, so the
+      # verifier can ask it which user it runs as: the parse step pulled it too, but "Free
+      # runner disk" prunes every image after that, and the first run of this step found
+      # none.
+      - name: Assert the gateway chart runs on EKS what compose runs, in front of Services that exist
+        run: |
+          set -euo pipefail
+          docker pull -q "$(docker compose config --format json | jq -er .services.kong.image)"
+          node scripts/verify-gateway-chart.mjs
+
+      # What infra/eks/up.mjs installs on EKS, judged without a cluster: every Secret the
+      # fifteen services, the stores and setup read is one it makes, and every one it makes
+      # is read; setup is a Job running exactly compose's setup command, once, as the
+      # image's own user, with compose's key directories writable and seeded from the key
+      # Secrets; the keys come from the directories kind takes them from; and .dockerignore
+      # keeps .claude, keys, env files and Terraform out of the image it pushes.
+      - name: Assert the EKS installer makes every Secret the charts read, and runs compose's setup
+        run: node scripts/verify-eks-install.mjs
 
       # The guard for "Free runner disk", placed before anything writes to
       # OpenSearch: at its 85% low watermark or past it, fail HERE naming the

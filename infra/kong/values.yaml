@@ -1,0 +1,62 @@
+# THE GATEWAY, IN THE CLUSTER, AS COMPOSE RUNS IT.
+#
+# This directory is both what compose mounts into its Kong container and this chart. The
+# chart reads kong.yml and render-consumer.lua from here (templates/all.yaml, .Files.Get),
+# so there is one copy of each, and Kong in the cluster renders and loads exactly the file
+# compose's Kong does.
+#
+# NOT A SECOND COPY OF COMPOSE. The image and the command below are compose's, and the
+# environment is compose's too: infra/eks/up.mjs makes the Secret kong-env from
+# `docker compose config`, as it makes every service's <chart>-env, so no variable is
+# written here. scripts/verify-gateway-chart.mjs holds the chart against compose's
+# resolved configuration, and against the Services the charts make: every upstream kong.yml
+# routes to, and the Redis its rate limit counts in.
+#
+# NO WAY IN FROM OUTSIDE YET. The Service is ClusterIP. Reach it with
+#   kubectl --context eventhub-demo port-forward svc/kong 18000:8000
+# and http://acme.eventhub.localhost:18000 (18000, because compose's own Kong holds 8000
+# on this machine). A load balancer, the domain and HTTPS come with the step that decides
+# the domain; kong.yml's hosts and CORS origins change with it.
+
+# yaml for kubectl and Helm; json for the verifiers, which read the chart without a YAML
+# parser. Both are printed from the same object (templates/_helpers.tpl).
+render: yaml
+
+# Exactly compose's reference, digest and all, so compose, CI and EKS run the same bits.
+image: kong:3.9@sha256:12972ce1ab6396083e56e7d46fce084836c98cc819344bef44a1f583ec3ab191
+
+# One on the demo: pods, not memory, are the cluster's tight limit. Any number of nodes
+# share one rate-limit count, in Redis (kong.yml says how).
+replicas: 1
+
+# Compose's command, as the container's args: the image's entrypoint stays, as compose
+# keeps it.
+args: ["sh", "-c", "resty /kong/declarative/render-consumer.lua && exec /docker-entrypoint.sh kong docker-start"]
+
+# The image's own user, kong: uid 1001, asked of the image (`docker run --entrypoint id`).
+# Numeric, because the image names it `kong` and the kubelet cannot check a name is not root.
+runAsUser: 1001
+
+# Where compose mounts each: its bind mount of this directory, and its jwt-public volume,
+# which holds Auth's public key under the name AUTH_PUBLIC_KEY_FILE gives it.
+declarativeDir: /kong/declarative
+keysDir: /run/eventhub/keys
+
+# The proxy, the one port the Service serves. The status listener answers the probes and
+# nothing else: it is the platform's, as compose publishes it to the host's loopback only.
+proxyPort: 8000
+statusPort: 8100
+
+# Compose's stop_grace_period. On the way out the pod keeps serving for preStopWait while
+# its removal from the Service reaches every node (the services' charts measured why), then
+# `kong quit` lets the requests in flight finish, for up to quitTimeout, before forcing it:
+# 5 + 8 is inside 15.
+terminationGracePeriodSeconds: 15
+preStopWait: 5
+quitTimeout: 8
+
+# Measured: compose's Kong holds 396 MiB with four nginx workers, one per CPU of the
+# Docker VM. A node here has two CPUs, so two workers.
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { memory: 512Mi }
