@@ -169,10 +169,7 @@ function main() {
       console.log(`    ..    building ${local} from HEAD`);
       run('docker', ['build', '-t', local, '.'], { stdio: 'inherit' });
     }
-    const password = run('aws', ['ecr', 'get-login-password', '--region', REGION]).trim();
-    run('docker', ['login', '--username', 'AWS', '--password-stdin', repo.split('/')[0]], { input: password });
-    run('docker', ['tag', local, remote]);
-    run('docker', ['push', remote], { stdio: 'inherit' });
+    pushImage(local, remote, repo.split('/')[0], REGION);
     check(true, `pushed ${remote}`);
   }
 
@@ -226,6 +223,32 @@ function main() {
     check(r.status === 0 && /^200 /.test(answer), `${chart}: ${answer || r.stderr.trim() || `(no answer, exit ${r.status})`}`);
   }
   console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${remote}`);
+}
+
+/**
+ * The image to ECR, logged in through a THROWAWAY DOCKER CONFIG. `docker login` into the
+ * user's own config hands ECR's token to the credential helper, and on Windows that is the
+ * Credential Manager, which refused it -- "error storing credentials ... The stub received
+ * bad data" (2026-11-14): an ECR token is longer than a Windows credential may be. So the
+ * login is written to a config directory made for this push alone, holding no helper, and
+ * the directory is deleted after it, token and all: nothing of AWS's stays on the machine.
+ * DOCKER_HOST is the current context's engine, which a fresh config would not know.
+ */
+function pushImage(local, remote, registry, region) {
+  const ctx = tryRun('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']);
+  const dc = mkdtempSync(join(tmpdir(), 'eventhub-docker-'));
+  try {
+    writeFileSync(join(dc, 'config.json'), '{}');
+    const env = { ...process.env, DOCKER_CONFIG: dc, ...(ctx.status === 0 && ctx.stdout.trim() ? { DOCKER_HOST: ctx.stdout.trim() } : {}) };
+    // The token goes from aws to docker as a process input, never through a shell: a
+    // PowerShell pipe re-encodes it and adds a line ending, and ECR answers 400.
+    const password = run('aws', ['ecr', 'get-login-password', '--region', region]).trim();
+    run('docker', ['login', '--username', 'AWS', '--password-stdin', registry], { input: password, env });
+    run('docker', ['tag', local, remote], { env });
+    run('docker', ['push', remote], { stdio: ['pipe', 'inherit', 'inherit'], env });
+  } finally {
+    rmSync(dc, { recursive: true, force: true });
+  }
 }
 
 /**
