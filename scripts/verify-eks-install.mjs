@@ -1,32 +1,40 @@
 /**
  * Asserts that infra/eks/up.mjs installs on EKS everything the charts need, from the
- * sources kind uses, and that setup there is compose's own setup.
+ * sources kind uses but with the cluster's own credentials, and that setup there is
+ * compose's own setup.
  *
- * NOTHING HERE TALKS TO A CLUSTER. It renders every chart -- the fifteen services, the
- * stores, setup and the gateway -- and holds what they read against what the installer
- * makes (kong-env is compose's environment for Kong, variable for variable):
+ * NOTHING HERE TALKS TO A CLUSTER. It runs the installer's own installSecrets() over compose,
+ * renders every chart -- the fifteen services, the stores, setup and the gateway -- and holds
+ * what they read against what the installer makes:
+ *   - THE CREDENTIALS ARE THE CLUSTER'S. Every password, secret and URL password compose has
+ *     is found (a planted one in a fixture too), and none of compose's values is left in a
+ *     credential's place; compose's secrets appear nowhere at all. Each user's password is
+ *     one value everywhere it appears, and every user a service logs in as is one a store's
+ *     init file or a store's own superuser makes. What the cluster already holds is kept,
+ *     never regenerated. A value made is 32 random bytes as hex, a different one each time;
+ *   - the keypairs are the cluster's too: jwt-keys' public half is its private key's, Auth
+ *     seals to exactly Notification's public key, and the installer reads no key file from
+ *     the checkout;
  *   - every Secret a pod reads (envFrom, a Secret volume and its items, a secretKeyRef) is
- *     one the installer or infra/stores/secrets.mjs makes, with every key read; and every
- *     Secret the installer makes is read by something, so neither list can rot;
- *   - the setup Job runs exactly compose's setup command, with compose's environment for
- *     it, once (backoffLimit 0, restartPolicy Never), as the image's own non-root user;
+ *     one the installer makes, with every key read; and every Secret it makes is read by
+ *     something, so neither list can rot. kong-env is compose's environment for Kong;
+ *   - the setup Job runs exactly compose's setup command, with the installer's setup-env,
+ *     once (backoffLimit 0, restartPolicy Never), as the image's own non-root user;
  *   - every directory compose's setup mounts a volume at is a writable emptyDir in the
  *     Job, and a directory whose volume is named like a key Secret is seeded from that
  *     Secret before setup starts -- so setup finds the keypairs and keeps them;
- *   - the key Secrets come from the directories infra/local/up.mjs reads for kind, so both
- *     clusters hold the same keypairs; and the installer refuses a missing half, or a
- *     Notification public key that is not the one Auth seals to;
  *   - .dockerignore keeps the agent's worktrees, keys, env files and Terraform out of the
  *     image the installer pushes.
  *
- * The keys are a fixture: what matters is their names, and a fixture can also be broken on
- * purpose to watch the installer refuse.
+ * The real store logins are not here, as nothing here starts a store; they were measured by
+ * booting compose's Postgres and ClickHouse on the rewritten init files (PR description).
  *   node scripts/verify-eks-install.mjs          against this tree
  *   node scripts/verify-eks-install.mjs [root]   against another (a red run in a copy)
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createPublicKey } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -81,20 +89,11 @@ function secretReads(docs) {
   return reads;
 }
 
-/** Keys that look like keypairs, for a fixture root: names are what is checked, not content. */
-function keyFixture(break_ = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'verify-eks-keys-'));
-  const write = (rel, text) => {
-    mkdirSync(dirname(join(dir, rel)), { recursive: true });
-    writeFileSync(join(dir, rel), text);
-  };
-  const notifPublic = break_.mismatch ? 'NOT THE SAME KEY' : 'notification public half';
-  if (!break_.noAuthPrivate) write('services/auth/keys/private.pem', 'auth private half');
-  write('services/auth/keys/public.pem', 'auth public half');
-  write('services/auth/keys/notification-public.pem', 'notification public half');
-  write('services/notification/keys/private.pem', 'notification private half');
-  if (!break_.noNotifPublic) write('services/notification/keys/public.pem', notifPublic);
-  return dir;
+/** The password a role's or user's CREATE statement sets in an init file, or undefined. */
+function sqlPassword(sql, user) {
+  const pg = new RegExp(`CREATE\\s+ROLE\\s+${user}\\b[^;]*?\\bPASSWORD\\s+'([^']*)'`, 'i').exec(sql);
+  const ch = new RegExp(`CREATE\\s+USER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${user}\\s+IDENTIFIED\\s+WITH\\s+\\w+\\s+BY\\s+'([^']*)'`, 'i').exec(sql);
+  return (pg ?? ch)?.[1];
 }
 
 async function main() {
@@ -102,6 +101,7 @@ async function main() {
   const root = rootArg ? resolve(rootArg) : ROOT;
   console.log(`  reading ${rootArg ? root : 'this tree'}`);
   const eks = await import(pathToFileURL(join(root, 'infra', 'eks', 'up.mjs')).href);
+  const cred = await import(pathToFileURL(join(root, 'infra', 'eks', 'credentials.mjs')).href);
   const stores = await import(pathToFileURL(join(root, 'infra', 'stores', 'secrets.mjs')).href);
 
   const composeRun = spawnSync('docker', ['compose', '-f', join(root, 'docker-compose.yml'), '-p', 'eventhub-rebuild', 'config', '--format', 'json'], { encoding: 'utf8', maxBuffer: 64 << 20 });
@@ -111,41 +111,83 @@ async function main() {
   }
   const compose = JSON.parse(composeRun.stdout);
   const charts = eks.allCharts(root);
+  const storeDocs = stores.renderChart(join(root, 'infra', 'stores'));
 
   // -------------------------------------------------------------------------
-  section('the installer refuses keys that would break the cluster');
-  const refusals = [
-    ['noAuthPrivate', /no private\.pem/],
-    ['noNotifPublic', /no public\.pem/],
-    ['mismatch', /not the notification-public\.pem Auth holds/],
-  ];
-  for (const [what, expect] of refusals) {
-    const dir = keyFixture({ [what]: true });
-    let msg = null;
-    try {
-      eks.appSecrets(compose, charts, dir);
-    } catch (e) {
-      msg = e.message;
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-    check(msg !== null && expect.test(msg), `with ${what}, appSecrets refuses (${msg ?? 'it did not refuse'})`);
+  section('the credentials found where they sit, a planted one of each kind too');
+  const planted = {
+    'x-env': { NEW_TOKEN: 'planted-token', DB_URL: 'postgresql://u_one:pw-one@db:5432/one', CLICKHOUSE_PASSWORD: 'pw-two', CLICKHOUSE_USER: 'u_two', ACCESS_TOKEN_TTL: '900', PLAIN: 'postgresql://db:5432/nopw' },
+    'x-init': { '01.sql': "CREATE ROLE u_one LOGIN PASSWORD 'pw-one';\nCREATE USER IF NOT EXISTS u_two IDENTIFIED WITH sha256_password BY 'pw-two';\n" },
+  };
+  const pf = cred.credentialsIn(planted);
+  const pslots = pf.map((f) => `${f.slot}(${f.kind})`).sort();
+  const want = ['clickhouse.u_two(password)', 'clickhouse.u_two(sql)', 'postgres.u_one(sql)', 'postgres.u_one(url)', 'secret.NEW_TOKEN(secret)'];
+  check(JSON.stringify(pslots) === JSON.stringify(want), `a planted secret, URL password, *_PASSWORD and both init statements are found, and ACCESS_TOKEN_TTL and a URL with no password are not (${pslots.join(', ')})`);
+  const pc = cred.ensure(pf).creds;
+  const pout = cred.withCredentials(planted, pc);
+  check(
+    pout['x-env'].NEW_TOKEN === pc['secret.NEW_TOKEN'] &&
+      decodeURIComponent(new URL(pout['x-env'].DB_URL).password) === pc['postgres.u_one'] &&
+      new URL(pout['x-env'].DB_URL).username === 'u_one' &&
+      sqlPassword(pout['x-init']['01.sql'], 'u_one') === pc['postgres.u_one'] &&
+      sqlPassword(pout['x-init']['01.sql'], 'u_two') === pc['clickhouse.u_two'] &&
+      pout['x-env'].CLICKHOUSE_PASSWORD === pc['clickhouse.u_two'] &&
+      pout['x-env'].ACCESS_TOKEN_TTL === '900' &&
+      pout['x-env'].PLAIN === planted['x-env'].PLAIN,
+    'and each is replaced in place -- the URL keeps its user, the init file its statement -- while everything else is kept exactly',
+  );
+
+  // -------------------------------------------------------------------------
+  section("the credentials are the cluster's: none of compose's reaches a Secret");
+  let install;
+  try {
+    install = eks.installSecrets(compose, charts, storeDocs, {});
+  } catch (e) {
+    check(false, `installSecrets refused: ${e.message}`);
+    return;
   }
+  const { secrets, found, creds } = install;
+  const kinds = [...new Set(found.map((f) => f.kind))].sort();
+  const slots = [...new Set(found.map((f) => f.slot))].sort();
+  check(found.length > 0 && JSON.stringify(kinds) === JSON.stringify(['password', 'secret', 'sql', 'url']), `CONTROL: ${found.length} of compose's credentials found, ${slots.length} user(s) and secret(s), of every kind (${kinds.join(', ')})`);
+  const wrong = [];
+  for (const f of found) {
+    const v = String(secrets[f.secret]?.[f.key] ?? '');
+    const now = f.kind === 'url' ? decodeURIComponent(new URL(v).password) : f.kind === 'sql' ? sqlPassword(v, f.slot.split('.')[1]) : v;
+    if (now !== creds[f.slot] || now === f.dev) wrong.push(`${f.secret}/${f.key}`);
+  }
+  check(wrong.length === 0, `every one of them now holds the cluster's value for its user or secret, never compose's: one value per user wherever it appears${wrong.length ? ` -- not so in ${wrong.join(', ')}` : ''}`);
+  const secretDevs = found.filter((f) => f.kind === 'secret').map((f) => f.dev);
+  const anywhere = Object.entries(secrets).flatMap(([s, data]) => Object.entries(data).filter(([, v]) => secretDevs.some((d) => String(v).includes(d))).map(([k]) => `${s}/${k}`));
+  check(secretDevs.length > 0 && anywhere.length === 0, `compose's ${secretDevs.length} secrets appear nowhere in any Secret, not even inside another value${anywhere.length ? ` -- found in ${anywhere.join(', ')}` : ''}`);
+  const setBy = new Set(found.filter((f) => f.kind === 'sql' || f.secret === 'stores-credentials').map((f) => f.slot));
+  const orphans = [...new Set(found.filter((f) => (f.kind === 'url' || f.kind === 'password') && f.secret !== 'stores-credentials').map((f) => f.slot))].filter((s) => !setBy.has(s));
+  check(setBy.size > 0 && orphans.length === 0, `every user a service logs in as is made, with that password, by a store's init file or as the store's own superuser${orphans.length ? ` -- made by nothing: ${orphans.join(', ')}` : ''}`);
+  const values = slots.map((s) => creds[s]);
+  check(values.every((v) => /^[0-9a-f]{64}$/.test(v)) && new Set(values).size === values.length, `each value made is 32 random bytes as hex, and no two are the same (${values.length})`);
+  const again = cred.ensure(found).creds;
+  check(slots.every((s) => again[s] !== creds[s]), 'a second cluster gets values of its own: none repeats');
+  const kept = cred.ensure(found, { [slots[0]]: 'held-by-the-cluster' });
+  check(kept.creds[slots[0]] === 'held-by-the-cluster' && !kept.made.includes(slots[0]) && kept.made.length === slots.length - 1 + Object.keys(cred.KEYPAIRS).length, `what the cluster already holds is kept, never made again (${slots[0]} kept; ${kept.made.length} made)`);
+
+  // -------------------------------------------------------------------------
+  section("the keypairs are the cluster's, and paired as the services need them");
+  const jk = secrets['jwt-keys'] ?? {};
+  const nk = secrets['notification-keys'] ?? {};
+  const pub = (pem) => createPublicKey(pem).export({ type: 'spki', format: 'pem' });
+  const bits = (pem) => createPublicKey(pem).asymmetricKeyDetails?.modulusLength;
+  check(Boolean(jk['private.pem']) && pub(jk['private.pem']) === jk['public.pem'] && bits(jk['private.pem']) === 2048, `jwt-keys: public.pem is the public half of private.pem, RSA ${bits(jk['private.pem'] ?? '')}`);
+  check(Boolean(nk['private.pem']) && pub(nk['private.pem']) === nk['public.pem'] && jk['notification-public.pem'] === nk['public.pem'], "notification-keys: its own pair, and the notification-public.pem Auth seals to is exactly its public half");
+  check(jk['private.pem'] !== nk['private.pem'], 'two keypairs, not one used twice');
+  const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+  const code = ['up.mjs', 'credentials.mjs'].map((f) => strip(readFileSync(join(root, 'infra', 'eks', f), 'utf8'))).join('\n');
+  check(!/services['"/\\,\s]+(auth|notification)['"/\\,\s]+keys/.test(code) && !/KEY_DIRS/.test(code), 'the installer reads no key file from the checkout: services/*/keys are development keys, and a worktree has none');
 
   // -------------------------------------------------------------------------
   section('every Secret a pod reads is one the installer makes, and every one it makes is read');
-  const keys = keyFixture();
-  let made;
-  try {
-    made = eks.appSecrets(compose, charts, keys);
-  } finally {
-    rmSync(keys, { recursive: true, force: true });
-  }
-  const storeDocs = stores.renderChart(join(root, 'infra', 'stores'));
-  const storeMade = stores.plan(storeDocs, compose);
   const produced = {};
-  for (const [name, s] of Object.entries(made)) produced[name] = new Set(Object.keys(s.data));
-  for (const [name, k] of Object.entries(storeMade)) produced[name] = new Set(Object.keys(k));
+  for (const [name, data] of Object.entries(secrets)) produced[name] = new Set(Object.keys(data));
+  const made_ = Object.fromEntries(Object.entries(secrets).map(([name, data]) => [name, { data }]));
 
   const cmdFile = join(mkdtempSync(join(tmpdir(), 'verify-eks-')), 'setup.json');
   writeFileSync(cmdFile, JSON.stringify({ image: { repository: 'registry.example/eventhub/app', tag: 'abc1234' }, command: eks.setupCommand(compose) }));
@@ -189,13 +231,23 @@ async function main() {
   }
   merge(secretReads(gateway.docs), 'kong');
   check(rendered === charts.length && charts.length > 0 && Object.keys(reads).length > 0, `CONTROL: ${rendered} of ${charts.length} chart(s) rendered, plus stores, setup and the gateway; ${Object.keys(reads).length} Secret(s) read`);
-  check(JSON.stringify(made['kong-env']?.data) === JSON.stringify(eks.envOf(compose, 'kong')), `kong-env is compose's resolved environment for Kong (${Object.keys(made['kong-env']?.data ?? {}).length} variable(s))`);
+  // compose's environment, value for value, except where a credential sat: there, and only
+  // there, the cluster's own.
+  const composeButCredentials = (name, env) => {
+    const data = made_[name]?.data ?? {};
+    const cred_ = new Set(found.filter((f) => f.secret === name).map((f) => f.key));
+    const keysSame = JSON.stringify(Object.keys(data).sort()) === JSON.stringify(Object.keys(env).sort());
+    const off = Object.keys(env).filter((k) => (cred_.has(k) ? data[k] === env[k] : data[k] !== env[k]));
+    return { ok: keysSame && off.length === 0, n: Object.keys(data).length, creds: cred_.size, off };
+  };
+  const kongEnv = composeButCredentials('kong-env', eks.envOf(compose, 'kong'));
+  check(kongEnv.ok && kongEnv.creds === 0, `kong-env is compose's resolved environment for Kong, holding no credential (${kongEnv.n} variable(s))`);
   for (const [name, r] of Object.entries(reads).sort()) {
     const have = produced[name];
     const missing = [...r.keys].filter((k) => k !== '*' && !have?.has(k));
     check(have !== undefined && missing.length === 0, `${name}, read by ${[...r.by].join(', ')}: made${have ? ` with ${have.size} key(s)` : ' by nothing'}${missing.length ? ` -- missing ${missing.join(', ')}` : ''}`);
   }
-  const unread = Object.keys(made).filter((n) => !reads[n]);
+  const unread = Object.keys(made_).filter((n) => !reads[n]);
   check(unread.length === 0, `every Secret the installer makes is read by some pod${unread.length ? ` -- unread: ${unread.join(', ')}` : ''}`);
 
   // -------------------------------------------------------------------------
@@ -207,8 +259,9 @@ async function main() {
   if (!job || !main_) return;
   const composeSetup = compose.services.setup;
   check(JSON.stringify(main_.command) === JSON.stringify(composeSetup.command), `the Job runs exactly compose's setup command (${main_.command?.length ?? 0} argument(s), ${String(main_.command?.at(-1) ?? '').split('\n').filter((l) => l.trim().startsWith('echo "setup:')).length} setup step(s))`);
-  check((main_.envFrom ?? []).some((f) => f.secretRef?.name === 'setup-env') && made['setup-env'] !== undefined, "with compose's environment for setup, from setup-env");
-  check(JSON.stringify(made['setup-env']?.data) === JSON.stringify(eks.envOf(compose, 'setup')), `setup-env is compose's resolved setup environment (${Object.keys(made['setup-env']?.data ?? {}).length} variable(s))`);
+  check((main_.envFrom ?? []).some((f) => f.secretRef?.name === 'setup-env') && made_['setup-env'] !== undefined, "with compose's environment for setup, from setup-env");
+  const setupEnv = composeButCredentials('setup-env', eks.envOf(compose, 'setup'));
+  check(setupEnv.ok && setupEnv.creds > 0, `setup-env is compose's resolved setup environment, with the cluster's ${setupEnv.creds} credential(s) where compose's sat and every other variable compose's (${setupEnv.n} variable(s))${setupEnv.off.length ? ` -- differs at ${setupEnv.off.join(', ')}` : ''}`);
   check(job.spec.backoffLimit === 0 && pod.restartPolicy === 'Never', `once, as compose's restart: "no" runs it: backoffLimit ${job.spec.backoffLimit}, restartPolicy ${pod.restartPolicy}`);
   check(pod.securityContext?.runAsNonRoot === true && pod.securityContext?.runAsUser === 1000, `as the image's own user, node (runAsNonRoot ${pod.securityContext?.runAsNonRoot}, uid ${pod.securityContext?.runAsUser})`);
   check(main_.workingDir === '/app', `in /app, the image's working directory (${main_.workingDir})`);
@@ -229,13 +282,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------------------
-  section('the keys come from where kind takes them, and nothing of .claude goes into the image');
-  const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
-  const upKind = strip(readFileSync(join(root, 'infra', 'local', 'up.mjs'), 'utf8'));
-  for (const [name, dir] of Object.entries(eks.KEY_DIRS)) {
-    const parts = dir.split('/').map((p) => `'${p}'`).join(',\\s*');
-    check(new RegExp(parts).test(upKind), `${name} comes from ${dir}, the directory infra/local/up.mjs reads for kind`);
-  }
+  section('nothing of .claude, keys or env files goes into the image');
   const ignore = readFileSync(join(root, '.dockerignore'), 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
   for (const rule of ['.claude', '**/keys', '**/.env', '**/.env.*', 'infra/terraform']) {
     check(ignore.includes(rule), `.dockerignore has ${rule}, so the image pushed to ECR does not carry it`);

@@ -105,9 +105,12 @@ kubectl version --client
 
    Then EventHub itself, with one command, from a clean working tree (the images are tagged
    with the commit they are built from). It builds and pushes the backend's image to
-   `ecr_repository_url` and the web app's to `ecr_web_repository_url`, by git SHA; installs
-   the stores (`infra/stores`) and waits for them; makes every Secret the services read,
-   from compose and the local keypairs; runs setup, compose's own setup command as a Job;
+   `ecr_repository_url` and the web app's to `ecr_web_repository_url`, by git SHA; makes the
+   cluster's own credentials -- every password, secret and both keypairs, kept in the
+   Secret `eventhub-credentials` and reused by every later run -- and every Secret the
+   stores and services read, from compose with those in place of compose's development
+   ones; installs the stores (`infra/stores`) and waits for them; runs setup, compose's own
+   setup command as a Job;
    installs the fifteen charts one replica each, then Kong in front of them, then the web
    app; asks each service's `/ready` from inside the cluster; sends requests through Kong
    that only a working gateway answers as they come back (Auth reached, the rate limit
