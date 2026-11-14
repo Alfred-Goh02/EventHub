@@ -41,6 +41,11 @@ output "ecr_repository_url" {
   value       = module.ecr.repository_url
 }
 
+output "ecr_web_repository_url" {
+  description = "Where eventhub/web images (the web app) are pushed, tagged by git SHA."
+  value       = module.ecr_web.repository_url
+}
+
 output "aws_load_balancer_controller_role_arn" {
   description = "The role the controller runs as. Pod Identity binds it to kube-system/aws-load-balancer-controller; the service account needs no annotation."
   value       = module.aws_load_balancer_controller_role.role_arn

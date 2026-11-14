@@ -57,6 +57,16 @@ module "ecr" {
   force_delete = true
 }
 
+# The web app's own repository: apps/web is its own project with its own image
+# (apps/web/Dockerfile), tagged by the same git SHA as the backend's.
+module "ecr_web" {
+  source = "../../modules/ecr"
+
+  name         = "eventhub/web"
+  keep_images  = var.ecr_keep_images
+  force_delete = true
+}
+
 # THE AWS LOAD BALANCER CONTROLLER'S ROLE, through Pod Identity. Helm installs the
 # controller into kube-system with the service account named here, and no role
 # annotation: the association binds the role to that name. The controller then creates

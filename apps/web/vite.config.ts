@@ -12,6 +12,11 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // A Node server, not Cloudflare: the shared config's default target is Lovable's own
+  // hosting, and this app runs as a container (Dockerfile, infra/web). `node
+  // .output/server/index.mjs` serves it, on PORT. Inside Lovable's sandbox the shared config
+  // still builds for Cloudflare whatever this says.
+  nitro: { preset: "node-server" },
   vite: {
     // Outside Lovable's sandbox the shared config listens on "::" -- every interface, so the
     // whole LAN could reach the dev server -- on port 8080. Loopback only, as every other port
