@@ -280,6 +280,16 @@ jobs:
       - name: Show what came up
         run: docker compose ps
 
+      # The data stores' chart for EKS (infra/stores). Written by hand, because Helm cannot
+      # read compose, so it is checked against compose's own resolved configuration: the
+      # stores are exactly the hosts the apps dial, each image is exactly compose's
+      # digest-pinned reference, each variable is compose's unless declared otherwise with
+      # a reason, and the disks are encrypted gp3 that go with their StatefulSet. HERE,
+      # after the stores start, so their images are on the runner to ask which user each
+      # one runs as.
+      - name: Assert the store chart runs on EKS what compose runs, on disks EBS can give it
+        run: node scripts/verify-store-chart.mjs
+
       # The guard for "Free runner disk", placed before anything writes to
       # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
       # disk, rather than minutes later as an index_create_block_exception in

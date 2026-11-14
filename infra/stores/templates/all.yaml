@@ -1,0 +1,15 @@
+{{- $root := . -}}
+{{- if .Values.storageClass.create }}
+{{- include "stores.emit" (list $root "stores.storageclass" (dict "root" $root)) }}
+{{- end }}
+{{- if .Values.priorityClass.create }}
+{{- include "stores.emit" (list $root "stores.priorityclass" (dict "root" $root)) }}
+{{- end }}
+{{- range $name, $s := .Values.stores }}
+{{- $ctx := dict "root" $root "name" $name "s" $s }}
+{{- include "stores.emit" (list $root "stores.service" $ctx) }}
+{{- if eq $s.kind "StatefulSet" }}
+{{- include "stores.emit" (list $root "stores.headless" $ctx) }}
+{{- end }}
+{{- include "stores.emit" (list $root "stores.workload" $ctx) }}
+{{- end }}

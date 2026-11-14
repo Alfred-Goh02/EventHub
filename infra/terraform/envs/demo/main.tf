@@ -1,6 +1,7 @@
 # The demo environment: a VPC, an EKS cluster with one managed node group, the image
-# repository, and the IAM role the AWS Load Balancer Controller runs as. No data layer
-# yet: that is the next part.
+# repository, the IAM role the AWS Load Balancer Controller runs as, and the EBS CSI
+# driver the data stores' disks come from. The stores themselves run in the cluster, from
+# infra/stores (a Helm chart): Terraform stops at the cluster boundary.
 
 locals {
   name = "eventhub-demo"
@@ -81,4 +82,66 @@ module "aws_load_balancer_controller_role" {
   inline_policies = {
     AWSLoadBalancerController = file("${path.module}/../../policies/aws-load-balancer-controller.json")
   }
+}
+
+# THE EBS CSI DRIVER: every disk a data store has. Postgres, OpenSearch, ClickHouse and
+# Kafka each claim a gp3 volume through infra/stores' StorageClass, and without the
+# driver every claim stays Pending.
+#
+# ITS ROLE, BY POD IDENTITY, BOUND BEFORE ITS PODS EXIST. The controller calls
+# CreateVolume, AttachVolume and the rest; nothing else in the add-on calls AWS. Pod
+# Identity hands a pod its credentials when the pod is admitted, so a controller started
+# before its association would run without any until restarted -- and the node role, the
+# only other way out, has no EBS permissions and is closed to pods by IMDS hop limit 1.
+# Hence depends_on below. And not the add-on's own pod_identity_association block: the
+# module makes the association, with the trust policy pinned to this one service
+# account, and a cluster holds one association per service account.
+#
+# AmazonEBSCSIDriverPolicyV2, the policy EKS recommends for this add-on version
+# (describe-addon-configuration, podIdentityConfiguration, 2026-11-14). Unlike the older
+# AmazonEBSCSIDriverPolicy it lets the driver modify, attach and delete only volumes
+# carrying the tag it puts on the ones it creates. It has no KMS statements, which is why
+# infra/stores encrypts with the AWS-managed aws/ebs key and not a key of ours.
+module "ebs_csi_driver_role" {
+  source = "../../modules/pod-identity-role"
+
+  name            = "${local.name}-ebs-csi-driver"
+  cluster_name    = module.eks.cluster_name
+  cluster_arn     = module.eks.cluster_arn
+  namespace       = "kube-system"
+  service_account = "ebs-csi-controller-sa"
+
+  policy_arns = ["arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicyV2"]
+}
+
+# AFTER THE NODES, like coredns: the controller is a Deployment, and with no node to run
+# on the add-on stays degraded until Terraform times out. module.eks as a whole includes
+# the node group.
+#
+# The configuration, each key checked against the add-on's own schema
+# (describe-addon-configuration for v1.68.0-eksbuild.1):
+#   - one controller replica, not two: pods are this cluster's tight limit (29 a node);
+#   - extraVolumeTags, so every volume the driver makes carries the project's tags and the
+#     teardown's leftover check finds it by them;
+#   - --k8s-tag-cluster-id, so each volume also says which cluster made it;
+#   - AWS_REGION, so the controller never has to ask IMDS, which pods cannot reach here.
+resource "aws_eks_addon" "ebs_csi_driver" {
+  cluster_name                = module.eks.cluster_name
+  addon_name                  = "aws-ebs-csi-driver"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  configuration_values = jsonencode({
+    controller = {
+      replicaCount    = 1
+      extraVolumeTags = { Project = "eventhub", Environment = "demo" }
+      additionalArgs  = ["--k8s-tag-cluster-id=${local.name}"]
+      env             = [{ name = "AWS_REGION", value = var.region }]
+    }
+  })
+
+  depends_on = [
+    module.eks,
+    module.ebs_csi_driver_role,
+  ]
 }
