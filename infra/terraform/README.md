@@ -24,8 +24,8 @@ the four that keep data on encrypted gp3 disks from the EBS CSI driver this root
 Not RDS, ElastiCache or OpenSearch Service, by decision (2026-11-14): the free plan's SCP
 leaves out `kafka`, so MSK was never an option, and the stores fit on the two nodes.
 `10.40.32.0/19` and `10.40.192.0/18` stay free in the VPC should a managed store come later.
-Not here yet: the one-shot setup as a Job, and the app's own Secrets and image on EKS -- the
-next part.
+`infra/eks/up.mjs` installs the rest on top of them: the image, the services' Secrets,
+setup as a Job (`infra/setup`), and the fifteen services.
 
 **What the account allows.** Two limits shaped this directory, from two places:
 
@@ -103,30 +103,25 @@ kubectl version --client
    kubectl get nodes
    ```
 
-   The data stores, in the apps' namespace, `default`: Kafka advertises `kafka:29092`, a
-   name that resolves only there. Their Secrets first, made from compose and `db/` (the
-   script never prints a value; `--print` shows what it would make):
+   Then EventHub itself, with one command, from a clean working tree (the image is tagged
+   with the commit it is built from). It builds and pushes the image to
+   `ecr_repository_url` by git SHA; installs the stores (`infra/stores`) and waits for
+   them; makes every Secret the services read, from compose and the local keypairs; runs
+   setup, compose's own setup command as a Job; installs the fifteen charts one replica
+   each; and asks each service's `/ready` from inside the cluster. Every step is
+   idempotent, so a failed run is re-run. No value is printed.
 
    ```powershell
-   node infra/stores/secrets.mjs --context eventhub-demo
-   helm install stores infra/stores --kube-context eventhub-demo --namespace default
-   kubectl --context eventhub-demo get pods,pvc -l app.kubernetes.io/component=store
+   node infra/eks/up.mjs --context eventhub-demo
+   kubectl --context eventhub-demo get pods,pvc
    ```
 
-   The Load Balancer Controller's chart takes `clusterName` (`cluster_name`), `region`,
-   `vpcId` (`vpc_id`), and a service account named `aws-load-balancer-controller` in
-   `kube-system`, with **no** role annotation: Terraform's Pod Identity association binds
-   `aws_load_balancer_controller_role_arn` to that name. Install the chart release that
-   ships controller v3.6.3, the version the IAM policy is copied from. Images go to
-   `ecr_repository_url`, tagged by git SHA:
-
-   ```powershell
-   $repo = terraform -chdir=infra/terraform/envs/demo output -raw ecr_repository_url
-   $sha = git rev-parse --short HEAD
-   aws ecr get-login-password --region ap-southeast-2 --profile eventhub | docker login --username AWS --password-stdin $repo.Split('/')[0]
-   docker tag "eventhub/app:$sha" "${repo}:$sha"
-   docker push "${repo}:$sha"
-   ```
+   The Load Balancer Controller's chart, when the cluster gets a public way in, takes
+   `clusterName` (`cluster_name`), `region`, `vpcId` (`vpc_id`), and a service account
+   named `aws-load-balancer-controller` in `kube-system`, with **no** role annotation:
+   Terraform's Pod Identity association binds `aws_load_balancer_controller_role_arn` to
+   that name. Install the chart release that ships controller v3.6.3, the version the IAM
+   policy is copied from.
 
 ## What an hour costs
 
@@ -214,9 +209,11 @@ aws eks update-kubeconfig --region ap-southeast-2 --name eventhub-demo --alias e
    Wait until both lists are empty, then ask AWS: every volume the driver made carries
    `ebs.csi.aws.com/cluster=true`, and none should be left.
 
+   `--down` does it in that order -- the services and setup, then the stores -- and then
+   waits for both lists to be empty and asks AWS, failing if anything is left:
+
    ```powershell
-   helm uninstall stores --kube-context eventhub-demo --namespace default --wait
-   kubectl --context eventhub-demo get pvc,pv --all-namespaces
+   node infra/eks/up.mjs --context eventhub-demo --down
    aws ec2 describe-volumes --region ap-southeast-2 --profile eventhub --filters "Name=tag:ebs.csi.aws.com/cluster,Values=true" --query "Volumes[].[VolumeId,State,Size]" --output table
    ```
 

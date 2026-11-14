@@ -290,6 +290,15 @@ jobs:
       - name: Assert the store chart runs on EKS what compose runs, on disks EBS can give it
         run: node scripts/verify-store-chart.mjs
 
+      # What infra/eks/up.mjs installs on EKS, judged without a cluster: every Secret the
+      # fifteen services, the stores and setup read is one it makes, and every one it makes
+      # is read; setup is a Job running exactly compose's setup command, once, as the
+      # image's own user, with compose's key directories writable and seeded from the key
+      # Secrets; the keys come from the directories kind takes them from; and .dockerignore
+      # keeps .claude, keys, env files and Terraform out of the image it pushes.
+      - name: Assert the EKS installer makes every Secret the charts read, and runs compose's setup
+        run: node scripts/verify-eks-install.mjs
+
       # The guard for "Free runner disk", placed before anything writes to
       # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
       # disk, rather than minutes later as an index_create_block_exception in
