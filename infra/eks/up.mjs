@@ -169,10 +169,7 @@ function main() {
       console.log(`    ..    building ${local} from HEAD`);
       run('docker', ['build', '-t', local, '.'], { stdio: 'inherit' });
     }
-    const password = run('aws', ['ecr', 'get-login-password', '--region', REGION]).trim();
-    run('docker', ['login', '--username', 'AWS', '--password-stdin', repo.split('/')[0]], { input: password });
-    run('docker', ['tag', local, remote]);
-    run('docker', ['push', remote], { stdio: 'inherit' });
+    pushImage(local, remote, repo.split('/')[0], REGION);
     check(true, `pushed ${remote}`);
   }
 
@@ -226,6 +223,37 @@ function main() {
     check(r.status === 0 && /^200 /.test(answer), `${chart}: ${answer || r.stderr.trim() || `(no answer, exit ${r.status})`}`);
   }
   console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${remote}`);
+}
+
+/**
+ * The image to ECR, through a THROWAWAY DOCKER CONFIG that already holds the credential,
+ * and no `docker login` at all. Each simpler way failed on 2026-11-14:
+ *   - `docker login` into the user's own config hands ECR's token to the credential
+ *     helper, and on Windows that is the Credential Manager, which refused it: "error
+ *     storing credentials ... The stub received bad data". An ECR token is longer than a
+ *     Windows credential may be.
+ *   - `docker login` into an EMPTY fresh config did the same. The CLI picks the platform's
+ *     helper itself whenever a config holds no credentials (DetectDefaultStore, skipped
+ *     only when ContainsAuth()).
+ * So the config is written with the credential in its `auths` already: the CLI then keeps
+ * to the file, and the push reads it from there. The directory is made for this push alone
+ * and deleted after it, token and all: nothing of AWS's stays on the machine. DOCKER_HOST
+ * is the current context's engine, which a fresh config would not know.
+ */
+function pushImage(local, remote, registry, region) {
+  const ctx = tryRun('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']);
+  const dc = mkdtempSync(join(tmpdir(), 'eventhub-docker-'));
+  try {
+    // Straight from aws to the file, never through a shell: by hand through a PowerShell
+    // pipe the token was re-encoded with a line ending, and ECR answered 400.
+    const token = run('aws', ['ecr', 'get-login-password', '--region', region]).trim();
+    writeFileSync(join(dc, 'config.json'), JSON.stringify({ auths: { [registry]: { auth: Buffer.from(`AWS:${token}`).toString('base64') } } }), { mode: 0o600 });
+    const env = { ...process.env, DOCKER_CONFIG: dc, ...(ctx.status === 0 && ctx.stdout.trim() ? { DOCKER_HOST: ctx.stdout.trim() } : {}) };
+    run('docker', ['tag', local, remote], { env });
+    run('docker', ['push', remote], { stdio: ['pipe', 'inherit', 'inherit'], env });
+  } finally {
+    rmSync(dc, { recursive: true, force: true });
+  }
 }
 
 /**

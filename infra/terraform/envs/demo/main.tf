@@ -123,8 +123,13 @@ module "ebs_csi_driver_role" {
 #   - one controller replica, not two: pods are this cluster's tight limit (29 a node);
 #   - extraVolumeTags, so every volume the driver makes carries the project's tags and the
 #     teardown's leftover check finds it by them;
-#   - --k8s-tag-cluster-id, so each volume also says which cluster made it;
-#   - AWS_REGION, so the controller never has to ask IMDS, which pods cannot reach here.
+#   - --k8s-tag-cluster-id, so each volume also says which cluster made it.
+#
+# NO AWS_REGION, though the schema takes an env list. It was here, as insurance against a
+# controller that would otherwise ask IMDS, and the first real create refused it: the
+# add-on already sets AWS_REGION on the controller itself, and the duplicate failed the
+# create with "duplicate entries for key [name="AWS_REGION"]" (CREATE_FAILED, 2026-11-14).
+# The schema says what may be added, not what is already there.
 resource "aws_eks_addon" "ebs_csi_driver" {
   cluster_name                = module.eks.cluster_name
   addon_name                  = "aws-ebs-csi-driver"
@@ -136,7 +141,6 @@ resource "aws_eks_addon" "ebs_csi_driver" {
       replicaCount    = 1
       extraVolumeTags = { Project = "eventhub", Environment = "demo" }
       additionalArgs  = ["--k8s-tag-cluster-id=${local.name}"]
-      env             = [{ name = "AWS_REGION", value = var.region }]
     }
   })
 
