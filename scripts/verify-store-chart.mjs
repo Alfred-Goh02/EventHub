@@ -308,6 +308,10 @@ function main() {
         const fsGroup = w.spec.template.spec.securityContext?.fsGroup;
         check(fsGroup === uid, `${name}: the image runs as ${u} (uid ${uid}), and fsGroup ${fsGroup ?? 'unset'} gives it the disk, which EBS hands over owned by root`);
       }
+    } else if (process.env.CI) {
+      // In CI the stores were started before this step, so a missing image is the step
+      // having moved, not a machine that never pulled it: refuse rather than skip quietly.
+      check(false, `${name}: ${svc.image} is not on the runner, so who it runs as cannot be checked; this step must run after the stores start`);
     } else {
       note(`${name}: ${svc.image} is not on this machine, so who it runs as is not checked`);
     }
