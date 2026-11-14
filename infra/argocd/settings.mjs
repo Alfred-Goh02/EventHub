@@ -14,3 +14,11 @@ export const ARGOCD_MANIFEST = `https://raw.githubusercontent.com/argoproj/argo-
 
 /** The read-only deploy key's private half: outside the repository, always. */
 export const DEPLOY_KEY = join(homedir(), '.eventhub', 'argocd-deploy-key');
+
+/**
+ * The read:packages token the EKS cluster pulls main's images with, beside the deploy key and
+ * for the same reason: a file the owner writes once, which the installer reads and never
+ * prints, so whoever runs the installer never has to hold the value. GHCR_TOKEN, when set,
+ * is used instead.
+ */
+export const GHCR_TOKEN_FILE = join(homedir(), '.eventhub', 'ghcr-token');

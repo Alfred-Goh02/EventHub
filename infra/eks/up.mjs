@@ -52,7 +52,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY } from '../argocd/settings.mjs';
+import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY, GHCR_TOKEN_FILE } from '../argocd/settings.mjs';
 import { plan as storePlan, renderChart } from '../stores/secrets.mjs';
 import { CREDENTIALS_SECRET, credentialsIn, ensure, keySecrets, withCredentials } from './credentials.mjs';
 
@@ -447,9 +447,9 @@ async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
   if (head !== mainSha) refuse(`this checkout is ${head.slice(0, 7)} and Argo CD deploys main, ${mainSha.slice(0, 7)}: the Secrets must come from the commit the cluster runs. Switch to main and pull, then run again.`);
   const owner = /github\.com[:/]([^/]+)\//.exec(run('git', ['remote', 'get-url', 'origin']))?.[1];
   if (!owner) refuse('origin is not a github.com repository');
-  const token = process.env.GHCR_TOKEN;
+  const token = process.env.GHCR_TOKEN || (existsSync(GHCR_TOKEN_FILE) ? readFileSync(GHCR_TOKEN_FILE, 'utf8').trim() : '');
   const user = process.env.GHCR_USER || owner;
-  if (!token) refuse("GHCR_TOKEN is not set: a GitHub token with read:packages and nothing else, which the cluster pulls main's images with (infra/terraform/README.md says how to make one)");
+  if (!token) refuse(`no token at ${GHCR_TOKEN_FILE}, and GHCR_TOKEN is not set: a GitHub token with read:packages and nothing else, which the cluster pulls main's images with (infra/terraform/README.md says how to make one)`);
   const { plan: publishPlan } = await import('../../scripts/publish-images.mjs');
   const images = await publishPlan({ sha: mainSha, owner });
   for (const img of images) {

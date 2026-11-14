@@ -133,16 +133,24 @@ kubectl version --client
    published main's images.
 
    The registry is private, so the cluster pulls with a token of yours that can only read
-   packages. Make it once: GitHub, Settings, Developer settings, Personal access tokens,
-   Tokens (classic), Generate new token (classic), with an expiry and **only** the
-   `read:packages` scope. Then, in the same PowerShell window, paste it where the prompt
-   asks, so it is in no file and no history:
+   packages. Make it once, at
+   <https://github.com/settings/tokens/new?scopes=read:packages&description=eventhub-cluster-pull>
+   (a classic token, with **only** `read:packages` ticked, and an expiry), and put it beside
+   the deploy key, where the installer reads it and never prints it. Paste it where the
+   prompt asks, so it is in no history:
 
    ```powershell
-   $env:GHCR_TOKEN = Read-Host -Prompt 'read:packages token'
+   Read-Host -Prompt 'read:packages token' | Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.eventhub\ghcr-token"
+   ```
+
+   Then, from main:
+
+   ```powershell
    git switch main; git pull
    node infra/eks/up.mjs --context eventhub-demo --gitops
    ```
+
+   `$env:GHCR_TOKEN`, when set, is used instead of the file.
 
    `--down` removes Argo CD's Applications first (with self-heal on, Argo CD would put back
    anything taken off before it), then Argo CD, then the stores and their disks.
