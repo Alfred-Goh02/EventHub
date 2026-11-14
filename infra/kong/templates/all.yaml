@@ -1,0 +1,8 @@
+{{- if not .Values.image }}{{ fail "image is required: compose's reference for kong, digest and all" }}{{ end -}}
+{{- if not (regexMatch "@sha256:[0-9a-f]{64}$" (toString .Values.image)) }}{{ fail "image must be pinned by digest, as compose pins it" }}{{ end -}}
+{{- include "kong.emit" (list . "kong.configmap") }}
+{{- include "kong.emit" (list . "kong.deployment") }}
+{{- include "kong.emit" (list . "kong.service") }}
+{{- if gt (int .Values.replicas) 1 }}
+{{- include "kong.emit" (list . "kong.pdb") }}
+{{- end }}

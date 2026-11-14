@@ -13,7 +13,8 @@
  * THE SAME SOURCES KIND USES. Everything that goes into the cluster comes from where
  * infra/local/up.mjs takes it for kind, never from a copy:
  *   - each service's environment is compose's, from `docker compose config`, into the
- *     Secret `<chart>-env` its chart reads (the GitOps shape, as on kind);
+ *     Secret `<chart>-env` its chart reads (the GitOps shape, as on kind), and Kong's into
+ *     kong-env, for infra/kong, the chart that is the directory compose mounts into Kong;
  *   - Auth's and Notification's keypairs are the files in services/auth/keys and
  *     services/notification/keys, into jwt-keys and notification-keys;
  *   - the stores' Secrets come from infra/stores/secrets.mjs, from compose and db/;
@@ -31,7 +32,10 @@
  *   5. setup, as a Job named for the image, waited for until it has finished;
  *   6. every chart under charts/, on the ECR image, one replica each (pods, not memory,
  *      are this cluster's tight limit), each waited for;
- *   7. every service's /ready, asked from inside the cluster.
+ *   7. the gateway, infra/kong, once the services it routes to are there;
+ *   8. every service's /ready, asked from inside the cluster;
+ *   9. requests through the gateway, from inside the cluster (gatewayProbe says what each
+ *      one shows). The Service is ClusterIP: from a laptop, `kubectl port-forward svc/kong`.
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -85,6 +89,7 @@ export function appSecrets(compose, charts, root = ROOT) {
   const out = {};
   for (const chart of charts) out[`${chart}-env`] = { data: envOf(compose, chart), from: `docker-compose.yml ${chart}.environment` };
   out['setup-env'] = { data: envOf(compose, 'setup'), from: 'docker-compose.yml setup.environment' };
+  out['kong-env'] = { data: envOf(compose, 'kong'), from: 'docker-compose.yml kong.environment' };
   for (const [name, dir] of Object.entries(KEY_DIRS)) {
     const abs = join(root, dir);
     const pems = existsSync(abs) ? readdirSync(abs).filter((f) => f.endsWith('.pem')).sort() : [];
@@ -103,6 +108,58 @@ export function appSecrets(compose, charts, root = ROOT) {
     refuse("services/notification/keys/public.pem is not the notification-public.pem Auth holds: Auth would seal requests Notification cannot open");
   }
   return out;
+}
+
+/**
+ * Requests through the gateway, as a script for `node -e` in a pod: five answers, as JSON.
+ * node:http, because fetch will not send a Host header, and the tenant is the Host.
+ */
+export function gatewayProbe(host = 'kong', port = 8000) {
+  return `
+const http = require('node:http');
+const ask = (h, path) => new Promise((done) => {
+  const req = http.request({ host: ${JSON.stringify(host)}, port: ${Number(port)}, path, headers: { host: h } }, (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (d) => { body += d; });
+    res.on('end', () => done({ status: res.statusCode, headers: res.headers, body: body.slice(0, 300) }));
+  });
+  req.on('error', (e) => done({ error: e.code || e.message }));
+  req.setTimeout(10000, () => req.destroy(new Error('no answer in 10 s')));
+  req.end();
+});
+(async () => {
+  const out = {};
+  out.me1 = await ask('acme.eventhub.localhost', '/auth/me');
+  out.me2 = await ask('acme.eventhub.localhost', '/auth/me');
+  out.events = await ask('acme.eventhub.localhost', '/events');
+  out.noTenant = await ask('www.eventhub.localhost', '/auth/me');
+  out.health = await ask('acme.eventhub.localhost', '/health');
+  console.log(JSON.stringify(out));
+})();`;
+}
+
+/**
+ * What those answers must show, as [ok, message] pairs. Each is told apart by who answered:
+ * a response Kong made itself carries X-Kong-Response-Latency, and one a service made
+ * carries X-Kong-Upstream-Latency, so "Kong refused it" and "the service refused it" are
+ * never the same 401.
+ */
+export function judgeGateway(a) {
+  const h = (r, k) => r?.headers?.[k];
+  const upstream = (r) => h(r, 'x-kong-upstream-latency') !== undefined;
+  const said = (r) => (r?.error ? `no answer: ${r.error}` : `${r?.status} ${String(r?.body ?? '').replace(/\s+/g, ' ').slice(0, 80)}`);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const r1 = Number(h(a.me1, 'ratelimit-remaining'));
+  const r2 = Number(h(a.me2, 'ratelimit-remaining'));
+  return [
+    [a.me1?.status === 401 && upstream(a.me1) && /"error"/.test(a.me1.body ?? ''), `a tenant's /auth/me reaches Auth, through Kong, and Auth refuses it without a token (${said(a.me1)})`],
+    [uuid.test(h(a.me1, 'x-request-id') ?? ''), `Kong gives it a request id (${h(a.me1, 'x-request-id') ?? 'none'})`],
+    [h(a.me1, 'ratelimit-limit') === '120' && Number.isFinite(r1) && Number.isFinite(r2) && r2 < r1, `counted in Redis at Auth's 120 a minute: ${h(a.me1, 'ratelimit-remaining') ?? 'no count'}, then ${h(a.me2, 'ratelimit-remaining') ?? 'no count'} left (with Redis unreachable the limit fails open, and no count comes back)`],
+    [a.events?.status === 401 && !upstream(a.events) && h(a.events, 'x-kong-response-latency') !== undefined, `/events without a token is refused by Kong itself, never reaching Event: the signature check with Auth's key is on (${said(a.events)})`],
+    [a.noTenant?.status === 400 && /tenant subdomain required/.test(a.noTenant.body ?? '') && !upstream(a.noTenant), `a host with no tenant in it is refused at the edge (${said(a.noTenant)})`],
+    [a.health?.status === 404 && !upstream(a.health), `/health is not routed: it is the platform's, not the internet's (${said(a.health)})`],
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +269,24 @@ function main() {
     rmSync(scratch, { recursive: true, force: true });
   }
 
-  step('7. /ready from inside the cluster');
+  step('7. the gateway');
+  const g = tryRun('helm', ['upgrade', '--install', 'kong', join('infra', 'kong'), ...helmArgs, '--wait', '--timeout', '5m']);
+  check(g.status === 0, `infra/kong${g.status === 0 ? ', ready' : `: ${g.stderr.trim().split('\n').pop()}`}`);
+  // And the OLD pods gone, not only the new ones ready. `--wait` returns once the new pods
+  // are ready, while an old one is still in the Service: on kind, a probe straight after an
+  // upgrade was answered by the old configuration. rollout status waits until every old pod
+  // is being deleted; a pod being deleted still serves through its preStop wait, so then
+  // wait for it to be gone.
+  const rolled = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'rollout', 'status', 'deployment/kong', '--timeout', '2m']);
+  let leaving = null;
+  for (let i = 0; rolled.status === 0 && i < 60; i += 1) {
+    leaving = JSON.parse(kubectl(['--namespace', 'default', 'get', 'pods', '-l', 'app.kubernetes.io/name=kong', '-o', 'json'])).items.filter((p) => p.metadata.deletionTimestamp).length;
+    if (leaving === 0) break;
+    spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 2000)']);
+  }
+  check(rolled.status === 0 && leaving === 0, `every Kong pod runs this configuration${rolled.status === 0 ? (leaving ? ` -- ${leaving} old pod(s) still leaving` : '') : `: ${rolled.stderr.trim().split('\n').pop()}`}`);
+
+  step('8. /ready from inside the cluster');
   for (const chart of charts) {
     const port = compose.services[chart]?.environment?.PORT;
     if (!port) continue;
@@ -222,7 +296,17 @@ function main() {
     const answer = r.stdout.trim();
     check(r.status === 0 && /^200 /.test(answer), `${chart}: ${answer || r.stderr.trim() || `(no answer, exit ${r.status})`}`);
   }
-  console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${remote}`);
+
+  step('9. through the gateway, from inside the cluster');
+  const p = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'run', `gateway-${Date.now().toString(36)}`, '--rm', '-i', '--restart=Never', `--image=${remote}`, '--quiet', '--', 'node', '-e', gatewayProbe()]);
+  let answers = null;
+  try {
+    answers = JSON.parse(p.stdout.trim().split('\n').pop());
+  } catch {
+    check(false, `the probe gave no answers: ${(p.stdout || p.stderr).trim().slice(-300) || `exit ${p.status}`}`);
+  }
+  if (answers) for (const [ok, msg] of judgeGateway(answers)) check(ok, msg);
+  console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${remote}. To reach it from here:\n  kubectl --context ${CONTEXT} port-forward svc/kong 18000:8000\n  then http://acme.eventhub.localhost:18000`);
 }
 
 /**
@@ -263,9 +347,9 @@ function pushImage(local, remote, registry, region) {
  * the driver made may be left.
  */
 function down({ kubectl, helmArgs, charts, REGION }) {
-  step('2. the releases, services and setup first, the stores last');
+  step('2. the releases: the gateway, the services and setup first, the stores last');
   const releases = new Set(JSON.parse(run('helm', ['list', ...helmArgs, '--output', 'json'])).map((r) => r.name));
-  for (const name of [...charts, 'setup', 'stores'].filter((n) => releases.has(n))) {
+  for (const name of ['kong', ...charts, 'setup', 'stores'].filter((n) => releases.has(n))) {
     const r = tryRun('helm', ['uninstall', name, ...helmArgs, '--wait', '--timeout', '10m']);
     check(r.status === 0, `uninstalled ${name}${r.status === 0 ? '' : `: ${r.stderr.trim().split('\n').pop()}`}`);
   }
