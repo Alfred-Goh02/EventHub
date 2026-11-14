@@ -1,0 +1,311 @@
+# EVENTHUB'S DATA STORES, IN THE CLUSTER, AS COMPOSE RUNS THEM.
+#
+# The decision (2026-11-14): on the AWS demo every store runs as a pod with an EBS disk,
+# not as RDS, ElastiCache or OpenSearch Service. The free plan closes MSK, the stores fit
+# on the two nodes (measured locally: about 4 GiB together), and a demo needs no upkeep
+# a pod cannot give it.
+#
+# NOT A SECOND COPY OF COMPOSE. docker-compose.yml stays the one description of each
+# store. Every image, every environment variable, every port the apps dial and every stop
+# grace period below is checked against it by scripts/verify-store-chart.mjs, and the
+# few deliberate differences are each declared there with the reason. Where this file
+# and compose disagree without a declared reason, the verifier fails.
+#
+# THE NAMES ARE THE CONTRACT. Each Service is named as compose names the service, on the
+# port the apps dial, in the apps' namespace (default): postgres:5432, kafka:29092 and the
+# rest. So every connection string in the apps' environment works unchanged, as it does
+# on kind through infra/local/up.mjs's bridge. Kafka advertises kafka:29092, a short name
+# that resolves only in the same namespace: install this chart where the apps run.
+#
+# EKS ONLY. On kind the stores stay in compose and are bridged in; installing this chart
+# into kind's default namespace would put a second postgres Service beside the bridge's.
+#
+# PASSWORDS ARE NOT HERE. A password reaches a store from a Secret, and
+# infra/stores/secrets.mjs makes every Secret this chart names -- from compose's own
+# environment and the db/ init files -- so nothing is copied and nothing is in git twice.
+
+# yaml for kubectl and Helm; json for the verifier, which reads the chart without a YAML
+# parser. Both are printed from the same object (templates/_helpers.tpl).
+render: yaml
+
+# gp3 on the EBS CSI driver (infra/terraform/envs/demo), encrypted with the AWS-managed
+# aws/ebs key: the driver's role has no KMS permissions. WaitForFirstConsumer, because the
+# nodes span two zones and a volume lives in one: the volume is made in the zone of the
+# node the pod is scheduled to, never the other way round. Delete, so a claim deleted at
+# teardown takes its volume with it instead of leaving it to bill.
+storageClass:
+  create: true
+  name: eventhub-gp3
+
+# Above every app pod (priority 0). Pods, not memory, are this cluster's tight limit (29
+# a node), and each store is pinned to one node by its disk's zone: if a node fills up,
+# the scheduler evicts an app pod for a store, never the other way round.
+priorityClass:
+  create: true
+  name: eventhub-stores
+  value: 1000
+
+stores:
+  postgres:
+    kind: StatefulSet
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+    containerPorts: [5432]
+    servicePorts: [5432]
+    env:
+      POSTGRES_USER: eventhub
+      POSTGRES_DB: postgres
+      # A SUBDIRECTORY OF THE DISK, NOT ITS ROOT. A fresh ext4 volume holds lost+found,
+      # and initdb refuses a data directory that is not empty. Compose's named volume has
+      # no lost+found, which is why compose never needed this.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secretEnv:
+      POSTGRES_PASSWORD: stores-credentials
+    volume:
+      mountPath: /var/lib/postgresql/data
+      size: 10Gi
+    # db/init, the first-boot bootstrap: roles, databases, grants. It runs once, on an
+    # empty data directory, as compose runs it.
+    initFrom:
+      secret: postgres-init
+      mountPath: /docker-entrypoint-initdb.d
+    terminationGracePeriodSeconds: 30
+    readinessProbe:
+      exec: { command: [pg_isready, -U, eventhub, -d, postgres] }
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 10
+    livenessProbe:
+      exec: { command: [pg_isready, -U, eventhub, -d, postgres] }
+      initialDelaySeconds: 60
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # Measured locally: 132 MiB. The image starts as root and chowns its own data
+    # directory, so no fsGroup.
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 512Mi }
+
+  redis:
+    kind: Deployment
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    # No persistence, deliberately (docker-compose.yml says why): no disk either.
+    args: [redis-server, --save, "", --appendonly, "no"]
+    containerPorts: [6379]
+    servicePorts: [6379]
+    terminationGracePeriodSeconds: 10
+    readinessProbe:
+      exec: { command: [redis-cli, ping] }
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 10
+    livenessProbe:
+      exec: { command: [redis-cli, ping] }
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 6
+    # Measured locally: 13 MiB.
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+  opensearch:
+    kind: StatefulSet
+    image: opensearchproject/opensearch:2.19.0@sha256:1f8b88245a6af61e7aa500afe0e87d43401e4b33140bb47230a919428ce3f7cb
+    containerPorts: [9200]
+    servicePorts: [9200]
+    # One of the three heavy stores, kept apart from the other two where there is room.
+    heavy: true
+    env:
+      cluster.name: eventhub-local
+      node.name: opensearch-node1
+      discovery.type: single-node
+      # FALSE HERE, TRUE IN COMPOSE. Locking the heap needs an unlimited memlock ulimit,
+      # which compose sets and Kubernetes has no per-pod field for, and EKS nodes run
+      # without swap, so there is nothing to lock it against. Single-node skips the
+      # bootstrap check that would refuse the failure; it would only log a warning.
+      bootstrap.memory_lock: "false"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      action.auto_create_index: -events-*,-tenant-*,+*
+    volume:
+      mountPath: /usr/share/opensearch/data
+      size: 10Gi
+    terminationGracePeriodSeconds: 60
+    # Yellow, as compose asks: a single node never reaches green.
+    readinessProbe:
+      httpGet: { path: "/_cluster/health?wait_for_status=yellow&timeout=1s", port: 9200 }
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 20
+    livenessProbe:
+      tcpSocket: { port: 9200 }
+      initialDelaySeconds: 120
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # The image runs as uid 1000 and an EBS root is owned by root. Docker copied the image
+    # directory's ownership into compose's named volume; a claim does not.
+    podSecurityContext: { fsGroup: 1000 }
+    # Measured locally: 1.28 GiB with the 512 MiB heap.
+    resources:
+      requests: { cpu: 200m, memory: 1280Mi }
+      limits: { memory: 1792Mi }
+
+  clickhouse:
+    kind: StatefulSet
+    image: clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+    containerPorts: [8123]
+    servicePorts: [8123]
+    heavy: true
+    env:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: eventhub
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    secretEnv:
+      CLICKHOUSE_PASSWORD: stores-credentials
+    volume:
+      mountPath: /var/lib/clickhouse
+      size: 10Gi
+    # db/clickhouse-init: the analytics database and its two users, once, on first boot.
+    initFrom:
+      secret: clickhouse-init
+      mountPath: /docker-entrypoint-initdb.d
+    terminationGracePeriodSeconds: 30
+    # Authenticated, as compose's check is: ClickHouse answers /ping without a password,
+    # and a store that cannot log its own admin in is not ready.
+    readinessProbe:
+      exec: { command: [sh, -c, 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null'] }
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 12
+    livenessProbe:
+      tcpSocket: { port: 8123 }
+      initialDelaySeconds: 60
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # Measured locally: 1.33 GiB with no limit. Under a limit ClickHouse caps its own
+    # memory below it; a merge or a backlog insert past the cap fails with
+    # MEMORY_LIMIT_EXCEEDED, which the first window must look for.
+    resources:
+      requests: { cpu: 200m, memory: 1Gi }
+      limits: { memory: 2Gi }
+
+  kafka:
+    kind: StatefulSet
+    image: confluentinc/cp-kafka:7.8.0@sha256:adc392d28a1e99e8c9a1ec7f087e9e91041837b35b8b7cc8b8a691b82dd581b0
+    containerPorts: [29092, 29093, 9092]
+    servicePorts: [29092]
+    heavy: true
+    env:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      # LOCALHOST, NOT kafka:29093. In compose that name is the container itself. Here it
+      # is a Service that routes only to READY pods, and the broker cannot be ready until
+      # it has reached its own controller: dialled through the Service, it would wait for
+      # itself forever. One node is its own whole quorum, so it dials itself directly.
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      # kafka:29092 for every pod, as in compose; localhost:9092 for a tool on this
+      # machine through `kubectl port-forward pod/kafka-0 9092`.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: EventHubLocalCluster1
+      # A subdirectory of the disk, for the reason PGDATA is one: lost+found.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data/logs
+      # What it runs with today, written down: the image's default, read from the
+      # running compose broker's command line. Unwritten, it is whatever the next image
+      # decides, under a limit it cannot see.
+      KAFKA_HEAP_OPTS: -Xms1G -Xmx1G
+    volume:
+      mountPath: /var/lib/kafka/data
+      size: 10Gi
+    terminationGracePeriodSeconds: 60
+    # The broker's own API, as compose asks it, but every 20 s, not 10: it starts a JVM
+    # each time, and these nodes have two cores.
+    readinessProbe:
+      exec: { command: [sh, -c, "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"] }
+      initialDelaySeconds: 20
+      periodSeconds: 20
+      timeoutSeconds: 15
+      failureThreshold: 12
+    livenessProbe:
+      tcpSocket: { port: 29092 }
+      initialDelaySeconds: 90
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # appuser, uid and gid 1000 (`id` in the image).
+    podSecurityContext: { fsGroup: 1000 }
+    # Measured locally: 913 MiB with the 1 GiB heap.
+    resources:
+      requests: { cpu: 200m, memory: 1280Mi }
+      limits: { memory: 1792Mi }
+
+  schema-registry:
+    kind: Deployment
+    image: confluentinc/cp-schema-registry:7.8.0@sha256:ae0695b092314be82fe32058c276d99224855090a77ec169423cf82e02d5e3ac
+    containerPorts: [8081]
+    servicePorts: [8081]
+    env:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "1"
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+      # Its default today, read from the running compose registry, written down.
+      SCHEMA_REGISTRY_HEAP_OPTS: -Xmx512M
+    terminationGracePeriodSeconds: 15
+    # No depends_on in Kubernetes: until Kafka answers it fails and restarts, then settles.
+    readinessProbe:
+      httpGet: { path: /subjects, port: 8081 }
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 12
+    livenessProbe:
+      tcpSocket: { port: 8081 }
+      initialDelaySeconds: 90
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # Measured locally: 277 MiB with the 512 MiB heap ceiling.
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 896Mi }
+
+  mailpit:
+    kind: Deployment
+    image: axllent/mailpit:v1.31.1@sha256:98b916bd3c8d61f7633a52d3ea2f58d00620cb01ca57ab59edde68c347a95365
+    # 1025 for Notification's SMTP; 8025, the inbox, for `kubectl port-forward svc/mailpit 8025`.
+    containerPorts: [1025, 8025]
+    servicePorts: [1025, 8025]
+    terminationGracePeriodSeconds: 10
+    readinessProbe:
+      exec: { command: [/mailpit, readyz] }
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    livenessProbe:
+      exec: { command: [/mailpit, readyz] }
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # Measured locally: 27 MiB.
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }

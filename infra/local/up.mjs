@@ -33,6 +33,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Which compose hosts an environment names: shared with scripts/verify-store-chart.mjs,
+// which requires infra/stores to serve on EKS every host this script bridges on kind.
+import { hostsOf } from '../lib/compose-hosts.mjs';
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CLUSTER = 'eventhub';
 const CONTEXT = `kind-${CLUSTER}`;
@@ -59,32 +63,6 @@ function allCharts() {
     .sort();
 }
 
-/** host:port pairs a value names, for hosts that are compose services. */
-function hostsIn(value, composeNames) {
-  const found = [];
-  for (const m of String(value).matchAll(/(?:^|[/@,\s])([a-z][a-z0-9-]*):(\d{2,5})\b/g)) {
-    if (composeNames.has(m[1])) found.push({ host: m[1], port: Number(m[2]) });
-  }
-  return found;
-}
-
-/**
- * Every compose host an environment names: host:port inside a value, and a bare
- * `X_HOST=<service>` with its `X_PORT` beside it -- how Notification names mailpit.
- * A bare value alone is not a host: CLICKHOUSE_DATABASE=analytics and
- * KAFKA_CONSUMER_GROUP=analytics-ingest both equal a compose service's name.
- */
-function hostsOf(env, composeNames) {
-  const found = [];
-  for (const [key, value] of Object.entries(env)) {
-    found.push(...hostsIn(value, composeNames));
-    const prefix = /^(.*)_HOST$/.exec(key)?.[1];
-    if (prefix && composeNames.has(String(value)) && /^\d{2,5}$/.test(String(env[`${prefix}_PORT`] ?? ''))) {
-      found.push({ host: String(value), port: Number(env[`${prefix}_PORT`]) });
-    }
-  }
-  return found;
-}
 
 const args = process.argv.slice(2).filter((a) => a !== '--');
 /**
