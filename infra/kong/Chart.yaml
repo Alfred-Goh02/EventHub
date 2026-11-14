@@ -1,0 +1,5 @@
+apiVersion: v2
+name: kong
+description: "EventHub's gateway inside the EKS cluster: Kong as compose runs it, reading this directory's kong.yml and render-consumer.lua, the files compose mounts."
+type: application
+version: 0.1.0

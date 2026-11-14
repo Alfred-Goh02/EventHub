@@ -25,7 +25,7 @@ Not RDS, ElastiCache or OpenSearch Service, by decision (2026-11-14): the free p
 leaves out `kafka`, so MSK was never an option, and the stores fit on the two nodes.
 `10.40.32.0/19` and `10.40.192.0/18` stay free in the VPC should a managed store come later.
 `infra/eks/up.mjs` installs the rest on top of them: the image, the services' Secrets,
-setup as a Job (`infra/setup`), and the fifteen services.
+setup as a Job (`infra/setup`), the fifteen services, and the gateway (`infra/kong`).
 
 **What the account allows.** Two limits shaped this directory, from two places:
 
@@ -108,12 +108,22 @@ kubectl version --client
    `ecr_repository_url` by git SHA; installs the stores (`infra/stores`) and waits for
    them; makes every Secret the services read, from compose and the local keypairs; runs
    setup, compose's own setup command as a Job; installs the fifteen charts one replica
-   each; and asks each service's `/ready` from inside the cluster. Every step is
-   idempotent, so a failed run is re-run. No value is printed.
+   each, then Kong in front of them; asks each service's `/ready` from inside the cluster;
+   and sends requests through Kong that only a working gateway answers as they come back
+   (Auth reached, the rate limit counted in Redis, a missing token refused at the edge).
+   Every step is idempotent, so a failed run is re-run. No value is printed.
 
    ```powershell
    node infra/eks/up.mjs --context eventhub-demo
    kubectl --context eventhub-demo get pods,pvc
+   ```
+
+   The gateway is ClusterIP until the domain is decided. From this machine, through a
+   port-forward (18000, because compose's own Kong holds 8000 here):
+
+   ```powershell
+   kubectl --context eventhub-demo port-forward svc/kong 18000:8000
+   curl.exe -i http://acme.eventhub.localhost:18000/auth/me
    ```
 
    The Load Balancer Controller's chart, when the cluster gets a public way in, takes

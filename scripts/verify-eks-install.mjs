@@ -3,7 +3,8 @@
  * sources kind uses, and that setup there is compose's own setup.
  *
  * NOTHING HERE TALKS TO A CLUSTER. It renders every chart -- the fifteen services, the
- * stores and setup -- and holds what they read against what the installer makes:
+ * stores, setup and the gateway -- and holds what they read against what the installer
+ * makes (kong-env is compose's environment for Kong, variable for variable):
  *   - every Secret a pod reads (envFrom, a Secret volume and its items, a secretKeyRef) is
  *     one the installer or infra/stores/secrets.mjs makes, with every key read; and every
  *     Secret the installer makes is read by something, so neither list can rot;
@@ -180,7 +181,15 @@ async function main() {
   }
   merge(secretReads(storeDocs), 'stores');
   merge(secretReads(setup.docs), 'setup');
-  check(rendered === charts.length && charts.length > 0 && Object.keys(reads).length > 0, `CONTROL: ${rendered} of ${charts.length} chart(s) rendered, plus stores and setup; ${Object.keys(reads).length} Secret(s) read`);
+  // The gateway: compose's environment for Kong as kong-env, and Auth's public key.
+  const gateway = render(join(root, 'infra', 'kong'), []);
+  if (gateway.error) {
+    check(false, `infra/kong did not render: ${gateway.error.slice(-400)}`);
+    return;
+  }
+  merge(secretReads(gateway.docs), 'kong');
+  check(rendered === charts.length && charts.length > 0 && Object.keys(reads).length > 0, `CONTROL: ${rendered} of ${charts.length} chart(s) rendered, plus stores, setup and the gateway; ${Object.keys(reads).length} Secret(s) read`);
+  check(JSON.stringify(made['kong-env']?.data) === JSON.stringify(eks.envOf(compose, 'kong')), `kong-env is compose's resolved environment for Kong (${Object.keys(made['kong-env']?.data ?? {}).length} variable(s))`);
   for (const [name, r] of Object.entries(reads).sort()) {
     const have = produced[name];
     const missing = [...r.keys].filter((k) => k !== '*' && !have?.has(k));
@@ -237,7 +246,7 @@ async function main() {
     console.error(`FAIL: ${failures} assertion(s) failed`);
     return;
   }
-  console.log(`infra/eks/up.mjs makes every Secret the ${charts.length} services, the stores and setup read, and runs compose's setup`);
+  console.log(`infra/eks/up.mjs makes every Secret the ${charts.length} services, the stores, setup and the gateway read, and runs compose's setup`);
 }
 
 main().catch((e) => {

@@ -1120,7 +1120,11 @@ services:
   # Browsers and curl resolve any *.localhost name to loopback by themselves.
   # ---------------------------------------------------------------------------
   kong:
-    image: kong:3.9
+    # Pinned by digest, as the stores are: infra/kong runs this same image on EKS, and CI
+    # parses kong.yml with it. scripts/verify-gateway-chart.mjs requires the chart's image
+    # to be exactly this one: 3.9.3, the kong:3.9 this machine has run since the gateway
+    # came in (#147).
+    image: kong:3.9@sha256:12972ce1ab6396083e56e7d46fce084836c98cc819344bef44a1f583ec3ab191
     container_name: eventhub-kong
     restart: unless-stopped
     stop_grace_period: 15s
