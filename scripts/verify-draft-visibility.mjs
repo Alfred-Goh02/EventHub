@@ -122,6 +122,51 @@ async function createEvent(token, title) {
 
 const listed = (body) => body.events ?? body.items ?? body.data ?? [];
 
+/** Far past any local database, and still a bound on a cursor that never ends. */
+const MAX_PAGES = 200;
+
+/**
+ * Reads a list by nextCursor, page after page, until `wanted` matches a row or
+ * the list ends.
+ *
+ * GET /events is keyset-paginated, soonest first, twenty to a page. This run's
+ * draft starts tomorrow, so on a database earlier runs have left drafts in it
+ * sits behind all of them. Measured on a used local database: the organiser's
+ * ?status=DRAFT came back with a full first page, a nextCursor, and not the
+ * draft, so a check that read page one was red there and green only on a fresh
+ * CI database. The absence checks had the mirror of it: page one empty of
+ * drafts says nothing about page two.
+ *
+ * `complete` is true only when the last page was read. An absence check needs
+ * it, because a walk cut short by the bound or by an error has not looked.
+ */
+async function walk(path, token, wanted = () => false) {
+  const rows = [];
+  let cursor = null;
+  for (let pages = 1; pages <= MAX_PAGES; pages += 1) {
+    const sep = path.includes('?') ? '&' : '?';
+    const r = await get(cursor ? `${path}${sep}cursor=${encodeURIComponent(cursor)}` : path, token);
+    if (r.status !== 200) return { rows, pages, found: undefined, complete: false, status: r.status };
+    const page = listed(r.body);
+    rows.push(...page);
+    const found = page.find(wanted);
+    cursor = r.body.nextCursor ?? null;
+    if (found || !cursor) return { rows, pages, found, complete: !cursor };
+  }
+  return { rows, pages: MAX_PAGES, found: undefined, complete: false };
+}
+
+/** The control: how much of the list a walk actually read, and why it stopped. */
+const read = (w) =>
+  `read ${w.pages} page(s), ${w.rows.length} row(s), ` +
+  (w.status !== undefined
+    ? `stopped by a ${w.status} on page ${w.pages}`
+    : w.found
+      ? 'stopped where it found it'
+      : w.complete
+        ? 'to the last page'
+        : `stopped at the ${MAX_PAGES}-page bound with more to read`);
+
 async function main() {
   await db.connect();
 
@@ -156,18 +201,19 @@ async function main() {
       : `by id -> ${byId.status} "${byId.body?.title}" (${byId.body?.status}) — the draft is readable`,
   );
 
-  const plainList = await get('/events', attendeeToken);
-  const draftsInList = listed(plainList.body).filter((e) => e.status === 'DRAFT');
+  const plainList = await walk('/events', attendeeToken);
+  const draftsInList = plainList.rows.filter((e) => e.status === 'DRAFT');
   check(
-    draftsInList.length === 0,
-    `no drafts in the default list, saw ${draftsInList.length}`,
+    plainList.complete && draftsInList.length === 0,
+    `no drafts in the default list, saw ${draftsInList.length} (${read(plainList)})`,
   );
 
-  const asked = await get('/events?status=DRAFT', attendeeToken);
-  const askedDrafts = listed(asked.body);
+  const asked = await walk('/events?status=DRAFT', attendeeToken);
+  const askedDrafts = asked.rows;
   check(
-    askedDrafts.length === 0,
-    `?status=DRAFT returns nothing, saw ${askedDrafts.length} — asking by name is not a bypass`,
+    asked.complete && askedDrafts.length === 0,
+    `?status=DRAFT returns nothing, saw ${askedDrafts.length} — asking by name is not a bypass ` +
+      `(${read(asked)})`,
   );
 
   // -------------------------------------------------------------------------
@@ -188,10 +234,10 @@ async function main() {
       'hiding drafts from everyone is not the fix',
   );
 
-  const organiserList = await get('/events?status=DRAFT', organiserToken);
+  const organiserList = await walk('/events?status=DRAFT', organiserToken, (e) => e.id === draft.id);
   check(
-    listed(organiserList.body).some((e) => e.id === draft.id),
-    'the organiser can still list drafts',
+    organiserList.found !== undefined,
+    `the organiser can still list drafts, this run's among them (${read(organiserList)})`,
   );
 
   await db.end();
