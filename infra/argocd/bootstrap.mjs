@@ -21,16 +21,13 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY as KEY } from './settings.mjs';
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CONTEXT = 'kind-eventhub';
-// Pinned: an install manifest from a branch changes under you. Release notes at
-// https://github.com/argoproj/argo-cd/releases.
-const ARGOCD_VERSION = 'v3.6.1';
-const KEY = join(homedir(), '.eventhub', 'argocd-deploy-key');
 
 const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { cwd: ROOT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...opts });
 const kubectl = (args, input) => run('kubectl', ['--context', CONTEXT, ...args], input === undefined ? {} : { input });
@@ -61,7 +58,7 @@ if (up.status !== 0) fail('infra/local/up.mjs --gitops failed');
 
 step(`2. ArgoCD ${ARGOCD_VERSION}`);
 spawnSync('kubectl', ['--context', CONTEXT, 'create', 'namespace', 'argocd'], { encoding: 'utf8' });
-run('kubectl', ['--context', CONTEXT, 'apply', '-n', 'argocd', '--server-side', '--force-conflicts', '-f', `https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml`]);
+run('kubectl', ['--context', CONTEXT, 'apply', '-n', 'argocd', '--server-side', '--force-conflicts', '-f', ARGOCD_MANIFEST]);
 run('kubectl', ['--context', CONTEXT, '-n', 'argocd', 'wait', '--for=condition=available', 'deployment', '--all', '--timeout=300s']);
 console.log('    ok    every ArgoCD deployment available');
 

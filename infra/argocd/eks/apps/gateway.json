@@ -1,0 +1,21 @@
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {
+    "name": "kong",
+    "namespace": "argocd",
+    "labels": { "app.kubernetes.io/part-of": "eventhub" },
+    "finalizers": ["resources-finalizer.argocd.argoproj.io"]
+  },
+  "spec": {
+    "project": "default",
+    "source": {
+      "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
+      "targetRevision": "main",
+      "path": "infra/kong",
+      "helm": { "releaseName": "kong", "valueFiles": ["values.yaml"] }
+    },
+    "destination": { "server": "https://kubernetes.default.svc", "namespace": "default" },
+    "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
+  }
+}

@@ -1,6 +1,8 @@
 /**
- * Asserts that ArgoCD, given infra/argocd/root.json, runs exactly the services in charts/,
- * from this repository's main branch, and that no credential is in git to do it.
+ * Asserts that ArgoCD, given either cluster's root -- infra/argocd/root.json (kind) or
+ * infra/argocd/eks/root.json (EKS) -- runs exactly the services in charts/, from this
+ * repository's main branch, and that no credential is in git to do it. What else the EKS root
+ * deploys, and from which images, is verify-argocd-eks.mjs.
  *
  * GITOPS FAILS QUIETLY. An ApplicationSet whose generator misses a chart simply never
  * creates that Application: nothing errors, the service is just not there. One that
@@ -61,15 +63,21 @@ function walk(dir) {
 /** A glob segment as ArgoCD's git directory generator matches it: * within one segment. */
 const segmentMatch = (pattern, name) => new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')}$`).test(name);
 
+/** Every root, one per cluster: kind's, which bootstrap.mjs applies, and EKS's, which up.mjs --gitops applies. */
+const ROOTS = ['infra/argocd/root.json', 'infra/argocd/eks/root.json'];
+
 function main() {
-  const rootFile = join(ROOT, 'infra', 'argocd', 'root.json');
-  const rootApp = JSON.parse(readFileSync(rootFile, 'utf8'));
   const origin = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: HERE, encoding: 'utf8' }).trim();
   const repo = repoId(origin);
   check(Boolean(repo), `CONTROL: this repository is read from git's origin (${repo})`);
+  for (const rel of ROOTS) judgeRoot(join(ROOT, ...rel.split('/')), rel, repo);
+  credentials();
+}
 
+function judgeRoot(rootFile, rel, repo) {
+  const rootApp = JSON.parse(readFileSync(rootFile, 'utf8'));
   console.log('');
-  console.log('  the root Application');
+  console.log(`  the root Application: ${rel}`);
   const src = rootApp.spec?.source ?? {};
   check(repoId(src.repoURL) === repo, `it reads this repository (${src.repoURL})`);
   check(src.targetRevision === 'main', `at main, the branch that is merged to (${src.targetRevision})`);
@@ -140,6 +148,9 @@ function main() {
     check(tauto?.prune === true && tauto?.selfHeal === true, 'with automated sync that prunes and self-heals');
   }
 
+}
+
+function credentials() {
   console.log('');
   console.log('  no credential in git');
   const data = walk(join(ROOT, 'infra', 'argocd')).filter((p) => /\.(json|ya?ml)$/.test(p));

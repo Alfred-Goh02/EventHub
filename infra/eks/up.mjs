@@ -1,8 +1,12 @@
 /**
  * Installs EventHub on the EKS demo cluster, and takes it off again.
  *
- *   node infra/eks/up.mjs                 everything, in order, each step idempotent
- *   node infra/eks/up.mjs --down          the releases off, the stores' disks deleted first
+ *   node infra/eks/up.mjs                 everything, in order, each step idempotent: this
+ *                                         checkout's images, built here, pushed to ECR
+ *   node infra/eks/up.mjs --gitops        main, from the images CI published to ghcr.io,
+ *                                         deployed and kept by Argo CD (gitops() says how)
+ *   node infra/eks/up.mjs --down          Argo CD's Applications and the releases off, the
+ *                                         stores' disks deleted first
  *   options: --context <kube context, default eventhub-demo> --region <default ap-southeast-2>
  *
  * Needs: the envs/demo Terraform applied, its kubeconfig entry
@@ -48,6 +52,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY, GHCR_TOKEN_FILE } from '../argocd/settings.mjs';
 import { plan as storePlan, renderChart } from '../stores/secrets.mjs';
 import { CREDENTIALS_SECRET, credentialsIn, ensure, keySecrets, withCredentials } from './credentials.mjs';
 
@@ -290,7 +295,7 @@ const check = (ok, msg) => {
   }
 };
 
-function main() {
+async function main() {
   const argv = process.argv.slice(2).filter((a) => a !== '--');
   const option = (name, fallback) => {
     const i = argv.indexOf(name);
@@ -299,6 +304,7 @@ function main() {
   const CONTEXT = option('--context', 'eventhub-demo');
   const REGION = option('--region', 'ap-southeast-2');
   const DOWN = argv.includes('--down');
+  const GITOPS = argv.includes('--gitops');
   const kubectl = (args, input) => run('kubectl', ['--context', CONTEXT, ...args], input === undefined ? {} : { input });
   const helmArgs = ['--kube-context', CONTEXT, '--namespace', 'default'];
   const charts = allCharts();
@@ -315,7 +321,6 @@ function main() {
   check(addon.stdout.trim() === 'ACTIVE', `the EBS CSI driver add-on is ${addon.stdout.trim() || addon.stderr.trim().split('\n').pop()}`);
   if (failed) return;
 
-  step('2. the images, by the commit they are built from');
   // A change to a tracked file, or an untracked file the build would copy in, means no
   // commit describes the image. .claude/ is always untracked in the main checkout (the
   // agent's worktrees) and never reaches the image: .dockerignore excludes it, and
@@ -325,6 +330,10 @@ function main() {
     .split(/\r?\n/)
     .filter((f) => f && !f.startsWith('.claude/'));
   if (changed || untracked.length) refuse(`the working tree is not HEAD, so no commit describes the image:\n${[changed, ...untracked.map((f) => `?? ${f}`)].filter(Boolean).join('\n')}`);
+
+  if (GITOPS) return gitops({ kubectl, helmArgs, charts, CONTEXT });
+
+  step('2. the images, by the commit they are built from');
   const sha = run('git', ['rev-parse', '--short', 'HEAD']).trim();
   const repos = {};
   for (const [name, context] of Object.entries(IMAGES)) {
@@ -346,29 +355,7 @@ function main() {
   const repo = repos['eventhub/app'];
   const remote = `${repo}:${sha}`;
 
-  step("3. this cluster's credentials, and every Secret with them in place");
-  const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
-  const secretOf = (name, data) => ({ apiVersion: 'v1', kind: 'Secret', metadata: { name, labels: { 'app.kubernetes.io/part-of': 'eventhub' } }, type: 'Opaque', stringData: data });
-  const held = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'get', 'secret', CREDENTIALS_SECRET, '-o', 'json']);
-  if (held.status !== 0 && !/NotFound/.test(held.stderr)) refuse(`could not read ${CREDENTIALS_SECRET}: ${held.stderr.trim().split('\n').pop()}`);
-  const existing = held.status === 0 ? Object.fromEntries(Object.entries(JSON.parse(held.stdout).data ?? {}).map(([k, v]) => [k, Buffer.from(v, 'base64').toString('utf8')])) : {};
-  // A store that has started once keeps the passwords its first boot set, and those were
-  // not this run's to know. New credentials would lock every service out of its database.
-  if (held.status !== 0 && tryRun('helm', ['status', 'stores', ...helmArgs]).status === 0) {
-    refuse(`infra/stores is installed and ${CREDENTIALS_SECRET} is not: the stores' disks hold credentials this run cannot know. Take EventHub off with --down, then install again.`);
-  }
-  const install = installSecrets(compose, charts, renderChart(join(ROOT, 'infra', 'stores')), existing);
-  // Kept first, before anything is made from them: a run that fails after this point
-  // leaves credentials the next run reads back, never a store set up with ones now lost.
-  if (install.made.length) kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify(secretOf(CREDENTIALS_SECRET, install.creds)));
-  check(true, `${CREDENTIALS_SECRET}: ${Object.keys(existing).length} kept, ${install.made.length} made, for ${install.found.length} credential(s) compose had in place`);
-  const items = Object.entries(install.secrets).map(([name, data]) => secretOf(name, data));
-  kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }));
-  for (const [name, data] of Object.entries(install.secrets)) console.log(`    ok    ${name}: ${Object.keys(data).length} key(s) from ${install.from[name]}`);
-
-  step('4. the stores');
-  run('helm', ['upgrade', '--install', 'stores', join('infra', 'stores'), ...helmArgs, '--wait', '--timeout', '15m'], { stdio: 'inherit' });
-  check(true, 'infra/stores installed, every store ready');
+  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT });
 
   step('5. setup, once for this image');
   const scratch = mkdtempSync(join(tmpdir(), 'eventhub-eks-'));
@@ -412,20 +399,168 @@ function main() {
   const w = tryRun('helm', ['upgrade', '--install', 'web', join('infra', 'web'), ...helmArgs, '--set', `image.repository=${repos['eventhub/web']}`, '--set', `image.tag=${sha}`, '--wait', '--timeout', '5m']);
   check(w.status === 0, `infra/web, on ${repos['eventhub/web']}:${sha}${w.status === 0 ? ', ready' : `: ${w.stderr.trim().split('\n').pop()}`}`);
 
-  step('9. /ready from inside the cluster');
+  checkRunning({ compose, charts, image: remote, CONTEXT, sha });
+}
+
+/** The pull Secret for GitHub's registry, on the default service account every pod here runs as. */
+export const PULL_SECRET = 'ghcr-pull';
+/** The Applications the EKS root makes: one per service chart, and the gateway, the web app and setup. */
+export const gitopsApps = (charts) => [...charts, 'kong', 'web', 'setup'];
+
+/**
+ * Whether ghcr.io has `ref`, asked as the cluster will ask: with the read-only token, through
+ * the registry's own token endpoint. { ok, why }. The token goes to ghcr.io and nowhere else.
+ */
+async function ghcrHas(ref, user, token) {
+  const [, name, tag] = /^ghcr\.io\/([^:]+):(.+)$/.exec(ref) ?? [];
+  if (!name) return { ok: false, why: `not a ghcr.io reference: ${ref}` };
+  const basic = Buffer.from(`${user}:${token}`).toString('base64');
+  const t = await fetch(`https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull`, { headers: { authorization: `Basic ${basic}` } });
+  if (!t.ok) return { ok: false, why: `ghcr.io refused the token (${t.status}): it needs read:packages, for a user who can read the package` };
+  const bearer = (await t.json()).token;
+  const accept = ['application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json', 'application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json'].join(', ');
+  const r = await fetch(`https://ghcr.io/v2/${name}/manifests/${tag}`, { method: 'HEAD', headers: { authorization: `Bearer ${bearer}`, accept } });
+  if (r.status === 200) return { ok: true };
+  return { ok: false, why: r.status === 404 ? 'not published: publish.yml has not finished for this commit (or failed)' : `ghcr.io answered ${r.status}` };
+}
+
+/**
+ * --gitops: Argo CD runs what main describes, from the images CI published for it.
+ *
+ * The installer still owns what git cannot hold and what must outlive a commit: the
+ * credentials and every Secret, the stores and their disks. Then it installs Argo CD (the
+ * version kind runs, infra/argocd/settings.mjs), hands it the repository through the
+ * read-only deploy key, and applies infra/argocd/eks/root.json, whose Applications deploy the
+ * fifteen services, the gateway, the web app and setup -- each image named by the commit
+ * deployed ($ARGOCD_APP_REVISION_SHORT), from GitHub's registry, pulled with a read-only
+ * token (GHCR_TOKEN, read:packages only; GHCR_USER, by default the repository's owner).
+ *
+ * The checkout must BE main: the Secrets come from this checkout's compose, and the cluster
+ * runs main's code. A checkout that differs would give main's services another commit's
+ * environment.
+ */
+async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
+  step("2. main, and its images in GitHub's registry");
+  run('git', ['fetch', '--quiet', 'origin', 'main']);
+  const head = run('git', ['rev-parse', 'HEAD']).trim();
+  const mainSha = run('git', ['rev-parse', 'origin/main']).trim();
+  if (head !== mainSha) refuse(`this checkout is ${head.slice(0, 7)} and Argo CD deploys main, ${mainSha.slice(0, 7)}: the Secrets must come from the commit the cluster runs. Switch to main and pull, then run again.`);
+  const owner = /github\.com[:/]([^/]+)\//.exec(run('git', ['remote', 'get-url', 'origin']))?.[1];
+  if (!owner) refuse('origin is not a github.com repository');
+  const token = process.env.GHCR_TOKEN || (existsSync(GHCR_TOKEN_FILE) ? readFileSync(GHCR_TOKEN_FILE, 'utf8').trim() : '');
+  const user = process.env.GHCR_USER || owner;
+  if (!token) refuse(`no token at ${GHCR_TOKEN_FILE}, and GHCR_TOKEN is not set: a GitHub token with read:packages and nothing else, which the cluster pulls main's images with (infra/terraform/README.md says how to make one)`);
+  const { plan: publishPlan } = await import('../../scripts/publish-images.mjs');
+  const images = await publishPlan({ sha: mainSha, owner });
+  for (const img of images) {
+    const has = await ghcrHas(img.ref, user, token);
+    check(has.ok, `${img.ref}${has.ok ? ', published' : `: ${has.why}`}`);
+  }
+  if (failed) return;
+
+  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT });
+
+  step("5. the pull Secret, on the service account every pod here runs as");
+  const auth = Buffer.from(`${user}:${token}`).toString('base64');
+  kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify(secretOf(PULL_SECRET, { '.dockerconfigjson': JSON.stringify({ auths: { 'ghcr.io': { auth } } }) }, 'kubernetes.io/dockerconfigjson')));
+  kubectl(['--namespace', 'default', 'patch', 'serviceaccount', 'default', '--type', 'merge', '-p', JSON.stringify({ imagePullSecrets: [{ name: PULL_SECRET }] })]);
+  check(true, `${PULL_SECRET}, read-only, for ${user} at ghcr.io; default/default pulls with it`);
+
+  step(`6. Argo CD ${ARGOCD_VERSION}`);
+  tryRun('kubectl', ['--context', CONTEXT, 'create', 'namespace', 'argocd']);
+  run('kubectl', ['--context', CONTEXT, 'apply', '-n', 'argocd', '--server-side', '--force-conflicts', '-f', ARGOCD_MANIFEST]);
+  run('kubectl', ['--context', CONTEXT, '-n', 'argocd', 'wait', '--for=condition=available', 'deployment', '--all', '--timeout=300s']);
+  check(true, 'every Argo CD deployment available');
+  if (!existsSync(DEPLOY_KEY)) refuse(`no deploy key at ${DEPLOY_KEY}: the read-only key kind's Argo CD reads the repository with (infra/argocd/bootstrap.mjs says how it was made)`);
+  const rootApp = JSON.parse(readFileSync(join(ROOT, 'infra', 'argocd', 'eks', 'root.json'), 'utf8'));
+  kubectl(['apply', '-f', '-'], JSON.stringify({
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: { name: 'repo-eventhub', namespace: 'argocd', labels: { 'argocd.argoproj.io/secret-type': 'repository' } },
+    type: 'Opaque',
+    stringData: { type: 'git', url: rootApp.spec.source.repoURL, sshPrivateKey: readFileSync(DEPLOY_KEY, 'utf8') },
+  }));
+  check(true, `${rootApp.spec.source.repoURL}, read with the deploy key at ${DEPLOY_KEY}`);
+  kubectl(['apply', '-f', join('infra', 'argocd', 'eks', 'root.json')]);
+  check(true, `root -> ${rootApp.spec.source.path} at ${rootApp.spec.source.targetRevision}`);
+
+  const want = gitopsApps(charts);
+  step(`7. ${want.length} Applications, each Synced and Healthy at ${mainSha.slice(0, 7)}`);
+  const deadline = Date.now() + 20 * 60_000;
+  let last = '';
+  for (;;) {
+    const apps = Object.fromEntries(JSON.parse(kubectl(['-n', 'argocd', 'get', 'applications', '-o', 'json'])).items.map((a) => [a.metadata.name, a]));
+    const state = (n) => `${apps[n]?.status?.sync?.status ?? 'absent'}/${apps[n]?.status?.health?.status ?? '-'}`;
+    const notYet = want.filter((n) => state(n) !== 'Synced/Healthy');
+    const line = notYet.length ? `waiting on ${notYet.map((n) => `${n}=${state(n)}`).join(' ')}` : 'all Synced and Healthy';
+    if (line !== last) {
+      console.log(`    ...   ${line}`);
+      last = line;
+    }
+    if (notYet.length === 0) {
+      const elsewhere = want.filter((n) => apps[n].status?.sync?.revision !== mainSha);
+      check(elsewhere.length === 0, `every one at ${mainSha.slice(0, 7)}${elsewhere.length ? ` -- main has moved: ${elsewhere.map((n) => `${n}@${String(apps[n].status?.sync?.revision).slice(0, 7)}`).join(', ')}` : ''}`);
+      break;
+    }
+    if (Date.now() > deadline) {
+      const why = notYet.map((n) => `${n}: ${(apps[n]?.status?.conditions ?? []).map((c) => c.message).join('; ') || state(n)}`).join(' | ');
+      check(false, `not Synced and Healthy in 20 minutes: ${why.slice(0, 1500)}`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 10_000));
+  }
+
+  checkRunning({ compose, charts, image: images.find((i) => i.name === 'eventhub/app').ref, CONTEXT, sha: mainSha.slice(0, 7) });
+}
+
+/**
+ * Steps 3 and 4, the same either way: this cluster's credentials, read back or made, then
+ * every Secret with them in place, then the stores. Returns compose's resolved configuration.
+ */
+function credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT }) {
+  step("3. this cluster's credentials, and every Secret with them in place");
+  const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
+  const held = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'get', 'secret', CREDENTIALS_SECRET, '-o', 'json']);
+  if (held.status !== 0 && !/NotFound/.test(held.stderr)) refuse(`could not read ${CREDENTIALS_SECRET}: ${held.stderr.trim().split('\n').pop()}`);
+  const existing = held.status === 0 ? Object.fromEntries(Object.entries(JSON.parse(held.stdout).data ?? {}).map(([k, v]) => [k, Buffer.from(v, 'base64').toString('utf8')])) : {};
+  // A store that has started once keeps the passwords its first boot set, and those were
+  // not this run's to know. New credentials would lock every service out of its database.
+  if (held.status !== 0 && tryRun('helm', ['status', 'stores', ...helmArgs]).status === 0) {
+    refuse(`infra/stores is installed and ${CREDENTIALS_SECRET} is not: the stores' disks hold credentials this run cannot know. Take EventHub off with --down, then install again.`);
+  }
+  const install = installSecrets(compose, charts, renderChart(join(ROOT, 'infra', 'stores')), existing);
+  // Kept first, before anything is made from them: a run that fails after this point
+  // leaves credentials the next run reads back, never a store set up with ones now lost.
+  if (install.made.length) kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify(secretOf(CREDENTIALS_SECRET, install.creds)));
+  check(true, `${CREDENTIALS_SECRET}: ${Object.keys(existing).length} kept, ${install.made.length} made, for ${install.found.length} credential(s) compose had in place`);
+  const items = Object.entries(install.secrets).map(([name, data]) => secretOf(name, data));
+  kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }));
+  for (const [name, data] of Object.entries(install.secrets)) console.log(`    ok    ${name}: ${Object.keys(data).length} key(s) from ${install.from[name]}`);
+
+  step('4. the stores');
+  run('helm', ['upgrade', '--install', 'stores', join('infra', 'stores'), ...helmArgs, '--wait', '--timeout', '15m'], { stdio: 'inherit' });
+  check(true, 'infra/stores installed, every store ready');
+  return compose;
+}
+
+const secretOf = (name, data, type = 'Opaque') => ({ apiVersion: 'v1', kind: 'Secret', metadata: { name, labels: { 'app.kubernetes.io/part-of': 'eventhub' } }, type, stringData: data });
+
+/** The last steps, the same either way: every /ready, and requests through the gateway and to the web app. */
+function checkRunning({ compose, charts, image, CONTEXT, sha }) {
+  step('/ready from inside the cluster');
   for (const chart of charts) {
     const port = compose.services[chart]?.environment?.PORT;
     if (!port) continue;
-    const r = runInCluster(CONTEXT, remote, `ready-${chart}-${Date.now().toString(36)}`,
+    const r = runInCluster(CONTEXT, image, `ready-${chart}-${Date.now().toString(36)}`,
       `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`);
     // The answer itself, not only the exit code (infra/local/up.mjs says why).
     const answer = r.stdout.trim();
     check(r.status === 0 && /^200 /.test(answer), `${chart}: ${answer || r.stderr.trim() || `(no answer, exit ${r.status})`}`);
   }
 
-  step('10. through the gateway, and to the web app, from inside the cluster');
+  step('through the gateway, and to the web app, from inside the cluster');
   for (const [name, script, judge] of [['gateway', gatewayProbe(), judgeGateway], ['web', webProbe(), judgeWeb]]) {
-    const p = runInCluster(CONTEXT, remote, `${name}-${Date.now().toString(36)}`, script);
+    const p = runInCluster(CONTEXT, image, `${name}-${Date.now().toString(36)}`, script);
     let answers = null;
     try {
       answers = JSON.parse(p.stdout.trim().split('\n').pop());
@@ -478,7 +613,24 @@ function pushImage(local, remote, registry, region) {
  * volumes, while the EBS CSI driver still runs to delete them. Then AWS is asked: no volume
  * the driver made may be left.
  */
-function down({ kubectl, helmArgs, charts, REGION }) {
+function down({ kubectl, helmArgs, charts, CONTEXT, REGION }) {
+  // Argo CD first, when it runs here: with self-heal on, it puts back whatever is taken off.
+  // Deleting the root deletes every Application under it, and each its resources (their
+  // finalizers), so the services go before the stores they talk to.
+  if (tryRun('kubectl', ['--context', CONTEXT, '-n', 'argocd', 'get', 'application', 'root']).status === 0) {
+    step("2a. Argo CD's Applications, and then Argo CD");
+    kubectl(['-n', 'argocd', 'delete', 'application', 'root', '--wait=false']);
+    let left = null;
+    for (let i = 0; i < 90; i += 1) {
+      left = JSON.parse(kubectl(['-n', 'argocd', 'get', 'applications', '-o', 'json'])).items.map((a) => a.metadata.name);
+      if (left.length === 0) break;
+      spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 5000)']);
+    }
+    check(left?.length === 0, `every Application deleted, with what it deployed${left?.length ? ` -- left: ${left.join(', ')}` : ''}`);
+    const ns = tryRun('kubectl', ['--context', CONTEXT, 'delete', 'namespace', 'argocd', '--wait=true', '--timeout=5m']);
+    check(ns.status === 0, `Argo CD removed${ns.status === 0 ? '' : `: ${ns.stderr.trim().split('\n').pop()}`}`);
+  }
+
   step('2. the releases: the web app, the gateway, the services and setup first, the stores last');
   const releases = new Set(JSON.parse(run('helm', ['list', ...helmArgs, '--output', 'json'])).map((r) => r.name));
   for (const name of ['web', 'kong', ...charts, 'setup', 'stores'].filter((n) => releases.has(n))) {
@@ -504,10 +656,8 @@ function down({ kubectl, helmArgs, charts, REGION }) {
 // Run only as a script: scripts/verify-eks-install.mjs imports appSecrets, setupCommand and
 // the rest, and must not install anything by doing so.
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    main();
-  } catch (e) {
+  main().catch((e) => {
     console.error(`FAIL: ${e instanceof Refusal ? e.message : (e.stderr || e.message || String(e)).toString().trim().slice(-1500)}`);
     process.exit(1);
-  }
+  });
 }

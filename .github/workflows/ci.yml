@@ -156,6 +156,14 @@ jobs:
       - name: Assert ArgoCD runs exactly the service charts, from main, with no credential in git
         run: node scripts/verify-argocd.mjs
 
+      # Argo CD on EKS (infra/argocd/eks): its Applications rendered as Argo CD renders them,
+      # at a commit -- every image exactly what publish.yml pushes for that commit, no tag
+      # written anywhere but $ARGOCD_APP_REVISION_SHORT, the pull Secret's service account,
+      # one replica each, setup running compose's own command, and the Applications exactly
+      # the ones the installer waits for.
+      - name: Assert Argo CD on EKS deploys main from the images CI published for each commit
+        run: node scripts/verify-argocd-eks.mjs
+
       # The AWS demo environment's Terraform (infra/terraform). Nothing in CI plans or
       # applies it: there are no AWS credentials here, and none are wanted. So this is all
       # CI can know about it, and it is the part a deleted line would otherwise get past:
