@@ -22,7 +22,8 @@
  *     claim. A data directory a fresh ext4 disk would break (lost+found) is a subdirectory
  *     of the mount; an image that runs as a user other than root gets that uid as fsGroup;
  *   - each directory compose bind-mounts becomes a Secret mounted at the same path, and
- *     infra/stores/secrets.mjs can make every Secret the chart names, from compose;
+ *     infra/stores/secrets.mjs can plan every Secret the chart names, from compose (the
+ *     installer makes them, with the cluster's own credentials);
  *   - the StorageClass is gp3 on the EBS CSI driver, encrypted, WaitForFirstConsumer,
  *     reclaim Delete; every store pod has the stores' PriorityClass, no service links, no
  *     API token, readiness and liveness probes, requests and a memory limit, and a JVM
@@ -334,9 +335,9 @@ function main() {
   try {
     const wanted = plan(docs, compose);
     const keys = Object.entries(wanted).map(([s, k]) => `${s}: ${Object.keys(k).join(', ')}`);
-    check(keys.length > 0, `infra/stores/secrets.mjs makes every Secret the chart names, from compose: ${keys.join('; ')}`);
+    check(keys.length > 0, `infra/stores/secrets.mjs plans every Secret the chart names, from compose: ${keys.join('; ')}`);
   } catch (e) {
-    check(false, `infra/stores/secrets.mjs cannot make what the chart names: ${e.message}`);
+    check(false, `infra/stores/secrets.mjs cannot plan what the chart names: ${e.message}`);
   }
 
   console.log('');

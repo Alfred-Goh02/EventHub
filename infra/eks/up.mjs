@@ -10,26 +10,27 @@
  * renews (infra/terraform/README.md), and docker, helm, kubectl and git on PATH. A clean
  * working tree: the image is tagged with the commit it is built from.
  *
- * THE SAME SOURCES KIND USES. Everything that goes into the cluster comes from where
- * infra/local/up.mjs takes it for kind, never from a copy:
+ * THE SAME SOURCES KIND USES, AND ITS OWN CREDENTIALS. Everything that goes into the
+ * cluster comes from where infra/local/up.mjs takes it for kind, never from a copy:
  *   - each service's environment is compose's, from `docker compose config`, into the
  *     Secret `<chart>-env` its chart reads (the GitOps shape, as on kind), and Kong's into
  *     kong-env, for infra/kong, the chart that is the directory compose mounts into Kong;
- *   - Auth's and Notification's keypairs are the files in services/auth/keys and
- *     services/notification/keys, into jwt-keys and notification-keys;
- *   - the stores' Secrets come from infra/stores/secrets.mjs, from compose and db/;
+ *   - the stores' Secrets are the ones infra/stores/secrets.mjs plans, from compose and db/;
  *   - setup runs compose's own setup command, with compose's environment for it.
- * The keys and passwords are therefore the local development ones. That is a demo's
- * choice, and the cluster has no way in from outside yet; real ones come with the step that
- * puts a public endpoint in front of it.
+ * Except every credential in them. Compose's are development values written into this
+ * repository, so each one -- every password, every secret, both keypairs -- is replaced by
+ * this cluster's own, made in the cluster on the first install and kept there
+ * (infra/eks/credentials.mjs). Nothing is read from services/*\/keys, and nothing of a
+ * credential is printed.
  *
  * IN ORDER, each step waiting for the last:
  *   1. the cluster answers, its nodes are Ready, and the EBS CSI driver is ACTIVE;
  *   2. the images (IMAGES): eventhub/app from the root, and eventhub/web from apps/web,
  *      each built from HEAD as <name>:<sha> if it is not here, and pushed to its ECR
  *      repository unless that tag is already there (tags are IMMUTABLE);
- *   3. the stores' Secrets, then infra/stores, waited for until every store is ready;
- *   4. the services' Secrets: keys, one environment per chart, and setup's;
+ *   3. the credentials, read from the cluster or made there, then every Secret: the
+ *      stores', the services', setup's and the gateway's, each with them in place;
+ *   4. infra/stores, waited for until every store is ready;
  *   5. setup, as a Job named for the image, waited for until it has finished;
  *   6. every chart under charts/, on the ECR image, one replica each (pods, not memory,
  *      are this cluster's tight limit), each waited for;
@@ -47,14 +48,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+import { plan as storePlan, renderChart } from '../stores/secrets.mjs';
+import { CREDENTIALS_SECRET, credentialsIn, ensure, keySecrets, withCredentials } from './credentials.mjs';
 
-/**
- * Where each key Secret's files come from: the same directories infra/local/up.mjs reads
- * for kind, so both clusters hold the same keypairs. scripts/verify-eks-install.mjs checks
- * that up.mjs still reads these two.
- */
-export const KEY_DIRS = { 'jwt-keys': 'services/auth/keys', 'notification-keys': 'services/notification/keys' };
+export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /**
  * The images the installer builds and pushes, each to an ECR repository of the same name
@@ -93,32 +90,59 @@ export function setupCommand(compose) {
 }
 
 /**
- * Every Secret the services and setup read, and from where: { name: { kind, data, from } }.
- * `data` holds strings; nothing here is printed.
+ * The environment Secrets, from compose: { name: { data, from } }, credentials still
+ * compose's. installSecrets() is what the installer makes.
  */
-export function appSecrets(compose, charts, root = ROOT) {
+export function envSecrets(compose, charts) {
   const out = {};
   for (const chart of charts) out[`${chart}-env`] = { data: envOf(compose, chart), from: `docker-compose.yml ${chart}.environment` };
   out['setup-env'] = { data: envOf(compose, 'setup'), from: 'docker-compose.yml setup.environment' };
   out['kong-env'] = { data: envOf(compose, 'kong'), from: 'docker-compose.yml kong.environment' };
-  for (const [name, dir] of Object.entries(KEY_DIRS)) {
-    const abs = join(root, dir);
-    const pems = existsSync(abs) ? readdirSync(abs).filter((f) => f.endsWith('.pem')).sort() : [];
-    out[name] = { data: Object.fromEntries(pems.map((f) => [f, readFileSync(join(abs, f), 'utf8')])), from: `${dir}/*.pem` };
-  }
-  const auth = out['jwt-keys'].data;
-  const notif = out['notification-keys'].data;
-  for (const f of ['private.pem', 'public.pem', 'notification-public.pem']) {
-    if (!auth[f]) refuse(`${KEY_DIRS['jwt-keys']} has no ${f}; run setup once locally (docker compose up), which makes the keypairs`);
-  }
-  for (const f of ['private.pem', 'public.pem']) {
-    // Without both halves, Notification's generate-keys in setup would make a NEW keypair.
-    if (!notif[f]) refuse(`${KEY_DIRS['notification-keys']} has no ${f}; run setup once locally (docker compose up)`);
-  }
-  if (notif['public.pem'] !== auth['notification-public.pem']) {
-    refuse("services/notification/keys/public.pem is not the notification-public.pem Auth holds: Auth would seal requests Notification cannot open");
-  }
   return out;
+}
+
+/**
+ * Every Secret the installer makes, with this cluster's credentials in place of compose's:
+ * { secrets: { name: data }, from: { name: where }, creds, made, found }.
+ *
+ *   storeDocs  infra/stores rendered (renderChart), whose Secrets infra/stores/secrets.mjs plans
+ *   existing   what the cluster already holds in CREDENTIALS_SECRET; never replaced
+ *
+ * Refuses rather than let one compose credential through: after the replacement, nothing
+ * found in a credential's place may still be a value compose had there.
+ */
+export function installSecrets(compose, charts, storeDocs, existing = {}) {
+  const raw = {};
+  const from = {};
+  // The environment each value came from, where a password's *_USER is: the Secret itself
+  // for a service's environment; compose's environment for that store, for a store Secret
+  // that holds only the password (plan() names it: "docker-compose.yml <store>.environment.<KEY>").
+  const env = {};
+  for (const [name, s] of Object.entries(envSecrets(compose, charts))) {
+    raw[name] = s.data;
+    from[name] = s.from;
+    env[name] = () => s.data;
+  }
+  for (const [name, keys] of Object.entries(storePlan(storeDocs, compose))) {
+    raw[name] = Object.fromEntries(Object.entries(keys).map(([k, v]) => [k, v.read()]));
+    from[name] = Object.values(keys).map((v) => v.from).join(', ');
+    env[name] = (key) => {
+      const store = /^docker-compose\.yml (\S+?)\.environment\./.exec(keys[key]?.from ?? '')?.[1];
+      return store ? envOf(compose, store) : raw[name];
+    };
+  }
+  const envAt = (secret, key) => env[secret](key);
+  const found = credentialsIn(raw, envAt);
+  const { creds, made } = ensure(found, existing);
+  const secrets = withCredentials(raw, creds, envAt);
+  for (const [name, data] of Object.entries(keySecrets(creds))) {
+    secrets[name] = data;
+    from[name] = "this cluster's own keypairs";
+  }
+  const compose_ = new Set(found.map((f) => f.dev));
+  const left = credentialsIn(secrets, (secret, key) => (env[secret] ? env[secret](key) : secrets[secret])).filter((f) => compose_.has(f.dev));
+  if (left.length) refuse(`compose's credentials would reach the cluster: ${left.map((f) => `${f.secret}/${f.key}`).join(', ')}`);
+  return { secrets, from, creds, made, found };
 }
 
 /**
@@ -322,23 +346,29 @@ function main() {
   const repo = repos['eventhub/app'];
   const remote = `${repo}:${sha}`;
 
-  step('3. the stores');
-  run('node', [join('infra', 'stores', 'secrets.mjs'), '--context', CONTEXT, '--namespace', 'default'], { stdio: 'inherit' });
+  step("3. this cluster's credentials, and every Secret with them in place");
+  const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
+  const secretOf = (name, data) => ({ apiVersion: 'v1', kind: 'Secret', metadata: { name, labels: { 'app.kubernetes.io/part-of': 'eventhub' } }, type: 'Opaque', stringData: data });
+  const held = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'get', 'secret', CREDENTIALS_SECRET, '-o', 'json']);
+  if (held.status !== 0 && !/NotFound/.test(held.stderr)) refuse(`could not read ${CREDENTIALS_SECRET}: ${held.stderr.trim().split('\n').pop()}`);
+  const existing = held.status === 0 ? Object.fromEntries(Object.entries(JSON.parse(held.stdout).data ?? {}).map(([k, v]) => [k, Buffer.from(v, 'base64').toString('utf8')])) : {};
+  // A store that has started once keeps the passwords its first boot set, and those were
+  // not this run's to know. New credentials would lock every service out of its database.
+  if (held.status !== 0 && tryRun('helm', ['status', 'stores', ...helmArgs]).status === 0) {
+    refuse(`infra/stores is installed and ${CREDENTIALS_SECRET} is not: the stores' disks hold credentials this run cannot know. Take EventHub off with --down, then install again.`);
+  }
+  const install = installSecrets(compose, charts, renderChart(join(ROOT, 'infra', 'stores')), existing);
+  // Kept first, before anything is made from them: a run that fails after this point
+  // leaves credentials the next run reads back, never a store set up with ones now lost.
+  if (install.made.length) kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify(secretOf(CREDENTIALS_SECRET, install.creds)));
+  check(true, `${CREDENTIALS_SECRET}: ${Object.keys(existing).length} kept, ${install.made.length} made, for ${install.found.length} credential(s) compose had in place`);
+  const items = Object.entries(install.secrets).map(([name, data]) => secretOf(name, data));
+  kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }));
+  for (const [name, data] of Object.entries(install.secrets)) console.log(`    ok    ${name}: ${Object.keys(data).length} key(s) from ${install.from[name]}`);
+
+  step('4. the stores');
   run('helm', ['upgrade', '--install', 'stores', join('infra', 'stores'), ...helmArgs, '--wait', '--timeout', '15m'], { stdio: 'inherit' });
   check(true, 'infra/stores installed, every store ready');
-
-  step("4. the services' Secrets");
-  const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
-  const secrets = appSecrets(compose, charts);
-  const items = Object.entries(secrets).map(([name, s]) => ({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name, labels: { 'app.kubernetes.io/part-of': 'eventhub' } },
-    type: 'Opaque',
-    stringData: s.data,
-  }));
-  kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }));
-  for (const [name, s] of Object.entries(secrets)) console.log(`    ok    ${name}: ${Object.keys(s.data).length} key(s) from ${s.from}`);
 
   step('5. setup, once for this image');
   const scratch = mkdtempSync(join(tmpdir(), 'eventhub-eks-'));
