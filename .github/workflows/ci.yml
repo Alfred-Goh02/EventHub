@@ -139,6 +139,14 @@ jobs:
       - name: Assert every service chart renders a workload Kubernetes can run
         run: node scripts/verify-helm-charts.mjs
 
+      # The other workflow, publish.yml, which pushes the cluster's images for every commit
+      # on main to GitHub's container registry: only on main, never on a pull request; a
+      # token that writes packages and nothing else, and no stored secret; one run per
+      # commit, never cancelled; exactly the installer's IMAGES, tagged with the commit's
+      # first seven digits, the tag Argo CD asks for. Reads files only.
+      - name: Assert main publishes the cluster's images under the tag Argo CD asks for, and nothing else can
+        run: node scripts/verify-image-publish.mjs
+
       # ArgoCD (infra/argocd) runs the cluster from git, and GitOps fails quietly: an
       # ApplicationSet whose generator misses a chart never creates that Application,
       # and one reading the wrong branch stays Synced and Healthy on old code. So the
@@ -147,6 +155,14 @@ jobs:
       # self-heal, value files that exist, and no key material in git.
       - name: Assert ArgoCD runs exactly the service charts, from main, with no credential in git
         run: node scripts/verify-argocd.mjs
+
+      # Argo CD on EKS (infra/argocd/eks): its Applications rendered as Argo CD renders them,
+      # at a commit -- every image exactly what publish.yml pushes for that commit, no tag
+      # written anywhere but $ARGOCD_APP_REVISION_SHORT, the pull Secret's service account,
+      # one replica each, setup running compose's own command, and the Applications exactly
+      # the ones the installer waits for.
+      - name: Assert Argo CD on EKS deploys main from the images CI published for each commit
+        run: node scripts/verify-argocd-eks.mjs
 
       # The AWS demo environment's Terraform (infra/terraform). Nothing in CI plans or
       # applies it: there are no AWS credentials here, and none are wanted. So this is all
@@ -311,6 +327,14 @@ jobs:
           set -euo pipefail
           docker pull -q "$(docker compose config --format json | jq -er .services.kong.image)"
           node scripts/verify-gateway-chart.mjs
+
+      # The web app's chart for EKS (infra/web) against the image apps/web/Dockerfile builds:
+      # its port, its user, a read-only root, probes on a rendered page and a file on disk;
+      # the build is for a Node server, the runtime image holds nitro's output alone; and
+      # every image the installer builds has a Dockerfile and an ECR repository. The web job
+      # builds that image and serves a page from it.
+      - name: Assert the web chart runs the image apps/web builds, and the installer can push it
+        run: node scripts/verify-web-chart.mjs
 
       # What infra/eks/up.mjs installs on EKS, judged without a cluster: every Secret the
       # fifteen services, the stores and setup read is one it makes, and every one it makes
@@ -2658,3 +2682,24 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+      # The image infra/eks/up.mjs pushes for the cluster (apps/web/Dockerfile), built
+      # here and asked for a page the way a browser asks: nitro's Node server, as the node
+      # user (uid 1000, which infra/web runs it as), on a read-only filesystem as the pod
+      # has it, rendering the page and serving the script the page names.
+      - name: Build the web image and serve a page from it
+        run: |
+          set -euo pipefail
+          docker build -t eventhub/web:ci .
+          uid=$(docker run --rm --entrypoint id eventhub/web:ci -u)
+          test "$uid" = 1000 || { echo "the image runs as uid $uid, not 1000 (infra/web's runAsUser)"; exit 1; }
+          docker run -d --rm --read-only --cap-drop ALL --name web-ci -p 127.0.0.1:3000:3000 eventhub/web:ci
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:3000/favicon.ico -o /dev/null && break; sleep 1; done
+          # tr: the streamed page carries NUL bytes, which bash would drop with a warning.
+          page=$(curl -sf http://127.0.0.1:3000/ | tr -d '\000')
+          grep -q '<title>EventHub</title>' <<<"$page" || { echo "the page has no EventHub title"; exit 1; }
+          script=$(grep -o 'src="/assets/[^"]*\.js"' <<<"$page" | head -n 1 | cut -d'"' -f2)
+          test -n "$script" || { echo "the page names no module script"; exit 1; }
+          curl -sf "http://127.0.0.1:3000$script" -o /dev/null
+          echo "  served the page and $script, as uid $uid, read-only"
+          docker stop web-ci

@@ -1,0 +1,47 @@
+# THE WEB APP, IN THE CLUSTER.
+#
+# apps/web's own image (apps/web/Dockerfile): nitro's Node server, which renders the page
+# shell and serves the browser bundle. The browser then calls the API itself, at the same
+# host on port 8000 (apps/web/src/api/env.ts) -- the gateway, never this pod. So the pod
+# needs no database, no key and no environment of its own.
+#
+# NO WAY IN FROM OUTSIDE YET. The Service is ClusterIP. From this machine, with compose's
+# Kong stopped (it holds 8000, where the browser looks for the API):
+#   kubectl --context eventhub-demo port-forward svc/web 5173:3000
+#   kubectl --context eventhub-demo port-forward svc/kong 8000:8000
+# then http://acme.eventhub.localhost:5173, the origin the gateway's CORS rule allows.
+
+# yaml for kubectl and Helm; json for the verifiers, which read the chart without a YAML
+# parser. Both are printed from the same object (templates/_helpers.tpl).
+render: yaml
+
+image:
+  # infra/eks/up.mjs sets both: the eventhub/web repository in ECR, and the git SHA the
+  # image was built from. A tag names one build, never latest.
+  repository: ""
+  tag: ""
+
+replicas: 1
+
+# nitro's node-server listens on PORT, which the image sets.
+port: 3000
+
+# The image's own user, node: uid 1000, asked of the image (`docker run --entrypoint id`).
+runAsUser: 1000
+
+# Readiness renders the page shell, which is the work a browser asks for. Liveness asks for a
+# file nitro serves from disk without rendering anything, so a slow render never restarts
+# the pod.
+probes:
+  readiness: /
+  liveness: /favicon.ico
+
+# The pod keeps serving for preStopSeconds while its removal from the Service reaches every
+# node (the services' charts measured why), and is stopped inside the grace period.
+preStopSeconds: 5
+terminationGracePeriodSeconds: 15
+
+# Measured: 26 MiB serving the app locally.
+resources:
+  requests: { cpu: 20m, memory: 64Mi }
+  limits: { memory: 256Mi }

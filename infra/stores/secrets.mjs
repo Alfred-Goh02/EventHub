@@ -1,8 +1,13 @@
 /**
- * Makes every Secret infra/stores names, in a cluster, from where compose keeps them.
+ * Plans every Secret infra/stores names, from where compose keeps them. infra/eks/up.mjs
+ * makes them, with the cluster's own credentials in place of compose's
+ * (infra/eks/credentials.mjs); this file says which Secrets, which keys, and where each
+ * value starts.
  *
- *   node infra/stores/secrets.mjs --print                                  what it would make, keys only
- *   node infra/stores/secrets.mjs --context eventhub-demo [--namespace default]   make them
+ *   node infra/stores/secrets.mjs --print      the plan, keys only
+ *
+ * It no longer makes them itself: compose's values are development credentials written
+ * into this repository, and `--context` refuses rather than put them in a cluster.
  *
  * NOTHING IS LISTED HERE. Which Secrets, and which keys, come from the chart itself,
  * rendered: every secretKeyRef a store's container reads, and every Secret volume a store
@@ -93,28 +98,19 @@ function main() {
   };
   const PRINT = argv.includes('--print');
   const CONTEXT = option('--context');
-  const NAMESPACE = option('--namespace') ?? 'default';
-  if (!PRINT && !CONTEXT) fail('give --print, or --context <kube context> to make the Secrets there');
+  // Compose's values are development credentials written into this repository. The
+  // installer makes these Secrets with the cluster's own (infra/eks/credentials.mjs); made
+  // from here, they would put compose's passwords on the stores' disks, or, after the
+  // first boot, lock every service out of its database.
+  if (CONTEXT) fail("this makes compose's development credentials, which no cluster should hold: node infra/eks/up.mjs makes these Secrets with the cluster's own. --print shows the plan");
+  if (!PRINT) fail('give --print to see which Secrets the chart names, and where each value comes from');
 
   const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
   const wanted = plan(renderChart(), compose);
   const names = Object.keys(wanted).sort();
   if (names.length === 0) fail('the chart names no Secret; that is a chart that renders nothing, not one with no secrets');
 
-  if (PRINT) {
-    console.log(JSON.stringify(Object.fromEntries(names.map((n) => [n, Object.fromEntries(Object.entries(wanted[n]).map(([k, v]) => [k, v.from]))])), null, 2));
-    return;
-  }
-
-  const items = names.map((n) => ({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: n, labels: { 'app.kubernetes.io/part-of': 'eventhub', 'app.kubernetes.io/component': 'store' } },
-    type: 'Opaque',
-    data: Object.fromEntries(Object.entries(wanted[n]).map(([k, v]) => [k, Buffer.from(v.read(), 'utf8').toString('base64')])),
-  }));
-  run('kubectl', ['--context', CONTEXT, '--namespace', NAMESPACE, 'apply', '-f', '-'], { input: JSON.stringify({ apiVersion: 'v1', kind: 'List', items }) });
-  for (const n of names) console.log(`    ok    ${NAMESPACE}/${n}: ${Object.keys(wanted[n]).join(', ')}`);
+  console.log(JSON.stringify(Object.fromEntries(names.map((n) => [n, Object.fromEntries(Object.entries(wanted[n]).map(([k, v]) => [k, v.from]))])), null, 2));
 }
 
 // Run only as a script: scripts/verify-store-chart.mjs imports plan() and renderChart().

@@ -20,9 +20,10 @@
 # EKS ONLY. On kind the stores stay in compose and are bridged in; installing this chart
 # into kind's default namespace would put a second postgres Service beside the bridge's.
 #
-# PASSWORDS ARE NOT HERE. A password reaches a store from a Secret, and
-# infra/stores/secrets.mjs makes every Secret this chart names -- from compose's own
-# environment and the db/ init files -- so nothing is copied and nothing is in git twice.
+# PASSWORDS ARE NOT HERE. A password reaches a store from a Secret. infra/stores/secrets.mjs
+# plans every Secret this chart names, from compose's own environment and the db/ init
+# files, so nothing is copied; infra/eks/up.mjs makes them, with the cluster's own
+# credentials in place of compose's development ones (infra/eks/credentials.mjs).
 
 # yaml for kubectl and Helm; json for the verifier, which reads the chart without a YAML
 # parser. Both are printed from the same object (templates/_helpers.tpl).

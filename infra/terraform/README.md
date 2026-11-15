@@ -103,28 +103,71 @@ kubectl version --client
    kubectl get nodes
    ```
 
-   Then EventHub itself, with one command, from a clean working tree (the image is tagged
-   with the commit it is built from). It builds and pushes the image to
-   `ecr_repository_url` by git SHA; installs the stores (`infra/stores`) and waits for
-   them; makes every Secret the services read, from compose and the local keypairs; runs
-   setup, compose's own setup command as a Job; installs the fifteen charts one replica
-   each, then Kong in front of them; asks each service's `/ready` from inside the cluster;
-   and sends requests through Kong that only a working gateway answers as they come back
-   (Auth reached, the rate limit counted in Redis, a missing token refused at the edge).
-   Every step is idempotent, so a failed run is re-run. No value is printed.
+   Then EventHub itself, with one command, from a clean working tree (the images are tagged
+   with the commit they are built from). It builds and pushes the backend's image to
+   `ecr_repository_url` and the web app's to `ecr_web_repository_url`, by git SHA; makes the
+   cluster's own credentials -- every password, secret and both keypairs, kept in the
+   Secret `eventhub-credentials` and reused by every later run -- and every Secret the
+   stores and services read, from compose with those in place of compose's development
+   ones; installs the stores (`infra/stores`) and waits for them; runs setup, compose's own
+   setup command as a Job;
+   installs the fifteen charts one replica each, then Kong in front of them, then the web
+   app; asks each service's `/ready` from inside the cluster; sends requests through Kong
+   that only a working gateway answers as they come back (Auth reached, the rate limit
+   counted in Redis, a missing token refused at the edge); and asks the web app for its
+   page and the script the page names. Every step is idempotent, so a failed run is re-run.
+   No value is printed.
 
    ```powershell
    node infra/eks/up.mjs --context eventhub-demo
    kubectl --context eventhub-demo get pods,pvc
    ```
 
-   The gateway is ClusterIP until the domain is decided. From this machine, through a
-   port-forward (18000, because compose's own Kong holds 8000 here):
+   **Or with Argo CD: `--gitops`**, which deploys main as CI published it, and keeps the
+   cluster on main from then on. The installer still makes the credentials, every Secret
+   and the stores; then it installs Argo CD (the version kind runs), hands it the
+   repository through the read-only deploy key kind uses (`%USERPROFILE%\.eventhub\argocd-deploy-key`),
+   and applies `infra/argocd/eks/root.json`. Every service, the gateway, the web app and
+   setup are then Argo CD's, each on the images `publish.yml` pushed to GitHub's container
+   registry for the commit it deploys. The checkout must be main itself, and CI must have
+   published main's images.
+
+   The registry is private, so the cluster pulls with a token of yours that can only read
+   packages. Make it once, at
+   <https://github.com/settings/tokens/new?scopes=read:packages&description=eventhub-cluster-pull>
+   (a classic token, with **only** `read:packages` ticked, and an expiry), and put it beside
+   the deploy key, where the installer reads it and never prints it. Paste it where the
+   prompt asks, so it is in no history:
 
    ```powershell
-   kubectl --context eventhub-demo port-forward svc/kong 18000:8000
-   curl.exe -i http://acme.eventhub.localhost:18000/auth/me
+   Read-Host -Prompt 'read:packages token' | Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.eventhub\ghcr-token"
    ```
+
+   Then, from main:
+
+   ```powershell
+   git switch main; git pull
+   node infra/eks/up.mjs --context eventhub-demo --gitops
+   ```
+
+   `$env:GHCR_TOKEN`, when set, is used instead of the file.
+
+   `--down` removes Argo CD's Applications first (with self-heal on, Argo CD would put back
+   anything taken off before it), then Argo CD, then the stores and their disks.
+
+   The gateway and the web app are ClusterIP until the domain is decided. To open the app
+   from this machine, stop compose's Kong first: the page calls the API on port 8000 of its
+   own host, where compose's Kong otherwise answers. Each port-forward runs in its own
+   terminal:
+
+   ```powershell
+   docker stop eventhub-kong
+   kubectl --context eventhub-demo port-forward svc/kong 8000:8000
+   kubectl --context eventhub-demo port-forward svc/web 5173:3000
+   ```
+
+   Then open `http://acme.eventhub.localhost:5173`. `docker start eventhub-kong` gives the
+   local stack its gateway back.
 
    The Load Balancer Controller's chart, when the cluster gets a public way in, takes
    `clusterName` (`cluster_name`), `region`, `vpcId` (`vpc_id`), and a service account
