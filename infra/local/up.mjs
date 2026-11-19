@@ -36,6 +36,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addressOnKind, allCharts, bridgesFor, composeConfig, inspectBridges, NETWORK, SELECTOR, serviceManifests } from './bridge.mjs';
+// A node script run once in a pod, and what it printed: the EKS installer's, so both
+// clusters ask /ready the same way. Importing it runs nothing; that file installs only
+// when it is the script being run.
+import { runInCluster } from '../eks/up.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CLUSTER = 'eventhub';
@@ -195,13 +199,14 @@ let ready = true;
 for (const chart of charts) {
   const port = services[chart].environment?.PORT;
   if (!port) continue;
-  const name = `ready-${chart}-${Date.now().toString(36)}`;
-  const r = spawnSync(
-    'kubectl',
-    ['--context', CONTEXT, 'run', name, '--rm', '-i', '--restart=Never', `--image=${IMAGE}`, '--image-pull-policy=Never', '--quiet', '--', 'node', '-e',
-      `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`],
-    { encoding: 'utf8' },
-  );
+  // DETACHED, AND THE LOG READ ONCE THE POD HAS FINISHED. This was `kubectl run -i --rm`,
+  // which attaches after the container has started: measured on this cluster, a pod that
+  // printed "hi" and exited came back with no output and exit 0 four times in five, so a
+  // service quick enough to answer before kubectl attached would have been reported FAIL
+  // with nothing to say why.
+  const r = runInCluster(CONTEXT, IMAGE, `ready-${chart}-${Date.now().toString(36)}`,
+    `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`,
+    ['--image-pull-policy=Never']);
   // The answer itself, not only the exit code: one run printed "ok event:" with nothing
   // after it, which a zero exit alone would have called ready.
   const answer = r.stdout.trim();

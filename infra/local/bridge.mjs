@@ -40,6 +40,8 @@ import { join } from 'node:path';
 // Which compose hosts an environment names: shared with scripts/verify-store-chart.mjs,
 // which requires infra/stores to serve on EKS every host bridged here on kind.
 import { hostsOf } from '../lib/compose-hosts.mjs';
+// The pod the probe runs in: the EKS installer's runInCluster, as up.mjs's /ready checks use.
+import { runInCluster } from '../eks/up.mjs';
 
 export const NETWORK = 'kind';
 export const LABELS = { 'app.kubernetes.io/part-of': 'eventhub', 'eventhub/bridge': 'compose' };
@@ -101,13 +103,13 @@ export function serviceManifests(bridges) {
 
 /**
  * Runs in a pod: what each host resolves to, the address a plain lookup puts first, and
- * whether each port answers. Its input arrives base64 encoded, so no quoting on the way
- * through kubectl can change it; its answer is one line that a missing or cut-off answer
- * cannot be mistaken for.
+ * whether each port answers. Its input is written in ahead of it as INPUT, base64 encoded:
+ * letters, digits, + / and =, so nothing in it can end the string or change the script.
+ * Its answer is one line that a missing or cut-off answer cannot be mistaken for.
  */
 const PROBE = `
 const dns = require('dns').promises, net = require('net');
-const input = JSON.parse(Buffer.from(process.argv[1], 'base64').toString());
+const input = JSON.parse(Buffer.from(INPUT, 'base64').toString());
 const look = (name) => dns.lookup(name, { all: true }).then((a) => a.map((x) => x.address), (e) => ({ error: e.code || e.message }));
 const tcp = (host, port) => new Promise((done) => {
   const s = net.connect({ host, port, timeout: 5000 });
@@ -129,17 +131,14 @@ const tcp = (host, port) => new Promise((done) => {
 
 function probeFromCluster(context, image, bridges, absent) {
   const input = Buffer.from(JSON.stringify({ hosts: [...bridges].map(([host, b]) => ({ host, ports: b.ports })), absent })).toString('base64');
-  const name = `bridge-probe-${Date.now().toString(36)}`;
-  const r = spawnSync(
-    'kubectl',
-    ['--context', context, 'run', name, '--rm', '-i', '--restart=Never', `--image=${image}`, '--image-pull-policy=Never', '--quiet', '--', 'node', '-e', PROBE, input],
-    { encoding: 'utf8', timeout: 180_000 },
-  );
-  const line = (r.stdout ?? '').split(/\r?\n/).find((l) => l.startsWith('BRIDGE-PROBE '));
-  // `--rm` removes the pod when kubectl lives to see it end; the timeout above kills kubectl
-  // first, so the pod is removed here too.
-  if (!line) spawnSync('kubectl', ['--context', context, 'delete', 'pod', name, '--ignore-not-found', '--wait=false'], { encoding: 'utf8' });
-  if (!line) return { error: `the probe pod gave no answer (exit ${r.status}): ${((r.stderr ?? '') + (r.stdout ?? '')).trim() || r.error?.message || 'nothing printed'}` };
+  // DETACHED, AND THE LOG READ ONCE THE POD HAS FINISHED, as up.mjs asks /ready. This was
+  // `kubectl run -i --rm`, which attaches after the container has started, and a pod that
+  // prints and exits first comes back with nothing (measured on kind: three in three for a
+  // `console.log`). This probe usually outlasted the attach, but a lost answer read as a
+  // broken bridge. runInCluster deletes the pod whatever happens.
+  const r = runInCluster(context, image, `bridge-probe-${Date.now().toString(36)}`, `const INPUT = ${JSON.stringify(input)};\n${PROBE}`, ['--image-pull-policy=Never']);
+  const line = r.stdout.split(/\r?\n/).find((l) => l.startsWith('BRIDGE-PROBE '));
+  if (!line) return { error: `the probe pod gave no answer (exit ${r.status}): ${(r.stderr + r.stdout).trim() || 'nothing printed'}` };
   return JSON.parse(line.slice('BRIDGE-PROBE '.length));
 }
 
