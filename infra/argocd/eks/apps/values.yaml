@@ -1,0 +1,24 @@
+# THE EKS ROOT'S APPLICATIONS, AS A CHART, SO THAT SETUP RUNS FIRST ON EVERY COMMIT.
+#
+# Setup (templates/setup.json) is sync wave -1; the services' ApplicationSet, the gateway and
+# the web app are wave 0. The root (infra/argocd/eks/root.json) applies a wave, waits until
+# every child in it is Healthy, then applies the next -- so no service is synced before setup
+# has migrated every database, made the topics and the schemas, and applied row security. On
+# 2026-11-15, without the waves, six services each exited 1 once or twice while setup ran: 11
+# restarts in a fresh install.
+#
+# A wave can only order what the root syncs, and the root syncs only when its children's
+# manifests change. When every child said `targetRevision: main`, a new commit changed none of
+# them: the root did nothing, and each child followed main by itself, the services rolling
+# beside the new commit's setup Job. So every child is given the commit the root itself
+# resolved main to, below. A commit then changes every child, the root syncs it, and the waves
+# order that commit too. It also means every child runs the one commit, never a mixture.
+#
+# Healthy, for an Application, is infra/argocd/eks/application-health.lua: Argo CD has no
+# health check of its own for one, and the documented one passes through a status that is
+# still about the previous commit.
+
+# The commit the root resolved main to: root.json passes $ARGOCD_APP_REVISION. A full SHA and
+# nothing else (templates/revision.yaml): the health check compares it with the revision each
+# child reports, and a branch name would never match, so the root would wait for ever.
+revision: ""

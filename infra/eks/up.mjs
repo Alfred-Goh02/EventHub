@@ -407,6 +407,26 @@ export const PULL_SECRET = 'ghcr-pull';
 /** The Applications the EKS root makes: one per service chart, and the gateway, the web app and setup. */
 export const gitopsApps = (charts) => [...charts, 'kong', 'web', 'setup'];
 
+/** Where Argo CD reads a health check for argoproj.io/Application from: argocd-cm, under this key. */
+export const APPLICATION_HEALTH_KEY = 'resource.customizations.health.argoproj.io_Application';
+/** The script, infra/argocd/eks/application-health.lua, which says why the root's waves need it. */
+export const applicationHealthScript = (root = ROOT) => readFileSync(join(root, 'infra', 'argocd', 'eks', 'application-health.lua'), 'utf8').replace(/\r\n/g, '\n');
+
+/**
+ * Puts the Application health check into argocd-cm, then reads argocd-cm back: { ok, why }.
+ * Without it, the root's sync waves wait for nothing (application-health.lua says why), so
+ * this must happen before the root is applied, and a write that did not land must not pass for
+ * one that did. A merge patch on that one key: argocd-cm's other settings are left as they are.
+ */
+export function installApplicationHealth(kubectl, root = ROOT) {
+  const script = applicationHealthScript(root);
+  kubectl(['-n', 'argocd', 'patch', 'configmap', 'argocd-cm', '--type', 'merge', '-p', JSON.stringify({ data: { [APPLICATION_HEALTH_KEY]: script } })]);
+  const back = JSON.parse(kubectl(['-n', 'argocd', 'get', 'configmap', 'argocd-cm', '-o', 'json'])).data?.[APPLICATION_HEALTH_KEY];
+  if (back === undefined) return { ok: false, why: `argocd-cm has no ${APPLICATION_HEALTH_KEY} after the patch` };
+  if (back.replace(/\r\n/g, '\n') !== script) return { ok: false, why: `argocd-cm's ${APPLICATION_HEALTH_KEY} is not application-health.lua` };
+  return { ok: true, why: `${script.split('\n').length} lines of application-health.lua` };
+}
+
 /**
  * Whether ghcr.io has `ref`, asked as the cluster will ask: with the read-only token, through
  * the registry's own token endpoint. { ok, why }. The token goes to ghcr.io and nowhere else.
@@ -434,6 +454,13 @@ async function ghcrHas(ref, user, token) {
  * fifteen services, the gateway, the web app and setup -- each image named by the commit
  * deployed ($ARGOCD_APP_REVISION_SHORT), from GitHub's registry, pulled with a read-only
  * token (GHCR_TOKEN, read:packages only; GHCR_USER, by default the repository's owner).
+ *
+ * SETUP FIRST, every time. The root gives each Application the commit it resolved main to,
+ * and syncs setup in an earlier wave than the rest, so nothing else is synced until setup's
+ * Job has finished for that commit: on this install, and on every commit after it
+ * (infra/argocd/eks/apps/values.yaml says why both halves are needed). A wave waits on a
+ * child's health, and Argo CD has no health check for an Application of its own, so this puts
+ * one into argocd-cm before the root is applied (installApplicationHealth).
  *
  * The checkout must BE main: the Secrets come from this checkout's compose, and the cluster
  * runs main's code. A checkout that differs would give main's services another commit's
@@ -481,8 +508,13 @@ async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
     stringData: { type: 'git', url: rootApp.spec.source.repoURL, sshPrivateKey: readFileSync(DEPLOY_KEY, 'utf8') },
   }));
   check(true, `${rootApp.spec.source.repoURL}, read with the deploy key at ${DEPLOY_KEY}`);
+  // Before the root: its first sync is the fresh install, and setup's wave must already have
+  // something to wait on.
+  const health = installApplicationHealth(kubectl);
+  check(health.ok, `argocd-cm: the Application health check the root's waves wait on (${health.why})`);
+  if (failed) return;
   kubectl(['apply', '-f', join('infra', 'argocd', 'eks', 'root.json')]);
-  check(true, `root -> ${rootApp.spec.source.path} at ${rootApp.spec.source.targetRevision}`);
+  check(true, `root -> ${rootApp.spec.source.path} at ${rootApp.spec.source.targetRevision}: setup first, then everything else`);
 
   const want = gitopsApps(charts);
   step(`7. ${want.length} Applications, each Synced and Healthy at ${mainSha.slice(0, 7)}`);
@@ -491,6 +523,16 @@ async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
   for (;;) {
     const apps = Object.fromEntries(JSON.parse(kubectl(['-n', 'argocd', 'get', 'applications', '-o', 'json'])).items.map((a) => [a.metadata.name, a]));
     const state = (n) => `${apps[n]?.status?.sync?.status ?? 'absent'}/${apps[n]?.status?.health?.status ?? '-'}`;
+    // A root whose sync ended will not try the same commit again, and what it waits on, the
+    // rest, will never come: say why now, not in twenty minutes. Setup's Job failing is the
+    // likely one, and its own Application says how. Only for this commit: an earlier commit's
+    // failure is history, and the root tries a new commit afresh.
+    const rootOp = apps.root?.status?.operationState;
+    const rootTried = rootOp?.syncResult?.revision ?? rootOp?.operation?.sync?.revision;
+    if (rootOp && (rootOp.phase === 'Failed' || rootOp.phase === 'Error') && rootTried === mainSha) {
+      check(false, `the root's sync of ${mainSha.slice(0, 7)} ended ${rootOp.phase}: ${rootOp.message} | setup: ${state('setup')}, ${apps.setup?.status?.health?.message ?? ''}`.slice(0, 1500));
+      return;
+    }
     const notYet = want.filter((n) => state(n) !== 'Synced/Healthy');
     const line = notYet.length ? `waiting on ${notYet.map((n) => `${n}=${state(n)}`).join(' ')}` : 'all Synced and Healthy';
     if (line !== last) {

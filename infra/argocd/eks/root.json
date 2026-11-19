@@ -12,7 +12,10 @@
       "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
       "targetRevision": "main",
       "path": "infra/argocd/eks/apps",
-      "directory": { "include": "*.json" }
+      "helm": {
+        "releaseName": "root",
+        "parameters": [{ "name": "revision", "value": "$ARGOCD_APP_REVISION", "forceString": true }]
+      }
     },
     "destination": { "server": "https://kubernetes.default.svc", "namespace": "argocd" },
     "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
