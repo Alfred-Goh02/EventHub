@@ -39,6 +39,8 @@ spec:
     metadata:
       labels:
         {{- include "web.labels" . | nindent 8 }}
+        # The load balancer's (infra/edge): its web port reaches this pod's http port.
+        eventhub/edge: "true"
     spec:
       terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
       # Nothing here reads its environment as configuration beyond PORT, HOST and the

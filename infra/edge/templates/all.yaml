@@ -1,0 +1,3 @@
+{{- $v := .Values -}}
+{{- if and $v.tls.certificateArn (not (regexMatch "^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-f-]+$" (toString $v.tls.certificateArn))) }}{{ fail "tls.certificateArn must be an ACM certificate's ARN" }}{{ end -}}
+{{- include "edge.emit" (list . "edge.service") }}

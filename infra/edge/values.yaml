@@ -1,0 +1,46 @@
+# THE WAY IN FROM THE INTERNET: ONE NETWORK LOAD BALANCER, TWO PORTS.
+#
+# The browser opens a tenant's page on the web app and calls the API at the same host on
+# port 8000 (apps/web/src/api/env.ts), so both must answer on ONE address: the web app on
+# the page's port, and Kong on 8000. Two Services of type LoadBalancer would be two load
+# balancers with two addresses. So this is one Service, selecting the web app's pods and
+# Kong's by the label below, with each port's targetPort a NAME only one of them has: the
+# web app's container port is `http`, Kong's is `proxy`. Kubernetes resolves a named
+# targetPort per pod and leaves a pod out of a port's endpoints when it has no port of
+# that name, so `web` reaches only web pods and `gateway` only Kong.
+#
+# THE AWS LOAD BALANCER CONTROLLER MAKES IT (loadBalancerClass service.k8s.aws/nlb), not
+# EKS's built-in provider, which would make a Classic Load Balancer. infra/eks/up.mjs
+# installs the controller first, on the role Terraform binds to it by Pod Identity.
+#   - IP targets: the pods themselves, not node ports, so a request goes straight to a
+#     pod and no node forwards it on;
+#   - the client's own address is kept (preserve_client_ip), so Kong's per-address rate
+#     limit and Auth's per-address sign-in budget count the person, not the load balancer
+#     -- the lesson behind TRUST_PROXY, which reads it from Kong;
+#   - across zones: one replica of each runs in one zone, and the address handed out is
+#     one of the balancer's two, so the other zone's node must be able to reach it;
+#   - tagged, so the teardown's leftover check finds anything it made.
+#
+# NO HTTPS WITHOUT A DOMAIN. Given a certificate (tls.certificateArn, an ACM certificate
+# for the domain in infra/eks/public.mjs), both listeners terminate TLS -- the page on 443
+# and Kong on 8000 -- with TLS 1.2 or later; without one, the page is plain HTTP on 80.
+
+# yaml for kubectl and Helm; json for the verifiers, which read the chart without a YAML
+# parser (templates/_helpers.tpl).
+render: yaml
+
+# The label the web app's and Kong's pod templates carry, and nothing else's.
+selectorLabel: eventhub/edge
+
+ports:
+  # The gateway's port, on every host: the web app calls it at its own host on 8000.
+  gateway: 8000
+
+tls:
+  # An ACM certificate's ARN, for the domain and *.domain. Empty: no TLS, the page on 80.
+  certificateArn: ""
+  # TLS 1.3, and 1.2 for older clients: the policy ELB recommends.
+  policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+# On everything the controller makes for this Service, as on every other AWS resource here.
+tags: Project=eventhub,Environment=demo
