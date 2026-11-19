@@ -41,8 +41,9 @@ spec:
         {{- include "web.labels" . | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
-      # Nothing here reads its environment as configuration beyond PORT and HOST, and a
-      # Service named web would add WEB_PORT and the rest for nothing.
+      # Nothing here reads its environment as configuration beyond PORT, HOST and the
+      # address in envSecret, and a Service named web would add WEB_PORT and the rest for
+      # nothing.
       enableServiceLinks: false
       # The web server never talks to the Kubernetes API.
       automountServiceAccountToken: false
@@ -63,6 +64,12 @@ spec:
         - name: web
           image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
           imagePullPolicy: IfNotPresent
+          # APP_URL_TEMPLATE, the cluster's address, which the installer puts here
+          # (infra/eks/public.mjs). Not optional: without it every page would be served on the
+          # sample data, which looks like a working site with nobody's events in it.
+          envFrom:
+            - secretRef:
+                name: {{ $v.envSecret | quote }}
           ports:
             - name: http
               containerPort: {{ $v.port }}

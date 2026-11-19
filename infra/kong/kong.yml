@@ -9,11 +9,14 @@
 # tenant headers trustworthy. Anything that needs to know what an event or a ticket is
 # stays in the services.
 #
-# HOSTS. A tenant is its subdomain: acme.eventhub.com in production, and
-# acme.eventhub.localhost here — browsers and curl resolve any *.localhost name to the
-# loopback address themselves, so nothing has to be added to a hosts file. The api
-# subdomain is the one host with no tenant in it, for the two callers that cannot know
-# one: a payment provider's webhook, and an unsubscribe link in an email.
+# HOSTS. A tenant is its subdomain: acme.eventhub.localhost here — browsers and curl
+# resolve any *.localhost name to the loopback address themselves, so nothing has to be
+# added to a hosts file — and acme.<domain> where the gateway is deployed. eventhub.com
+# below STANDS FOR that domain: render-consumer.lua puts the one APP_URL_TEMPLATE names
+# in its four places (the tenant hosts, the api host, the CORS origin and the tenant
+# rule), and refuses to start if any is missing. The api subdomain is the one host with
+# no tenant in it, for the two callers that cannot know one: a payment provider's
+# webhook, and an unsubscribe link in an email.
 #
 # PATHS. Each service already owns distinct top-level paths, so they are routed as they
 # are, with no prefix to strip — /events reaches Event as /events. Auth is the

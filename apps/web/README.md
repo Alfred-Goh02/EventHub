@@ -27,7 +27,9 @@ in every major browser, so no hosts-file entry is needed. The seeded test accoun
 
 The dev server listens on 127.0.0.1 only, like every other port in this repository. Opened on
 any other host (Lovable's preview, for instance) the app uses the sample data in
-`src/api/mock.ts` instead of the API.
+`src/api/mock.ts` instead of the API -- unless that host is a tenant of the deployment's own
+domain. The server announces that domain as `/config.js`, from `APP_URL_TEMPLATE`, and the page
+loads it before the app; on EKS the template is the cluster's address, `infra/eks/public.mjs`.
 
 ## Checks
 
