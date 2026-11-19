@@ -36,3 +36,14 @@ $env:EVENTHUB_IMAGE_TAG = (git rev-parse --short HEAD); node infra/local/up.mjs
 ```
 
 `kind delete cluster --name eventhub` removes it all; compose is untouched.
+
+Each store reaches the cluster as an ExternalName Service naming its container
+(`postgres` -> `eventhub-postgres`), resolved by Docker's DNS wherever the container is
+now, so a Docker restart that hands the stores new addresses needs nothing re-run. What
+it does not survive is compose recreating a store, which drops the extra network. When a
+service cannot reach a store, ask from inside the cluster:
+
+```powershell
+node scripts/verify-kind-bridge.mjs   # names any host that does not lead to its container
+node infra/local/up.mjs --gitops      # joins the stores to kind again; ArgoCD keeps the charts
+```
