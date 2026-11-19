@@ -70,6 +70,8 @@ spec:
     metadata:
       labels:
         {{- include "kong.labels" . | nindent 8 }}
+        # The load balancer's (infra/edge): its gateway port reaches this pod's proxy port.
+        eventhub/edge: "true"
       annotations:
         # A changed kong.yml or render step rolls the pods: Kong reads both only as it
         # starts. A rotated key likewise reaches Kong only when Kong restarts
