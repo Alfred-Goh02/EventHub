@@ -700,10 +700,20 @@ async function main() {
       Boolean(flusherUp) && passesAtStart === 0 && (await heldItems(Z)).length === 1,
       `it does not pass as it starts: two seconds after its flusher started, no pass yet and Z's reply still held (${passesAtStart ?? 'no metrics'} pass(es), ${(await heldItems(Z)).length} held)`,
     );
-    const first = again ? await waitFor(async () => ((await digests(Z)).length === 1 ? true : null), 40_000) : null;
-    const passesAfterFirst = first ? (await metrics()).digest?.passesTotal ?? 0 : 0;
+    // A pass is counted when it returns (services/notification/src/digest/index.ts), after
+    // the digest it sent is already in the sent-log. So the count is waited for with the
+    // digest, never read the instant the digest appears: read then, CI found Z's digest and
+    // 0 passes (#196), and the later check had the same window. A pass that never runs, or
+    // is never counted, still runs out the wait and fails.
+    const passes = async () => (await metrics()).digest?.passesTotal ?? 0;
+    const first = again
+      ? await waitFor(async () => ((await digests(Z)).length === 1 && (await passes()) >= 1 ? true : null), 40_000)
+      : null;
+    const passesAfterFirst = first ? await passes() : 0;
     await plantHeld(Z2, { postId: 'post_z2' });
-    const later = first ? await waitFor(async () => ((await digests(Z2)).length === 1 ? true : null), 40_000) : null;
+    const later = first
+      ? await waitFor(async () => ((await digests(Z2)).length === 1 && (await passes()) > passesAfterFirst ? true : null), 40_000)
+      : null;
     const m = again ? await metrics() : null;
     check(Boolean(first) && passesAfterFirst >= 1 && (await gone(Z)), `its first pass sent Z's digest (${passesAfterFirst} pass(es))`);
     check(
