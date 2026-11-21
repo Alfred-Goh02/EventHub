@@ -3,7 +3,8 @@
 # apps/web's own image (apps/web/Dockerfile): nitro's Node server, which renders the page
 # shell and serves the browser bundle. The browser then calls the API itself, at the same
 # host on port 8000 (apps/web/src/api/env.ts) -- the gateway, never this pod. So the pod
-# needs no database, no key and no environment of its own.
+# needs no database and no key: only the cluster's address, APP_URL_TEMPLATE, which tells the
+# browser the domain whose tenants are real (apps/web/src/server.ts serves it as /config.js).
 #
 # NO WAY IN FROM OUTSIDE YET. The Service is ClusterIP. From this machine, with compose's
 # Kong stopped (it holds 8000, where the browser looks for the API):
@@ -25,6 +26,9 @@ replicas: 1
 
 # nitro's node-server listens on PORT, which the image sets.
 port: 3000
+
+# The Secret holding APP_URL_TEMPLATE, which infra/eks/up.mjs makes from infra/eks/public.mjs.
+envSecret: web-env
 
 # The image's own user, node: uid 1000, asked of the image (`docker run --entrypoint id`).
 runAsUser: 1000

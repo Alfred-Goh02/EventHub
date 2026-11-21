@@ -1,9 +1,9 @@
 /**
  * Which compose hosts an environment names, and on which ports.
  *
- * ONE DEFINITION, TWO READERS. infra/local/up.mjs bridges every such host into the kind
- * cluster, and scripts/verify-store-chart.mjs requires infra/stores to serve every one of
- * them on EKS. Kept in two places, the two would drift apart, and the chart could leave a
+ * ONE DEFINITION, TWO READERS. infra/local/bridge.mjs derives from it every host that
+ * infra/local/up.mjs bridges into the kind cluster, and scripts/verify-store-chart.mjs
+ * requires infra/stores to serve every one of them on EKS. Kept in two places, the two would drift apart, and the chart could leave a
  * port out that the bridge serves.
  */
 

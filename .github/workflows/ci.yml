@@ -350,6 +350,14 @@ jobs:
       - name: Assert the EKS installer makes every Secret the charts read, and runs compose's setup
         run: node scripts/verify-eks-install.mjs
 
+      # The cluster's address is one line, infra/eks/public.mjs. Given a real https domain,
+      # Kong's render step puts it where kong.yml says eventhub.com, and Kong runs it and
+      # serves that domain's tenants and nothing that resembles them; the services with a
+      # production rule start in production on what the installer makes for it. Kong's image
+      # was pulled by the gateway chart's step above.
+      - name: Assert the cluster's address is one setting, and Kong and the services take it from there
+        run: node scripts/verify-public-address.mjs
+
       # The guard for "Free runner disk", placed before anything writes to
       # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
       # disk, rather than minutes later as an index_create_block_exception in
@@ -2708,3 +2716,38 @@ jobs:
           curl -sf "http://127.0.0.1:3000$script" -o /dev/null
           echo "  served the page and $script, as uid $uid, read-only"
           docker stop web-ci
+
+      # The cluster's address reaches the browser as /config.js (src/server.ts), which the
+      # page loads before its module scripts: with APP_URL_TEMPLATE, the domain whose tenants
+      # use the real API; without it, none, so every host but eventhub.localhost gets the
+      # sample data; and with one that is not an address, no page at all (the pod is never
+      # ready) rather than a real host serving sample data.
+      - name: The web image tells the browser the cluster's domain, and refuses a malformed one
+        run: |
+          set -euo pipefail
+          serve() { # name, then any docker run options
+            local name=$1; shift
+            docker run -d --rm --read-only --cap-drop ALL --name "$name" -p 127.0.0.1::3000 "$@" eventhub/web:ci >/dev/null
+            port=$(docker port "$name" 3000/tcp | head -n 1 | sed 's/.*://')
+            for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:$port/favicon.ico" -o /dev/null && break; sleep 1; done
+          }
+          serve web-domain -e 'APP_URL_TEMPLATE=https://{tenant}.example.org'
+          config=$(curl -sf "http://127.0.0.1:$port/config.js")
+          test "$config" = 'window.__EVENTHUB__ = {"domain":"example.org"};' || { echo "config.js with a domain: $config"; exit 1; }
+          type=$(curl -sf -o /dev/null -w '%{content_type}' "http://127.0.0.1:$port/config.js")
+          test "$type" = 'text/javascript; charset=utf-8' || { echo "config.js is served as $type"; exit 1; }
+          page=$(curl -sf "http://127.0.0.1:$port/" | tr -d '\000')
+          # Before the first module script, so the app is chosen with the domain in place.
+          first=$(grep -oE '<script[^>]*src="[^"]*"' <<<"$page" | head -n 1)
+          test "$first" = '<script src="/config.js"' || { echo "the first script the page loads is $first"; exit 1; }
+          docker stop web-domain >/dev/null
+          serve web-none
+          config=$(curl -sf "http://127.0.0.1:$port/config.js")
+          test "$config" = 'window.__EVENTHUB__ = {"domain":null};' || { echo "config.js with no domain: $config"; exit 1; }
+          docker stop web-none >/dev/null
+          serve web-bad -e 'APP_URL_TEMPLATE=https://{tenant}.Example.org'
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/")
+          test "$code" = 500 || { echo "a malformed address served the page: $code"; exit 1; }
+          docker logs web-bad 2>&1 | grep -q 'APP_URL_TEMPLATE must be' || { echo "the log does not say why"; exit 1; }
+          docker stop web-bad >/dev/null
+          echo "  config.js: example.org with the address, null without, and no page on a malformed one"

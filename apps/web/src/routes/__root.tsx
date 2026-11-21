@@ -98,6 +98,9 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { rel: "icon", href: "/favicon.ico", type: "image/x-icon" },
     ],
+    // The deployment's domain, from the app's own server (src/server.ts), before the app's
+    // module scripts run: a classic script in the head runs first, and they wait for it.
+    scripts: [{ src: "/config.js" }],
   }),
   shellComponent: RootShell,
   component: RootComponent,

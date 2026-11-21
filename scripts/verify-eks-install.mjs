@@ -17,7 +17,9 @@
  *     the checkout;
  *   - every Secret a pod reads (envFrom, a Secret volume and its items, a secretKeyRef) is
  *     one the installer makes, with every key read; and every Secret it makes is read by
- *     something, so neither list can rot. kong-env is compose's environment for Kong;
+ *     something, so neither list can rot. kong-env and each service's <chart>-env are
+ *     compose's environment with the cluster's address over it (infra/eks/public.mjs), and
+ *     web-env is the address alone;
  *   - the setup Job runs exactly compose's setup command, with the installer's setup-env,
  *     once (backoffLimit 0, restartPolicy Never), as the image's own non-root user;
  *   - every directory compose's setup mounts a volume at is a writable emptyDir in the
@@ -230,18 +232,35 @@ async function main() {
     return;
   }
   merge(secretReads(gateway.docs), 'kong');
-  check(rendered === charts.length && charts.length > 0 && Object.keys(reads).length > 0, `CONTROL: ${rendered} of ${charts.length} chart(s) rendered, plus stores, setup and the gateway; ${Object.keys(reads).length} Secret(s) read`);
-  // compose's environment, value for value, except where a credential sat: there, and only
-  // there, the cluster's own.
-  const composeButCredentials = (name, env) => {
+  // The web app: the cluster's address, from web-env.
+  const web = render(join(root, 'infra', 'web'), ['--set', 'image.repository=registry.example/eventhub/web', '--set', 'image.tag=abc1234']);
+  if (web.error) {
+    check(false, `infra/web did not render: ${web.error.slice(-400)}`);
+    return;
+  }
+  merge(secretReads(web.docs), 'web');
+  check(rendered === charts.length && charts.length > 0 && Object.keys(reads).length > 0, `CONTROL: ${rendered} of ${charts.length} chart(s) rendered, plus stores, setup, the gateway and the web app; ${Object.keys(reads).length} Secret(s) read`);
+  // compose's environment, value for value, with the address's variables over it
+  // (infra/eks/public.mjs), except where a credential sat: there, and only there, the
+  // cluster's own.
+  const where = await import(pathToFileURL(join(root, 'infra', 'eks', 'public.mjs')).href);
+  const address = where.publicEnvironment(where.APP_URL_TEMPLATE, charts, (chart) => eks.envOf(compose, chart));
+  const composeButCredentials = (name, composeEnv) => {
+    const env = { ...composeEnv, ...(address[name] ?? {}) };
     const data = made_[name]?.data ?? {};
     const cred_ = new Set(found.filter((f) => f.secret === name).map((f) => f.key));
     const keysSame = JSON.stringify(Object.keys(data).sort()) === JSON.stringify(Object.keys(env).sort());
     const off = Object.keys(env).filter((k) => (cred_.has(k) ? data[k] === env[k] : data[k] !== env[k]));
-    return { ok: keysSame && off.length === 0, n: Object.keys(data).length, creds: cred_.size, off };
+    return { ok: keysSame && off.length === 0, n: Object.keys(data).length, creds: cred_.size, set: Object.keys(address[name] ?? {}), off };
   };
   const kongEnv = composeButCredentials('kong-env', eks.envOf(compose, 'kong'));
-  check(kongEnv.ok && kongEnv.creds === 0, `kong-env is compose's resolved environment for Kong, holding no credential (${kongEnv.n} variable(s))`);
+  check(kongEnv.ok && kongEnv.creds === 0 && kongEnv.set.join() === 'APP_URL_TEMPLATE', `kong-env is compose's resolved environment for Kong and the cluster's address, holding no credential (${kongEnv.n} variable(s), ${kongEnv.set.join(', ')} from the address)`);
+  const serviceEnvs = charts.map((chart) => [chart, composeButCredentials(`${chart}-env`, eks.envOf(compose, chart))]);
+  const offEnv = serviceEnvs.filter(([, r]) => !r.ok).map(([chart, r]) => `${chart}-env${r.off.length ? ` at ${r.off.join(', ')}` : ' (other keys)'}`);
+  const withAddress = serviceEnvs.filter(([, r]) => r.set.length > 0).length;
+  check(offEnv.length === 0 && withAddress === charts.length, `every service's <chart>-env is compose's environment with the address's variables over it and the cluster's credentials in place, and nothing else: ${withAddress} of ${charts.length} carry the address${offEnv.length ? ` -- differs in ${offEnv.join('; ')}` : ''}`);
+  const webEnv = made_['web-env']?.data ?? {};
+  check(JSON.stringify(webEnv) === JSON.stringify({ APP_URL_TEMPLATE: where.APP_URL_TEMPLATE }), `web-env is the address and nothing else (${Object.keys(webEnv).join(', ') || 'not made'})`);
   for (const [name, r] of Object.entries(reads).sort()) {
     const have = produced[name];
     const missing = [...r.keys].filter((k) => k !== '*' && !have?.has(k));

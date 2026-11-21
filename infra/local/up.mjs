@@ -12,16 +12,19 @@
  *   2. reads compose's resolved configuration, and checks each node is on kind's
  *      network alone;
  *   3. joins each data store compose runs to kind's network, and gives every host the
- *      services' environment names -- postgres, kafka,
- *      schema-registry, ... -- a Service in the cluster whose endpoint is that compose
- *      container. A pod reaches `postgres:5432` here as it will reach the RDS endpoint
- *      on EKS, and the environment is the same string in both places;
+ *      services' environment names -- postgres, kafka, schema-registry, ... -- an
+ *      ExternalName Service naming that compose container, so the address is looked up
+ *      when it is used, not written down when this runs (infra/local/bridge.mjs says why).
+ *      A pod reaches `postgres:5432` here as it will reach the RDS endpoint on EKS, and
+ *      the environment is the same string in both places;
  *   4. puts Auth's keypair in the `jwt-keys` Secret, from services/auth/keys;
  *   5. loads the image into the nodes;
- *   6. installs each chart with its environment taken from compose's OWN resolved
+ *   6. asks, from a pod, where every bridge leads, and fails naming any host that does not
+ *      reach its container (scripts/verify-kind-bridge.mjs asks the same, any time);
+ *   7. installs each chart with its environment taken from compose's OWN resolved
  *      configuration (`docker compose config`), never a hand-written copy -- a copy falls
  *      behind the list it copies (CLAUDE.md, "Derive a list from its source");
- *   7. waits for each rollout, then asks every service's /ready from inside the cluster.
+ *   8. waits for each rollout, then asks every service's /ready from inside the cluster.
  *
  * A host that is itself one of the charts being installed gets no bridge: inside the
  * cluster, `auth` means the auth Service.
@@ -32,10 +35,11 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } fro
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-// Which compose hosts an environment names: shared with scripts/verify-store-chart.mjs,
-// which requires infra/stores to serve on EKS every host this script bridges on kind.
-import { hostsOf } from '../lib/compose-hosts.mjs';
+import { addressOnKind, allCharts, bridgesFor, composeConfig, inspectBridges, NETWORK, SELECTOR, serviceManifests } from './bridge.mjs';
+// A node script run once in a pod, and what it printed: the EKS installer's, so both
+// clusters ask /ready the same way. Importing it runs nothing; that file installs only
+// when it is the script being run.
+import { runInCluster } from '../eks/up.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CLUSTER = 'eventhub';
@@ -54,16 +58,6 @@ function fail(msg) {
   process.exit(1);
 }
 
-/** Every chart under charts/ that is not a library. */
-function allCharts() {
-  return readdirSync(join(ROOT, 'charts'), { withFileTypes: true })
-    .filter((d) => d.isDirectory() && existsSync(join(ROOT, 'charts', d.name, 'Chart.yaml')))
-    .map((d) => d.name)
-    .filter((name) => !/^type:\s*library\s*$/m.test(readFileSync(join(ROOT, 'charts', name, 'Chart.yaml'), 'utf8')))
-    .sort();
-}
-
-
 const args = process.argv.slice(2).filter((a) => a !== '--');
 /**
  * --gitops: prepare the cluster for ArgoCD, which installs the charts from git. Every step
@@ -74,7 +68,7 @@ const args = process.argv.slice(2).filter((a) => a !== '--');
  */
 const GITOPS = args.includes('--gitops');
 const wanted = args.filter((a) => !a.startsWith('--'));
-const charts = wanted.length ? wanted : allCharts();
+const charts = wanted.length ? wanted : allCharts(ROOT);
 for (const c of charts) if (!existsSync(join(ROOT, 'charts', c, 'Chart.yaml'))) fail(`no chart at charts/${c}`);
 
 step('1. the kind cluster');
@@ -87,9 +81,7 @@ if (!clusters.includes(CLUSTER)) {
 const nodes = run('kind', ['get', 'nodes', '--name', CLUSTER]).split(/\r?\n/).filter(Boolean);
 
 step("2. compose's configuration");
-const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
-const services = compose.services;
-const composeNames = new Set(Object.keys(services));
+const services = composeConfig(ROOT).services;
 /**
  * THE DATA STORES JOIN KIND'S NETWORK; THE NODES NEVER JOIN COMPOSE'S. The first version
  * did it the other way round, and after Docker's VM restarted two nodes came back
@@ -99,47 +91,32 @@ const composeNames = new Set(Object.keys(services));
  * with one network has one address. A container compose recreates loses the extra
  * network; this step puts it back.
  */
-const network = 'kind';
-console.log(`    ok    ${Object.keys(services).length} compose service(s); the data stores join the ${network} network`);
+console.log(`    ok    ${Object.keys(services).length} compose service(s); the data stores join the ${NETWORK} network`);
 for (const node of nodes) {
   const attached = Object.keys(JSON.parse(run('docker', ['inspect', node, '--format', '{{json .NetworkSettings.Networks}}'])));
-  if (attached.length !== 1 || attached[0] !== network) {
-    fail(`${node} is on ${attached.join(', ')}; a node must be on ${network} alone (docker network disconnect the others and restart it)`);
+  if (attached.length !== 1 || attached[0] !== NETWORK) {
+    fail(`${node} is on ${attached.join(', ')}; a node must be on ${NETWORK} alone (docker network disconnect the others and restart it)`);
   }
 }
 
 step('3. a Service for every compose host the environment names');
-const bridges = new Map();
-for (const chart of charts) {
-  const svc = services[chart];
-  if (!svc) fail(`charts/${chart} has no compose service of the same name to take its environment from`);
-  for (const { host, port } of hostsOf(svc.environment ?? {}, composeNames)) {
-    if (charts.includes(host)) continue;
-    if (!bridges.has(host)) bridges.set(host, new Set());
-    bridges.get(host).add(port);
-  }
+for (const chart of charts) if (!services[chart]) fail(`charts/${chart} has no compose service of the same name to take its environment from`);
+const bridges = bridgesFor(charts, services);
+for (const [host, { container, ports }] of bridges) {
+  const r = spawnSync('docker', ['network', 'connect', NETWORK, container], { encoding: 'utf8' });
+  if (r.status !== 0 && !/already exists/.test(r.stderr)) fail(`could not join ${container} to ${NETWORK}: ${r.stderr.trim()}`);
+  const ip = addressOnKind(container);
+  if (!ip) fail(`${container} has no address on ${NETWORK}; is it running?`);
+  console.log(`    ok    ${host} -> ExternalName ${container}, at ${ip} now, port(s) ${ports.join(',')}`);
 }
-const manifests = [];
-for (const [host, ports] of [...bridges].sort()) {
-  const container = services[host].container_name ?? host;
-  const r = spawnSync('docker', ['network', 'connect', network, container], { encoding: 'utf8' });
-  if (r.status !== 0 && !/already exists/.test(r.stderr)) fail(`could not join ${container} to ${network}: ${r.stderr.trim()}`);
-  const ip = JSON.parse(run('docker', ['inspect', container, '--format', '{{json .NetworkSettings.Networks}}']))[network]?.IPAddress;
-  if (!ip) fail(`${container} has no address on ${network}; is it running?`);
-  const portList = [...ports].sort((a, b) => a - b).map((p) => ({ name: `p${p}`, port: p, protocol: 'TCP' }));
-  const labels = { 'app.kubernetes.io/part-of': 'eventhub', 'eventhub/bridge': 'compose' };
-  manifests.push({ apiVersion: 'v1', kind: 'Service', metadata: { name: host, labels }, spec: { ports: portList.map((p) => ({ ...p, targetPort: p.port })) } });
-  manifests.push({
-    apiVersion: 'discovery.k8s.io/v1',
-    kind: 'EndpointSlice',
-    metadata: { name: `${host}-compose`, labels: { ...labels, 'kubernetes.io/service-name': host } },
-    addressType: 'IPv4',
-    ports: portList,
-    endpoints: [{ addresses: [ip] }],
-  });
-  console.log(`    ok    ${host} -> ${container} ${ip}:${[...ports].join(',')}`);
-}
-if (manifests.length) kubectl(['apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items: manifests }));
+if (bridges.size) kubectl(['apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items: serviceManifests(bridges) }));
+// The EndpointSlices the first version wrote, each holding an address as it was when this
+// last ran. An ExternalName Service ignores them, so they mislead only whoever reads them,
+// and they go. Counted, so a delete that matched nothing says so -- counting the names it
+// printed, not its lines: with nothing to delete it prints "No resources found", which a
+// line count called one.
+const removed = kubectl(['delete', 'endpointslices', '-l', SELECTOR, '--ignore-not-found', '-o', 'name']).split(/\r?\n/).filter((l) => /^endpointslice[\w.]*\/\S+$/.test(l));
+console.log(`    ok    ${removed.length} EndpointSlice(s) holding a written-down address removed${removed.length ? `: ${removed.join(', ')}` : ''}`);
 
 step("4. Auth's keys");
 // EVERY FILE IN THE DIRECTORY, not a list of the ones known today. The first version
@@ -173,11 +150,17 @@ if (charts.includes('notification')) {
 step('5. the image');
 run('kind', ['load', 'docker-image', IMAGE, '--name', CLUSTER], { stdio: 'inherit' });
 
+step('6. where every bridge leads, asked from a pod');
+const findings = inspectBridges({ context: CONTEXT, image: IMAGE, bridges });
+for (const { ok, msg } of findings) console.log(`    ${ok ? 'ok  ' : 'FAIL'}  ${msg}`);
+const wrong = findings.filter((f) => !f.ok);
+if (wrong.length) fail(`${wrong.length} bridge check(s) failed; the services would start against the wrong address or none`);
+
 const envOf = (chart) =>
   Object.fromEntries(Object.entries(services[chart].environment ?? {}).map(([k, v]) => [k, v === null ? '' : String(v)]));
 
 if (GITOPS) {
-  step('6. each chart\'s environment, for ArgoCD to find');
+  step('7. each chart\'s environment, for ArgoCD to find');
   for (const chart of charts) {
     // THE RELEASE GOES FIRST. A release this script installed owns a Secret of the same
     // name, `<chart>-env`, and uninstalling it deletes that Secret. Done the other way
@@ -200,7 +183,7 @@ if (GITOPS) {
   process.exit(0);
 }
 
-step('6. the charts');
+step('7. the charts');
 const scratch = mkdtempSync(join(tmpdir(), 'eventhub-up-'));
 for (const chart of charts) {
   const env = envOf(chart);
@@ -211,18 +194,19 @@ for (const chart of charts) {
   console.log(`    ok    ${chart} installed, ${Object.keys(env).length} variable(s) from compose`);
 }
 
-step('7. /ready from inside the cluster');
+step('8. /ready from inside the cluster');
 let ready = true;
 for (const chart of charts) {
   const port = services[chart].environment?.PORT;
   if (!port) continue;
-  const name = `ready-${chart}-${Date.now().toString(36)}`;
-  const r = spawnSync(
-    'kubectl',
-    ['--context', CONTEXT, 'run', name, '--rm', '-i', '--restart=Never', `--image=${IMAGE}`, '--image-pull-policy=Never', '--quiet', '--', 'node', '-e',
-      `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`],
-    { encoding: 'utf8' },
-  );
+  // DETACHED, AND THE LOG READ ONCE THE POD HAS FINISHED. This was `kubectl run -i --rm`,
+  // which attaches after the container has started: measured on this cluster, a pod that
+  // printed "hi" and exited came back with no output and exit 0 four times in five, so a
+  // service quick enough to answer before kubectl attached would have been reported FAIL
+  // with nothing to say why.
+  const r = runInCluster(CONTEXT, IMAGE, `ready-${chart}-${Date.now().toString(36)}`,
+    `fetch('http://${chart}:${port}/ready').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) }, e => { console.log('unreachable', e.cause?.code ?? e.message); process.exit(1) })`,
+    ['--image-pull-policy=Never']);
   // The answer itself, not only the exit code: one run printed "ok event:" with nothing
   // after it, which a zero exit alone would have called ready.
   const answer = r.stdout.trim();
