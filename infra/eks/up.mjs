@@ -21,7 +21,9 @@
  *     kong-env, for infra/kong, the chart that is the directory compose mounts into Kong;
  *   - the stores' Secrets are the ones infra/stores/secrets.mjs plans, from compose and db/;
  *   - setup runs compose's own setup command, with compose's environment for it.
- * Except every credential in them. Compose's are development values written into this
+ * Except the address the cluster is reached at, which infra/eks/public.mjs sets in one line
+ * and derives every variable naming it from -- NODE_ENV, the link templates, Kong's domain,
+ * Live's origin rule, the web app's -- and every credential in them. Compose's are development values written into this
  * repository, so each one -- every password, every secret, both keypairs -- is replaced by
  * this cluster's own, made in the cluster on the first install and kept there
  * (infra/eks/credentials.mjs). Nothing is read from services/*\/keys, and nothing of a
@@ -55,6 +57,7 @@ import { fileURLToPath } from 'node:url';
 import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY, GHCR_TOKEN_FILE } from '../argocd/settings.mjs';
 import { plan as storePlan, renderChart } from '../stores/secrets.mjs';
 import { CREDENTIALS_SECRET, credentialsIn, ensure, keySecrets, withCredentials } from './credentials.mjs';
+import { APP_URL_TEMPLATE, DEV_DOMAIN, GATEWAY_PORT, openAt, publicAddress, publicEnvironment } from './public.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -116,18 +119,27 @@ export function envSecrets(compose, charts) {
  * Refuses rather than let one compose credential through: after the replacement, nothing
  * found in a credential's place may still be a value compose had there.
  */
-export function installSecrets(compose, charts, storeDocs, existing = {}) {
+export function installSecrets(compose, charts, storeDocs, existing = {}, template = APP_URL_TEMPLATE) {
   const raw = {};
   const from = {};
   // The environment each value came from, where a password's *_USER is: the Secret itself
   // for a service's environment; compose's environment for that store, for a store Secret
   // that holds only the password (plan() names it: "docker-compose.yml <store>.environment.<KEY>").
   const env = {};
+  // What the cluster's address sets (infra/eks/public.mjs), over compose's values. None of
+  // it is a credential, so the credential search below sees compose's values and these alike.
+  const address = publicEnvironment(template, charts, (chart) => envOf(compose, chart));
   for (const [name, s] of Object.entries(envSecrets(compose, charts))) {
-    raw[name] = s.data;
-    from[name] = s.from;
-    env[name] = () => s.data;
+    const set = address[name] ?? {};
+    raw[name] = { ...s.data, ...set };
+    from[name] = Object.keys(set).length ? `${s.from}, with ${Object.keys(set).sort().join(', ')} from the address in infra/eks/public.mjs` : s.from;
+    env[name] = () => raw[name];
   }
+  raw['web-env'] = address['web-env'];
+  from['web-env'] = 'the address in infra/eks/public.mjs';
+  env['web-env'] = () => raw['web-env'];
+  const stray = Object.keys(address).filter((name) => !raw[name]);
+  if (stray.length) refuse(`the address sets variables in Secrets nothing makes: ${stray.join(', ')}`);
   for (const [name, keys] of Object.entries(storePlan(storeDocs, compose))) {
     raw[name] = Object.fromEntries(Object.entries(keys).map(([k, v]) => [k, v.read()]));
     from[name] = Object.values(keys).map((v) => v.from).join(', ');
@@ -569,11 +581,13 @@ function checkRunning({ compose, charts, image, CONTEXT, sha }) {
     }
     if (answers) for (const [ok, msg] of judge(answers)) check(ok, msg);
   }
-  console.log(
-    failed
-      ? `\nFAIL: ${failed} step(s) failed`
-      : `\nEventHub runs on ${CONTEXT}, from ${sha}. To open it from here, stop compose's Kong (docker stop eventhub-kong: it holds 8000), then:\n  kubectl --context ${CONTEXT} port-forward svc/kong 8000:8000\n  kubectl --context ${CONTEXT} port-forward svc/web 5173:3000\n  and http://acme.eventhub.localhost:5173`,
-  );
+  // The address is this machine's own until a domain is set (infra/eks/public.mjs): then the
+  // two port-forwards are the way in, onto the ports the address names.
+  const { domain, port } = publicAddress(APP_URL_TEMPLATE);
+  const local = domain === DEV_DOMAIN
+    ? `To open it from here, stop compose's Kong (docker stop eventhub-kong: it holds ${GATEWAY_PORT}), then:\n  kubectl --context ${CONTEXT} port-forward svc/kong ${GATEWAY_PORT}:8000\n  kubectl --context ${CONTEXT} port-forward svc/web ${port || 80}:3000\n  and `
+    : 'At ';
+  console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${sha}. ${local}${openAt(APP_URL_TEMPLATE)}`);
 }
 
 /**

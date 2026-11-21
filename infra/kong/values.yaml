@@ -15,8 +15,9 @@
 # NO WAY IN FROM OUTSIDE YET. The Service is ClusterIP. Reach it with
 #   kubectl --context eventhub-demo port-forward svc/kong 18000:8000
 # and http://acme.eventhub.localhost:18000 (18000, because compose's own Kong holds 8000
-# on this machine). A load balancer, the domain and HTTPS come with the step that decides
-# the domain; kong.yml's hosts and CORS origins change with it.
+# on this machine). A load balancer and HTTPS come with the step that decides the domain.
+# The domain itself is one line, infra/eks/public.mjs: kong-env carries it as
+# APP_URL_TEMPLATE, and render-consumer.lua puts it where kong.yml says eventhub.com.
 
 # yaml for kubectl and Helm; json for the verifiers, which read the chart without a YAML
 # parser. Both are printed from the same object (templates/_helpers.tpl).

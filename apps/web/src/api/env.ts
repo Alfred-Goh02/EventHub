@@ -1,14 +1,37 @@
 /**
  * The host as a name, without the trailing dot a fully qualified one may carry:
- * `acme.eventhub.com.` is the same site as `acme.eventhub.com`, and must not fall through
+ * `acme.example.org.` is the same site as `acme.example.org`, and must not fall through
  * to the sample data.
  */
 const hostName = (h: string) => h.toLowerCase().replace(/\.$/, "");
 
-/** True when `hostname` is not a real EventHub host; the mock API is used then. */
-export function isMockHostname(hostname: string): boolean {
+declare global {
+  interface Window {
+    /** Set by /config.js, which the app's own server writes (src/server.ts) before the app loads. */
+    __EVENTHUB__?: { domain?: string | null };
+  }
+}
+
+/**
+ * The deployment's own domain, as its server announced it, or null. A laptop needs none:
+ * eventhub.localhost is always real. Anywhere that serves no /config.js -- a preview host,
+ * a static copy -- has none either, and gets the sample data.
+ */
+export function publicDomain(): string | null {
+  if (typeof window === "undefined") return null;
+  const d = window.__EVENTHUB__?.domain;
+  return typeof d === "string" && d.length > 0 ? d : null;
+}
+
+/**
+ * True when `hostname` is not a real EventHub host; the mock API is used then. Real is a
+ * tenant's subdomain of eventhub.localhost, or of the deployment's own domain: a whole label
+ * of it, so evilexample.org is not example.org's.
+ */
+export function isMockHostname(hostname: string, domain: string | null = publicDomain()): boolean {
   const h = hostName(hostname);
-  return !(h.endsWith(".eventhub.localhost") || h.endsWith(".eventhub.com"));
+  if (h.endsWith(".eventhub.localhost")) return false;
+  return !(domain !== null && h.endsWith(`.${domain}`));
 }
 
 /** True when the page is not on a real EventHub host; the mock API is used then. */

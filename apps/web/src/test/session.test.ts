@@ -36,16 +36,25 @@ describe("refresh schedule", () => {
 });
 
 describe("mock mode", () => {
-  it("is off on every real host, a fully qualified one with its trailing dot included", () => {
-    expect(isMockHostname("acme.eventhub.com")).toBe(false);
-    expect(isMockHostname("acme.eventhub.com.")).toBe(false);
-    expect(isMockHostname("ACME.EventHub.com")).toBe(false);
+  it("is off on a tenant of the deployment's domain, a fully qualified one with its trailing dot included", () => {
+    expect(isMockHostname("acme.example.org", "example.org")).toBe(false);
+    expect(isMockHostname("acme.example.org.", "example.org")).toBe(false);
+    expect(isMockHostname("ACME.Example.org", "example.org")).toBe(false);
+  });
+
+  it("is off on a laptop's eventhub.localhost, with or without a domain", () => {
     expect(isMockHostname("acme.eventhub.localhost")).toBe(false);
+    expect(isMockHostname("acme.eventhub.localhost", "example.org")).toBe(false);
   });
 
   it("is on anywhere else", () => {
     expect(isMockHostname("id-preview--1234.lovable.app")).toBe(true);
+    expect(isMockHostname("eventhub-demo.vercel.app")).toBe(true);
     expect(isMockHostname("localhost")).toBe(true);
-    expect(isMockHostname("eventhub.com.evil.example")).toBe(true);
+    // A domain is real only where it is announced: eventhub.com is no longer anyone's.
+    expect(isMockHostname("acme.eventhub.com")).toBe(true);
+    expect(isMockHostname("example.org.evil.example", "example.org")).toBe(true);
+    // A whole label of the domain, never a suffix of a name.
+    expect(isMockHostname("acme.evilexample.org", "example.org")).toBe(true);
   });
 });
