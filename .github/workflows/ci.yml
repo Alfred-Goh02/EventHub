@@ -353,6 +353,13 @@ jobs:
       - name: Assert the cluster's address is one setting, and Kong and the services take it from there
         run: node scripts/verify-public-address.mjs
 
+      # The cluster's one way in from the internet (infra/edge): one Network Load Balancer,
+      # made by the AWS Load Balancer Controller Terraform grants a role to, reaching the web
+      # app's pods on the page's port and Kong's on 8000 and no other pod; made before the
+      # Secrets that need its address, and taken off before its controller.
+      - name: Assert the one load balancer reaches the web app and Kong, each on its port, and is made and taken off in order
+        run: node scripts/verify-edge.mjs
+
       # The guard for "Free runner disk", placed before anything writes to
       # OpenSearch: at its 85% low watermark or past it, fail HERE naming the
       # disk, rather than minutes later as an index_create_block_exception in
