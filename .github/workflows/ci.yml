@@ -2743,6 +2743,19 @@ jobs:
           serve web-bad -e 'APP_URL_TEMPLATE=https://{tenant}.Example.org'
           code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/")
           test "$code" = 500 || { echo "a malformed address served the page: $code"; exit 1; }
-          docker logs web-bad 2>&1 | grep -q 'APP_URL_TEMPLATE must be' || { echo "the log does not say why"; exit 1; }
+          # The whole log is read first and searched after, never `docker logs | grep -q`: grep
+          # quits at the first match, docker logs then writes the stack's next line into a closed
+          # pipe and exits 1, and pipefail fails the step on a log that said why. Measured on a log
+          # that goes on after the match: 5 of 5 pipelines failed, each with grep's status 0. Here
+          # the stack's nine lines follow the match, so it is a race: it failed two PRs that do
+          # not touch the web app, and passed main. A few tries, because Docker copies a line
+          # into the log after the process writes it.
+          said=
+          for _ in $(seq 1 10); do
+            log=$(docker logs web-bad 2>&1 || true)
+            if grep -qF 'APP_URL_TEMPLATE must be' <<<"$log"; then said=1; break; fi
+            sleep 1
+          done
+          test -n "$said" || { echo "the log does not say why:"; echo "$log"; exit 1; }
           docker stop web-bad >/dev/null
           echo "  config.js: example.org with the address, null without, and no page on a malformed one"
