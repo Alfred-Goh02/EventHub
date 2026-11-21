@@ -61,3 +61,7 @@ infra/terraform
 # a worktree's own infra/terraform is not infra/terraform, and a tfvars there would have
 # gone in. Nothing in .claude belongs in an image.
 .claude
+
+# DOCUMENTATION. Nothing in the image reads it, and docs/architecture holds the diagram's
+# PNG export, close to 2 MB that every pod's image pull would otherwise carry.
+docs
