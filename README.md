@@ -103,6 +103,16 @@ connection to a database it was not granted.
 
 ## How it fits together
 
+[![EventHub on AWS: the EKS demo environment](docs/architecture/eventhub-aws.drawio.png)](docs/architecture/eventhub-aws.drawio.png)
+
+The AWS demo environment, drawn from `infra/` and `charts/`: solid lines ran on AWS in the
+demo windows of 2026-11-14 and 2026-11-15, dashed amber is the load balancer on branch
+`infra/edge`, and dotted grey waits on a domain. The source is
+[`docs/architecture/eventhub-aws.drawio`](docs/architecture/eventhub-aws.drawio); open it at
+app.diagrams.net. The PNG carries a copy of it, so either one opens there for editing.
+
+The services themselves, wired as compose runs them:
+
 ```mermaid
 flowchart TB
   subgraph AUTHSVC["Auth · :3001"]
