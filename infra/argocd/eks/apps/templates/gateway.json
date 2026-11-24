@@ -2,25 +2,19 @@
   "apiVersion": "argoproj.io/v1alpha1",
   "kind": "Application",
   "metadata": {
-    "name": "setup",
+    "name": "kong",
     "namespace": "argocd",
     "labels": { "app.kubernetes.io/part-of": "eventhub" },
+    "annotations": { "argocd.argoproj.io/sync-wave": "0" },
     "finalizers": ["resources-finalizer.argocd.argoproj.io"]
   },
   "spec": {
     "project": "default",
     "source": {
       "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
-      "targetRevision": "main",
-      "path": "infra/setup",
-      "helm": {
-        "releaseName": "setup",
-        "valueFiles": ["values.yaml", "../argocd/env/eks-setup.json"],
-        "parameters": [
-          { "name": "image.repository", "value": "ghcr.io/alfred-goh02/eventhub/app" },
-          { "name": "image.tag", "value": "$ARGOCD_APP_REVISION_SHORT" }
-        ]
-      }
+      "targetRevision": "{{ .Values.revision }}",
+      "path": "infra/kong",
+      "helm": { "releaseName": "kong", "valueFiles": ["values.yaml"] }
     },
     "destination": { "server": "https://kubernetes.default.svc", "namespace": "default" },
     "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }

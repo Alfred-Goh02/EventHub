@@ -5,13 +5,14 @@
     "name": "web",
     "namespace": "argocd",
     "labels": { "app.kubernetes.io/part-of": "eventhub" },
+    "annotations": { "argocd.argoproj.io/sync-wave": "0" },
     "finalizers": ["resources-finalizer.argocd.argoproj.io"]
   },
   "spec": {
     "project": "default",
     "source": {
       "repoURL": "git@github.com:Alfred-Goh02/EventHub.git",
-      "targetRevision": "main",
+      "targetRevision": "{{ .Values.revision }}",
       "path": "infra/web",
       "helm": {
         "releaseName": "web",

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: eventhub-eks-apps
+description: "The EKS root's Applications (app-of-apps): setup, then the services, the gateway and the web app, each at the commit the root resolved main to."
+type: application
+version: 0.1.0

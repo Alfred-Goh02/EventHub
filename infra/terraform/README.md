@@ -129,8 +129,13 @@ kubectl version --client
    repository through the read-only deploy key kind uses (`%USERPROFILE%\.eventhub\argocd-deploy-key`),
    and applies `infra/argocd/eks/root.json`. Every service, the gateway, the web app and
    setup are then Argo CD's, each on the images `publish.yml` pushed to GitHub's container
-   registry for the commit it deploys. The checkout must be main itself, and CI must have
-   published main's images.
+   registry for the commit it deploys. Setup runs first, on the install and on every commit
+   after it: the root syncs it in an earlier wave and waits for its Job to finish before it
+   syncs anything else, using the health check the installer puts into `argocd-cm`
+   (`infra/argocd/eks/application-health.lua`). A setup that fails stops the rest: the
+   services stay on the commit they ran, and the root's sync ends Failed about five minutes
+   later, after Argo CD's retries. The next commit is tried afresh. The checkout must be main
+   itself, and CI must have published main's images.
 
    The registry is private, so the cluster pulls with a token of yours that can only read
    packages. Make it once, at

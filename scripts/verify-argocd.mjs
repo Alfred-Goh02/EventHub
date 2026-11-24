@@ -12,7 +12,10 @@
  *   - root.json points at this repository (the `origin` remote), at `main`, at a
  *     directory that exists, with automated sync that prunes and self-heals;
  *   - every Application or ApplicationSet under the root's path names the same
- *     repository and branch;
+ *     repository and branch -- `main` itself under kind's root, a directory; under EKS's, a
+ *     Helm chart, the commit the root resolved main to, which it hands each one as
+ *     $ARGOCD_APP_REVISION (infra/argocd/eks/apps/values.yaml says why). The chart is
+ *     rendered for a commit, as Argo CD renders it (scripts/lib/argocd-children.mjs);
  *   - the services ApplicationSet's directories, applied to charts/, give exactly the
  *     service charts -- every library chart excluded, none missing, none extra -- and
  *     each has the values.yaml it starts from;
@@ -22,7 +25,7 @@
  *   - no file under infra/argocd that ArgoCD reads carries key material. The deploy key
  *     lives outside the repository, and bootstrap.mjs reads it from there.
  *
- * Reads files and `git remote` only:
+ * Reads files and `git remote`, and renders EKS's root with helm:
  *   node scripts/verify-argocd.mjs [root]
  */
 
@@ -31,8 +34,12 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { rootChildren } from './lib/argocd-children.mjs';
+
 const HERE = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = process.argv[2] ? resolve(process.argv[2]) : HERE;
+/** The commit a Helm root is rendered at: what Argo CD resolved main to, for the run. */
+const REV = '0123456789abcdef0123456789abcdef01234567';
 
 let failures = 0;
 function check(ok, msg) {
@@ -86,8 +93,16 @@ function judgeRoot(rootFile, rel, repo) {
   const auto = rootApp.spec?.syncPolicy?.automated;
   check(auto?.prune === true && auto?.selfHeal === true, 'with automated sync that prunes and self-heals');
 
-  const manifests = existsSync(appsDir) ? readdirSync(appsDir).filter((f) => f.endsWith('.json')).map((f) => ({ f, m: JSON.parse(readFileSync(join(appsDir, f), 'utf8')) })) : [];
-  check(manifests.length > 0, `CONTROL: ${manifests.length} manifest(s) under ${src.path}: ${manifests.map((x) => `${x.f} (${x.m.kind})`).join(', ')}`);
+  // A Helm root pins its children to the commit it resolved main to; a directory root's
+  // children name main themselves. Either way, main is what they run.
+  const pinned = Boolean(src.helm);
+  const childRev = pinned ? REV : 'main';
+  const at = pinned ? `the commit the root resolved main to (${REV.slice(0, 7)} for this run)` : 'main';
+  if (pinned) check((src.helm.parameters ?? []).some((p) => p.name === 'revision' && p.value === '$ARGOCD_APP_REVISION'), 'a Helm chart, handed the commit it resolved main to: revision=$ARGOCD_APP_REVISION');
+  const rendered = rootChildren(ROOT, rootApp, REV);
+  if (rendered.error) check(false, `${src.path} did not render: ${rendered.error}`);
+  const manifests = rendered.files;
+  check(manifests.length > 0, `CONTROL: ${manifests.length} manifest(s) under ${src.path}${pinned ? ', rendered at a commit' : ''}: ${manifests.map((x) => `${x.f} (${x.m.kind})`).join(', ')}`);
 
   // What charts/ holds, judged the way the charts judge themselves.
   const chartsDir = join(ROOT, 'charts');
@@ -105,7 +120,7 @@ function judgeRoot(rootFile, rel, repo) {
     console.log('');
     console.log(`  ${src.path}/${f}: ${m.kind} ${m.metadata?.name}`);
     if (m.kind === 'Application') {
-      check(repoId(m.spec?.source?.repoURL) === repo && m.spec?.source?.targetRevision === 'main', 'it reads this repository at main');
+      check(repoId(m.spec?.source?.repoURL) === repo && m.spec?.source?.targetRevision === childRev, `it reads this repository at ${at} (${m.spec?.source?.targetRevision})`);
       continue;
     }
     if (m.kind !== 'ApplicationSet') {
@@ -113,7 +128,7 @@ function judgeRoot(rootFile, rel, repo) {
       continue;
     }
     const gen = m.spec?.generators?.[0]?.git;
-    check(Boolean(gen) && repoId(gen.repoURL) === repo && gen.revision === 'main', `its git generator reads this repository at main (${gen?.repoURL} @ ${gen?.revision})`);
+    check(Boolean(gen) && repoId(gen.repoURL) === repo && gen.revision === childRev, `its git generator reads this repository at ${at} (${gen?.repoURL} @ ${gen?.revision})`);
     const dirs = gen?.directories ?? [];
     const includes = dirs.filter((d) => !d.exclude).map((d) => d.path);
     const excludes = dirs.filter((d) => d.exclude).map((d) => d.path);
@@ -132,7 +147,7 @@ function judgeRoot(rootFile, rel, repo) {
 
     const t = m.spec?.template?.spec ?? {};
     const tsrc = t.source ?? {};
-    check(repoId(tsrc.repoURL) === repo && tsrc.targetRevision === 'main', `each Application reads this repository at main (${tsrc.targetRevision})`);
+    check(repoId(tsrc.repoURL) === repo && tsrc.targetRevision === childRev, `each Application reads this repository at ${at} (${tsrc.targetRevision})`);
     check(tsrc.path === '{{.path.path}}' && tsrc.helm?.releaseName === '{{.path.basename}}' && m.spec?.template?.metadata?.name === '{{.path.basename}}', 'from its own directory, as a release and an Application named for it');
     check(m.spec?.goTemplate === true && (m.spec?.goTemplateOptions ?? []).includes('missingkey=error'), 'a missing template key is an error, not an empty string');
     const files = tsrc.helm?.valueFiles ?? [];

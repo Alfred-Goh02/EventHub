@@ -160,7 +160,12 @@ jobs:
       # at a commit -- every image exactly what publish.yml pushes for that commit, no tag
       # written anywhere but $ARGOCD_APP_REVISION_SHORT, the pull Secret's service account,
       # one replica each, setup running compose's own command, and the Applications exactly
-      # the ones the installer waits for.
+      # the ones the installer waits for. And setup FIRST, on every commit: a fresh install
+      # once restarted six services 11 times, each started before setup had made what it
+      # needs. Setup is an earlier sync wave than everything else, every child is pinned to the
+      # commit the root resolved, the installer puts the Application health check into
+      # argocd-cm before the root, and that script is run through Argo CD's own CLI (its image,
+      # at the version the cluster runs) against a child in every state on the way to Healthy.
       - name: Assert Argo CD on EKS deploys main from the images CI published for each commit
         run: node scripts/verify-argocd-eks.mjs
 
@@ -2750,16 +2755,19 @@ jobs:
           serve web-bad -e 'APP_URL_TEMPLATE=https://{tenant}.Example.org'
           code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/")
           test "$code" = 500 || { echo "a malformed address served the page: $code"; exit 1; }
-          # Read into a variable, never piped into grep -q: under pipefail, grep exiting at its
-          # first match kills docker logs with SIGPIPE, and the pipeline fails on a log that
-          # says exactly the right thing (it did, on #195's first run). A few tries, as the
-          # log line can land a moment after the 500 does.
-          said=''
+          # The whole log is read first and searched after, never `docker logs | grep -q`: grep
+          # quits at the first match, docker logs then writes the stack's next line into a closed
+          # pipe and exits 1, and pipefail fails the step on a log that said why. Measured on a log
+          # that goes on after the match: 5 of 5 pipelines failed, each with grep's status 0. Here
+          # the stack's nine lines follow the match, so it is a race: it failed two PRs that do
+          # not touch the web app, and passed main. A few tries, because Docker copies a line
+          # into the log after the process writes it.
+          said=
           for _ in $(seq 1 10); do
-            logs=$(docker logs web-bad 2>&1 || true)
-            if grep -q 'APP_URL_TEMPLATE must be' <<<"$logs"; then said=yes; break; fi
-            sleep 0.5
+            log=$(docker logs web-bad 2>&1 || true)
+            if grep -qF 'APP_URL_TEMPLATE must be' <<<"$log"; then said=1; break; fi
+            sleep 1
           done
-          test -n "$said" || { echo "the log does not say why: $(tail -n 5 <<<"$logs")"; exit 1; }
+          test -n "$said" || { echo "the log does not say why:"; echo "$log"; exit 1; }
           docker stop web-bad >/dev/null
           echo "  config.js: example.org with the address, null without, and no page on a malformed one"
