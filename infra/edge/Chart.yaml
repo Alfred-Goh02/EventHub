@@ -1,0 +1,5 @@
+apiVersion: v2
+name: edge
+description: "The one way into the EKS cluster from the internet: a Network Load Balancer, made by the AWS Load Balancer Controller, in front of the web app and the gateway."
+type: application
+version: 0.1.0

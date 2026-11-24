@@ -34,6 +34,9 @@
  *   2. the images (IMAGES): eventhub/app from the root, and eventhub/web from apps/web,
  *      each built from HEAD as <name>:<sha> if it is not here, and pushed to its ECR
  *      repository unless that tag is already there (tags are IMMUTABLE);
+ *  2b. the way in: the AWS Load Balancer Controller, then infra/edge, the one load balancer,
+ *      in front of the web app and the gateway; its address, through sslip.io until a
+ *      domain is set, is the address every Secret below is made with (theWayIn);
  *   3. the credentials, read from the cluster or made there, then every Secret: the
  *      stores', the services', setup's and the gateway's, each with them in place;
  *   4. infra/stores, waited for until every store is ready;
@@ -44,11 +47,15 @@
  *   8. the web app, infra/web, on its own image;
  *   9. every service's /ready, asked from inside the cluster;
  *  10. requests through the gateway and to the web app, from inside the cluster
- *      (gatewayProbe and webProbe say what each one shows). Both Services are ClusterIP:
- *      from a laptop, `kubectl port-forward` (infra/web/values.yaml says how).
+ *      (gatewayProbe and webProbe say what each one shows), and then from this machine,
+ *      through the load balancer, at the address itself (judgeOutside).
+ *
+ * --down takes the load balancer off first, and its controller only once AWS shows nothing
+ * the controller made is left: a balancer outliving its controller bills, and holds the VPC.
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
+import { resolve4 } from 'node:dns/promises';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -57,7 +64,7 @@ import { fileURLToPath } from 'node:url';
 import { ARGOCD_MANIFEST, ARGOCD_VERSION, DEPLOY_KEY, GHCR_TOKEN_FILE } from '../argocd/settings.mjs';
 import { plan as storePlan, renderChart } from '../stores/secrets.mjs';
 import { CREDENTIALS_SECRET, credentialsIn, ensure, keySecrets, withCredentials } from './credentials.mjs';
-import { APP_URL_TEMPLATE, DEV_DOMAIN, GATEWAY_PORT, openAt, publicAddress, publicEnvironment } from './public.mjs';
+import { APP_URL_TEMPLATE, DEV_DOMAIN, DOMAIN_TEMPLATE, GATEWAY_PORT, addressFor, openAt, publicAddress, publicEnvironment } from './public.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -68,6 +75,22 @@ export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
  * each context has a Dockerfile and that Terraform makes each repository.
  */
 export const IMAGES = { 'eventhub/app': '.', 'eventhub/web': 'apps/web' };
+
+/**
+ * The AWS Load Balancer Controller, which makes the cluster's one load balancer (infra/edge):
+ * AWS's own chart, at the version whose IAM policy Terraform grants it -- envs/demo/main.tf
+ * names the tag its copy of the policy came from, and scripts/verify-edge.mjs holds the two
+ * together -- in the namespace and under the service account Terraform's Pod Identity
+ * association binds that role to.
+ */
+export const LB_CONTROLLER = {
+  release: 'aws-load-balancer-controller',
+  chart: 'aws-load-balancer-controller',
+  repo: 'https://aws.github.io/eks-charts',
+  version: '3.6.3',
+  namespace: 'kube-system',
+  serviceAccount: 'aws-load-balancer-controller',
+};
 
 class Refusal extends Error {}
 const refuse = (msg) => {
@@ -343,7 +366,7 @@ async function main() {
     .filter((f) => f && !f.startsWith('.claude/'));
   if (changed || untracked.length) refuse(`the working tree is not HEAD, so no commit describes the image:\n${[changed, ...untracked.map((f) => `?? ${f}`)].filter(Boolean).join('\n')}`);
 
-  if (GITOPS) return gitops({ kubectl, helmArgs, charts, CONTEXT });
+  if (GITOPS) return gitops({ kubectl, helmArgs, charts, CONTEXT, REGION });
 
   step('2. the images, by the commit they are built from');
   const sha = run('git', ['rev-parse', '--short', 'HEAD']).trim();
@@ -367,7 +390,9 @@ async function main() {
   const repo = repos['eventhub/app'];
   const remote = `${repo}:${sha}`;
 
-  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT });
+  const template = await theWayIn({ kubectl, helmArgs, CONTEXT, REGION });
+  if (failed) return;
+  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT, template });
 
   step('5. setup, once for this image');
   const scratch = mkdtempSync(join(tmpdir(), 'eventhub-eks-'));
@@ -411,7 +436,7 @@ async function main() {
   const w = tryRun('helm', ['upgrade', '--install', 'web', join('infra', 'web'), ...helmArgs, '--set', `image.repository=${repos['eventhub/web']}`, '--set', `image.tag=${sha}`, '--wait', '--timeout', '5m']);
   check(w.status === 0, `infra/web, on ${repos['eventhub/web']}:${sha}${w.status === 0 ? ', ready' : `: ${w.stderr.trim().split('\n').pop()}`}`);
 
-  checkRunning({ compose, charts, image: remote, CONTEXT, sha });
+  await checkRunning({ compose, charts, image: remote, CONTEXT, sha, template });
 }
 
 /** The pull Secret for GitHub's registry, on the default service account every pod here runs as. */
@@ -478,7 +503,7 @@ async function ghcrHas(ref, user, token) {
  * runs main's code. A checkout that differs would give main's services another commit's
  * environment.
  */
-async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
+async function gitops({ kubectl, helmArgs, charts, CONTEXT, REGION }) {
   step("2. main, and its images in GitHub's registry");
   run('git', ['fetch', '--quiet', 'origin', 'main']);
   const head = run('git', ['rev-parse', 'HEAD']).trim();
@@ -497,7 +522,9 @@ async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
   }
   if (failed) return;
 
-  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT });
+  const template = await theWayIn({ kubectl, helmArgs, CONTEXT, REGION });
+  if (failed) return;
+  const compose = credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT, template });
 
   step("5. the pull Secret, on the service account every pod here runs as");
   const auth = Buffer.from(`${user}:${token}`).toString('base64');
@@ -564,14 +591,78 @@ async function gitops({ kubectl, helmArgs, charts, CONTEXT }) {
     await new Promise((r) => setTimeout(r, 10_000));
   }
 
-  checkRunning({ compose, charts, image: images.find((i) => i.name === 'eventhub/app').ref, CONTEXT, sha: mainSha.slice(0, 7) });
+  await checkRunning({ compose, charts, image: images.find((i) => i.name === 'eventhub/app').ref, CONTEXT, sha: mainSha.slice(0, 7), template });
+}
+
+const sleepFor = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Step 2b, the same either way, and BEFORE THE SECRETS: the address the cluster is reached at
+ * is the load balancer's own until a domain is set (infra/eks/public.mjs), and every Secret
+ * that names the address is made from it. Returns that address, a template.
+ *
+ *   1. the AWS Load Balancer Controller, AWS's chart at LB_CONTROLLER.version, in kube-system,
+ *      on the role Terraform binds to its service account. Region and VPC are given, not
+ *      looked up: IMDS is closed to pods (hop limit 1), which is where it would look;
+ *   2. infra/edge, the one Service of type LoadBalancer, which the controller turns into a
+ *      Network Load Balancer; no pod it selects needs to exist yet;
+ *   3. the balancer's DNS name, once the controller has made it, and the addresses that name
+ *      resolves to, once its DNS is published (a minute or two after);
+ *   4. addressFor() those addresses: the domain's if there is one, else sslip.io's for the
+ *      balancer's own address.
+ */
+async function theWayIn({ kubectl, helmArgs, CONTEXT, REGION }) {
+  step('2b. the way in: the AWS Load Balancer Controller, and the one load balancer it makes');
+  const vpc = run('aws', ['eks', 'describe-cluster', '--region', REGION, '--name', CONTEXT, '--query', 'cluster.resourcesVpcConfig.vpcId', '--output', 'text']).trim();
+  if (!/^vpc-[0-9a-f]+$/.test(vpc)) refuse(`the cluster's VPC is not a VPC id: ${vpc}`);
+  const c = LB_CONTROLLER;
+  const ctl = tryRun('helm', [
+    'upgrade', '--install', c.release, c.chart, '--repo', c.repo, '--version', c.version,
+    '--kube-context', CONTEXT, '--namespace', c.namespace,
+    '--set', `clusterName=${CONTEXT}`, '--set', `region=${REGION}`, '--set', `vpcId=${vpc}`,
+    '--set', 'replicaCount=1', '--set', 'serviceAccount.create=true', '--set', `serviceAccount.name=${c.serviceAccount}`,
+    '--wait', '--timeout', '5m',
+  ]);
+  check(ctl.status === 0, `the controller ${c.version}, in ${c.namespace} as ${c.serviceAccount}, for ${CONTEXT} in ${vpc}${ctl.status === 0 ? ', ready' : `: ${ctl.stderr.trim().split('\n').pop()}`}`);
+  if (failed) return null;
+
+  const e = tryRun('helm', ['upgrade', '--install', 'edge', join('infra', 'edge'), ...helmArgs, '--timeout', '5m']);
+  check(e.status === 0, `infra/edge${e.status === 0 ? '' : `: ${e.stderr.trim().split('\n').pop()}`}`);
+  if (failed) return null;
+
+  let hostname = '';
+  for (let i = 0; i < 60 && !hostname; i += 1) {
+    hostname = kubectl(['--namespace', 'default', 'get', 'service', 'edge', '-o', 'jsonpath={.status.loadBalancer.ingress[0].hostname}']).trim();
+    if (!hostname) await sleepFor(10_000);
+  }
+  check(Boolean(hostname), `the controller made the load balancer${hostname ? `: ${hostname}` : ' -- no hostname in 10 minutes (kubectl -n kube-system logs deploy/aws-load-balancer-controller)'}`);
+  if (failed) return null;
+
+  let ips = [];
+  let why = '';
+  for (let i = 0; i < 60 && ips.length === 0; i += 1) {
+    try {
+      ips = await resolve4(hostname);
+    } catch (err) {
+      why = err.code ?? err.message;
+      await sleepFor(10_000);
+    }
+  }
+  check(ips.length > 0, `its DNS name resolves${ips.length ? `: ${ips.join(', ')}` : ` -- not in 10 minutes (${why})`}`);
+  if (failed) return null;
+
+  const template = addressFor(ips);
+  check(true, DOMAIN_TEMPLATE
+    ? `the address is the domain's, ${template}: *.${publicAddress(template).domain} must be a CNAME of ${hostname}`
+    : `the address is the load balancer's own, through sslip.io: ${template}`);
+  return template;
 }
 
 /**
  * Steps 3 and 4, the same either way: this cluster's credentials, read back or made, then
  * every Secret with them in place, then the stores. Returns compose's resolved configuration.
  */
-function credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT }) {
+function credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT, template }) {
   step("3. this cluster's credentials, and every Secret with them in place");
   const compose = JSON.parse(run('docker', ['compose', '-p', 'eventhub-rebuild', 'config', '--format', 'json']));
   const held = tryRun('kubectl', ['--context', CONTEXT, '--namespace', 'default', 'get', 'secret', CREDENTIALS_SECRET, '-o', 'json']);
@@ -582,7 +673,7 @@ function credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT }) {
   if (held.status !== 0 && tryRun('helm', ['status', 'stores', ...helmArgs]).status === 0) {
     refuse(`infra/stores is installed and ${CREDENTIALS_SECRET} is not: the stores' disks hold credentials this run cannot know. Take EventHub off with --down, then install again.`);
   }
-  const install = installSecrets(compose, charts, renderChart(join(ROOT, 'infra', 'stores')), existing);
+  const install = installSecrets(compose, charts, renderChart(join(ROOT, 'infra', 'stores')), existing, template);
   // Kept first, before anything is made from them: a run that fails after this point
   // leaves credentials the next run reads back, never a store set up with ones now lost.
   if (install.made.length) kubectl(['--namespace', 'default', 'apply', '-f', '-'], JSON.stringify(secretOf(CREDENTIALS_SECRET, install.creds)));
@@ -599,8 +690,51 @@ function credentialsAndStores({ kubectl, helmArgs, charts, CONTEXT }) {
 
 const secretOf = (name, data, type = 'Opaque') => ({ apiVersion: 'v1', kind: 'Secret', metadata: { name, labels: { 'app.kubernetes.io/part-of': 'eventhub' } }, type, stringData: data });
 
+/**
+ * Asked from THIS machine, through the load balancer, at the address the Secrets were made
+ * with: what a person opening the link gets. { page, config, me } answers, or { error }.
+ * node:http, not fetch, for the Host is the name itself here and a fresh connection each time.
+ */
+async function fromOutside(template) {
+  const { scheme, port } = publicAddress(template);
+  const origin = openAt(template);
+  const host = new URL(origin).hostname;
+  const ask = (url) => new Promise((done) => {
+    const mod = scheme === 'https' ? 'node:https' : 'node:http';
+    import(mod).then(({ request }) => {
+      const req = request(url, { agent: false, timeout: 10_000 }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (d) => { body += d; });
+        res.on('end', () => done({ status: res.statusCode, headers: res.headers, body: body.slice(0, 4000) }));
+      });
+      req.on('timeout', () => req.destroy(new Error('no answer in 10 s')));
+      req.on('error', (err) => done({ error: err.code ?? err.message }));
+      req.end();
+    });
+  });
+  return {
+    origin,
+    page: await ask(`${origin}/`),
+    config: await ask(`${origin}/config.js`),
+    me: await ask(`${scheme}://${host}:${GATEWAY_PORT}/auth/me`),
+    port: port || (scheme === 'https' ? '443' : '80'),
+  };
+}
+
+/** What those answers must show, as [ok, message] pairs. */
+export function judgeOutside(a, template) {
+  const { domain } = publicAddress(template);
+  const said = (r) => (r?.error ? `no answer: ${r.error}` : `${r?.status}`);
+  return [
+    [a.page?.status === 200 && /<title>EventHub<\/title>/.test(a.page.body ?? ''), `${a.origin}/ is the web app's page, through the load balancer on port ${a.port} (${said(a.page)})`],
+    [a.config?.status === 200 && (a.config.body ?? '').includes(JSON.stringify({ domain })), `and it tells the browser the domain is ${domain}, so the real API is used there (${said(a.config)}: ${(a.config?.body ?? '').trim().slice(0, 80)})`],
+    [a.me?.status === 401 && a.me?.headers?.['x-kong-upstream-latency'] !== undefined, `the gateway answers on ${GATEWAY_PORT} at the same host: /auth/me reaches Auth through Kong, which refuses it without a token (${said(a.me)})`],
+  ];
+}
+
 /** The last steps, the same either way: every /ready, and requests through the gateway and to the web app. */
-function checkRunning({ compose, charts, image, CONTEXT, sha }) {
+async function checkRunning({ compose, charts, image, CONTEXT, sha, template }) {
   step('/ready from inside the cluster');
   for (const chart of charts) {
     const port = compose.services[chart]?.environment?.PORT;
@@ -623,13 +757,25 @@ function checkRunning({ compose, charts, image, CONTEXT, sha }) {
     }
     if (answers) for (const [ok, msg] of judge(answers)) check(ok, msg);
   }
-  // The address is this machine's own until a domain is set (infra/eks/public.mjs): then the
-  // two port-forwards are the way in, onto the ports the address names.
-  const { domain, port } = publicAddress(APP_URL_TEMPLATE);
+
+  // The laptop's address is reached through port-forwards, never a load balancer; any other
+  // is asked from here. The balancer registers a pod a while after it is ready (its health
+  // checks), so the first answers may be none: asked again for up to five minutes.
+  const { domain, port } = publicAddress(template);
+  if (domain !== DEV_DOMAIN) {
+    step(`from this machine, through the load balancer, at ${openAt(template)}`);
+    let answers = null;
+    for (let i = 0; i < 30; i += 1) {
+      answers = await fromOutside(template);
+      if (judgeOutside(answers, template).every(([ok]) => ok)) break;
+      await sleepFor(10_000);
+    }
+    for (const [ok, msg] of judgeOutside(answers, template)) check(ok, msg);
+  }
   const local = domain === DEV_DOMAIN
     ? `To open it from here, stop compose's Kong (docker stop eventhub-kong: it holds ${GATEWAY_PORT}), then:\n  kubectl --context ${CONTEXT} port-forward svc/kong ${GATEWAY_PORT}:8000\n  kubectl --context ${CONTEXT} port-forward svc/web ${port || 80}:3000\n  and `
-    : 'At ';
-  console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${sha}. ${local}${openAt(APP_URL_TEMPLATE)}`);
+    : 'Open ';
+  console.log(failed ? `\nFAIL: ${failed} step(s) failed` : `\nEventHub runs on ${CONTEXT}, from ${sha}. ${local}${openAt(template)}, or any tenant's subdomain`);
 }
 
 /**
@@ -685,6 +831,42 @@ function down({ kubectl, helmArgs, charts, CONTEXT, REGION }) {
     check(left?.length === 0, `every Application deleted, with what it deployed${left?.length ? ` -- left: ${left.join(', ')}` : ''}`);
     const ns = tryRun('kubectl', ['--context', CONTEXT, 'delete', 'namespace', 'argocd', '--wait=true', '--timeout=5m']);
     check(ns.status === 0, `Argo CD removed${ns.status === 0 ? '' : `: ${ns.stderr.trim().split('\n').pop()}`}`);
+  }
+
+  // The load balancer BEFORE ITS CONTROLLER. AWS bills the balancer by the hour and it is in no
+  // Terraform state: deleting the Service is what has the controller delete it, its target
+  // groups and the security groups it made, and a controller removed first would leave all of
+  // them -- billing, and holding the VPC so `terraform destroy` cannot delete it. So the
+  // Service goes, AWS is asked until nothing the controller made is left in the VPC, and only
+  // then does the controller go.
+  const releasesIn = (ns) => new Set(JSON.parse(run('helm', ['list', '--kube-context', CONTEXT, '--namespace', ns, '--output', 'json'])).map((r) => r.name));
+  if (releasesIn('default').has('edge') || releasesIn(LB_CONTROLLER.namespace).has(LB_CONTROLLER.release)) {
+    step('2b. the load balancer, gone from AWS, and then its controller');
+    const vpc = run('aws', ['eks', 'describe-cluster', '--region', REGION, '--name', CONTEXT, '--query', 'cluster.resourcesVpcConfig.vpcId', '--output', 'text']).trim();
+    if (releasesIn('default').has('edge')) {
+      const r = tryRun('helm', ['uninstall', 'edge', ...helmArgs, '--wait', '--timeout', '5m']);
+      check(r.status === 0, `uninstalled edge${r.status === 0 ? '' : `: ${r.stderr.trim().split('\n').pop()}`}`);
+    }
+    const leftIn = () => ({
+      balancers: run('aws', ['elbv2', 'describe-load-balancers', '--region', REGION, '--query', `LoadBalancers[?VpcId=='${vpc}'].LoadBalancerName`, '--output', 'text']).trim(),
+      targetGroups: run('aws', ['elbv2', 'describe-target-groups', '--region', REGION, '--query', `TargetGroups[?VpcId=='${vpc}'].TargetGroupName`, '--output', 'text']).trim(),
+      securityGroups: run('aws', ['ec2', 'describe-security-groups', '--region', REGION, '--filters', `Name=vpc-id,Values=${vpc}`, 'Name=tag-key,Values=elbv2.k8s.aws/cluster', '--query', 'SecurityGroups[].GroupName', '--output', 'text']).trim(),
+    });
+    let left = leftIn();
+    for (let i = 0; i < 60 && Object.values(left).some(Boolean); i += 1) {
+      spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 5000)']);
+      left = leftIn();
+    }
+    const what = Object.entries(left).filter(([, v]) => v).map(([k, v]) => `${k}: ${v.replace(/\s+/g, ' ')}`);
+    check(what.length === 0, `no load balancer, target group or controller-made security group is left in ${vpc}${what.length ? ` -- ${what.join('; ')}` : ''}`);
+    if (what.length === 0 && releasesIn(LB_CONTROLLER.namespace).has(LB_CONTROLLER.release)) {
+      const r = tryRun('helm', ['uninstall', LB_CONTROLLER.release, '--kube-context', CONTEXT, '--namespace', LB_CONTROLLER.namespace, '--wait', '--timeout', '5m']);
+      check(r.status === 0, `uninstalled the controller${r.status === 0 ? '' : `: ${r.stderr.trim().split('\n').pop()}`}`);
+    }
+    if (failed) {
+      console.log('\nFAIL: the load balancer is not gone; the controller is kept so it can still delete it. Run --down again before destroying.');
+      return;
+    }
   }
 
   step('2. the releases: the web app, the gateway, the services and setup first, the stores last');

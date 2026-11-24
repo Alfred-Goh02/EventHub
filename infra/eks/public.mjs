@@ -3,7 +3,7 @@
  *
  * A tenant is its subdomain, so the address is a template: APP_URL_TEMPLATE, the same
  * variable Auth and Notification build their emailed links from (packages/config/src/app-url.ts).
- * Choosing a domain is changing the one line below. Every other value that names the address
+ * Choosing a domain is changing DOMAIN_TEMPLATE below. Every other value that names the address
  * is derived from it here, and the installer puts them in the Secrets each pod reads
  * (infra/eks/up.mjs, installSecrets):
  *
@@ -20,14 +20,42 @@
  *
  * Compose keeps its own values: this is what differs on the cluster, and nothing else does.
  *
- * TODAY IT IS THE LAPTOP'S ADDRESS. There is no domain yet, so the cluster is reached through
- * `kubectl port-forward` at http://acme.eventhub.localhost:5173, exactly as before this file,
- * and every derived value is the one that address needs. scripts/verify-public-address.mjs
- * derives the values for a real https domain too, renders Kong with them, and runs it.
+ * WITHOUT A DOMAIN, THE LOAD BALANCER'S OWN ADDRESS. The cluster's one way in is a Network
+ * Load Balancer (infra/edge), whose addresses are fixed for its life, and sslip.io answers
+ * any name holding an address with that address: acme.13-54-1-2.sslip.io is 13.54.1.2. So
+ * until DOMAIN_TEMPLATE is set, the installer makes the load balancer first and uses
+ * http://{tenant}.<its address, dashed>.sslip.io -- free, a subdomain for every tenant, and
+ * plain HTTP, since no certificate can be had for a name nobody here controls. With neither
+ * (no load balancer to ask), it is the laptop's address, reached through `kubectl
+ * port-forward`. scripts/verify-public-address.mjs derives the values for a real https
+ * domain too, renders Kong with them, and runs it.
  */
 
-/** The address. A domain replaces eventhub.localhost here, and the scheme becomes https. */
-export const APP_URL_TEMPLATE = 'http://{tenant}.eventhub.localhost:5173';
+/** The domain, once there is one: 'https://{tenant}.example.com'. Choosing one is this line. */
+export const DOMAIN_TEMPLATE = null;
+
+/** A laptop's address: browsers and curl resolve any *.localhost name to the machine itself. */
+export const LAPTOP_TEMPLATE = 'http://{tenant}.eventhub.localhost:5173';
+
+/** The address, before anything is asked of a load balancer: the domain's, or the laptop's. */
+export const APP_URL_TEMPLATE = DOMAIN_TEMPLATE ?? LAPTOP_TEMPLATE;
+
+/**
+ * The address the cluster is reached at, given the load balancer's IPv4 addresses (none
+ * when there is none): the domain's when there is one; else the first of the balancer's
+ * addresses, in order, through sslip.io; else the laptop's. The balancer spans zones, so
+ * any one of its addresses reaches every target.
+ */
+export function addressFor(balancerIps = []) {
+  if (DOMAIN_TEMPLATE) return DOMAIN_TEMPLATE;
+  const ips = [...balancerIps].filter((ip) => /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(ip));
+  if (ips.length !== balancerIps.length) throw new Error(`not IPv4 addresses: ${balancerIps.join(', ')}`);
+  if (ips.length === 0) return LAPTOP_TEMPLATE;
+  // In numeric order, so the same balancer gives the same address however DNS lists them.
+  const key = (ip) => ip.split('.').map((n) => n.padStart(3, '0')).join('.');
+  const [first] = ips.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+  return `http://{tenant}.${first.replaceAll('.', '-')}.sslip.io`;
+}
 
 /** The gateway's port, on every host: the web app calls the API at its own host on 8000. */
 export const GATEWAY_PORT = 8000;
