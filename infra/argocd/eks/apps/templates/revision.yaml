@@ -1,0 +1,6 @@
+{{- /*
+Renders nothing. Refuses a revision that is not a full commit SHA (values.yaml says why).
+*/ -}}
+{{- if not (regexMatch "^[0-9a-f]{40}$" (toString .Values.revision)) }}
+{{- fail (printf "revision must be the full commit SHA the root resolved main to ($ARGOCD_APP_REVISION), not %q" (toString .Values.revision)) }}
+{{- end }}
